@@ -8,7 +8,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15-intel      # GitHub's Apple Silicon Macs were saturated (jobs not acquired); the binary is universal anyway
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
