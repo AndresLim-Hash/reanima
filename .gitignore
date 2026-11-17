@@ -1,6 +1,6 @@
 # Builds and local work (not part of the source)
-build/
-build-*/
+/build/
+/build-*/
 build_prof/
 b/
 backups/
