@@ -1,0 +1,35 @@
+Reanima · Mecanismo: origen de las grabaciones
+==============================================
+
+Los 831 golpes de esta carpeta (Piano, Púa, Arco, Tecla, Soplo y sus versiones «real») se han sacado de grabaciones publicadas
+bajo CC0 1.0 Universal (dominio público: se pueden usar, modificar y distribuir sin pedir permiso ni
+citar, también en productos comerciales). Se citan igualmente, por cortesía:
+
+- Piano, al soltar la tecla y al pulsarla: Versilian Community Sample Library (VCSL), Steinway B,
+  "Rel" (sonidos de apagador). Sam Gossner, https://github.com/sgossner/VCSL
+- Piano, pedal derecho: VCSL, Upright Piano (Knight), PedOn / PedOff.
+- Púa: Growlybass, de Karoryfer Samples (sfzinstruments), ataques staccato y sonidos de soltar.
+  https://github.com/sfzinstruments/karoryfer.growlybass
+- Arco: Versilian Studios Chamber Orchestra 2 Community Edition (VSCO-2-CE), violín y violonchelo
+  spiccato. Sam Gossner, https://github.com/sgossner/VSCO-2-CE
+- Tecla: VSCO-2-CE, órgano (contacto de la tecla); VCSL, clave (martinete al volver).
+- Soplo: VSCO-2-CE, flauta y clarinete staccato; VCSL, saxo tenor staccato (Brett Tenor).
+- Piano real (0.9.5, 170 golpes "hammer_down_v2_*"): el golpe del macillo sacado de notas reales de piano.
+  University of Iowa Electronic Music Studios, Musical Instrument Samples (piano en pp, mf y ff, una nota de
+  cada dos), https://theremin.music.uiowa.edu/MIS.html: según su web, se pueden "descargar y usar en cualquier
+  proyecto, sin restricciones". VSCO-2-CE, piano vertical "Upright Nr1" (CC0). De cada nota se tomó la parte no
+  armónica alrededor de su ataque (HPSS, research/referencias_2026-11-13/scripts/mechv2.py), 0,3 s.
+
+Tratamiento: de cada grabación se quitó la nota (separación armónico/percusiva con filtros de mediana),
+con la misma máscara para los dos canales (no cambia la imagen estéreo), se recortó al ruido del
+mecanismo y se limitó su anchura (lados 3 dB por debajo del centro); 48 kHz, 16 bit, FLAC. La nota de
+cada grabación se comprobó en su audio. Las licencias originales están en research/mecanismo_fuentes/
+(LICENCIA_*.txt) y los scripts que los generan en research/mecanismo_scripts/.
+- Pulsado real, Arco real y Soplo real (0.9.5, "pickreal", "bowreal", "breathreal"): el ataque de notas reales.
+  VSCO-2-CE (CC0): arpa, pizzicato de violín y de violonchelo, violín con arco y vibrato, oboe, fagot, trompeta,
+  flauta y clarinete sostenidos. University of Iowa MIS (sin restricciones): violín y violonchelo con arco,
+  flauta sin vibrato, clarinete y trompa. Separación HPSS con margen 2 y selección por calidad (mechv2.py).
+- Púa guitarra (0.9.5, "guitarreal", 48 golpes): la púa sobre guitarras de verdad. Karoryfer Samples (CC0,
+  https://github.com/sfzinstruments): Shinyguitar (la misma guitarra grabada con micrófono, "acoustic", y por su
+  pastilla, "electric"), Emilyguitar (eléctrica) y Black and Green Guitars (staccato). La nota de cada golpe es la
+  que mide Reanima (los nombres de estas librerías no siempre la dicen).

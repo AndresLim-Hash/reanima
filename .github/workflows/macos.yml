@@ -1,0 +1,44 @@
+# Builds Reanima for macOS on GitHub's Macs: one universal binary (Apple Silicon + Intel), VST3 and AU,
+# for macOS 10.13 and later. The result is a zip to download from the run's page (Artifacts).
+name: macOS
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build-mac -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13
+
+      - name: Build VST3 and AU
+        run: cmake --build build-mac --config Release --target Reanima_VST3 Reanima_AU -- -quiet
+
+      - name: Check the Audio Unit and the architectures
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R build-mac/Reanima_artefacts/Release/AU/Reanima.component ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          auval -v aumu Rnm1 Bpnd || echo "auval failed (see above)"
+          lipo -info build-mac/Reanima_artefacts/Release/VST3/Reanima.vst3/Contents/MacOS/Reanima
+          otool -l build-mac/Reanima_artefacts/Release/VST3/Reanima.vst3/Contents/MacOS/Reanima | grep -A3 -E "LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION" | head -12
+
+      - name: Package
+        run: |
+          mkdir -p out
+          cp -R build-mac/Reanima_artefacts/Release/VST3/Reanima.vst3 out/
+          cp -R build-mac/Reanima_artefacts/Release/AU/Reanima.component out/
+          codesign --force --deep --sign - out/Reanima.vst3 out/Reanima.component
+          cp COMPILAR_EN_MAC.md LICENSE.md LICENCIAS_TERCEROS.md out/ 2>/dev/null || true
+          cp install_mac.command out/ && chmod +x out/install_mac.command
+          cd out && zip -qry ../Reanima-macOS.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Reanima-macOS
+          path: Reanima-macOS.zip

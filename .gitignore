@@ -1,0 +1,21 @@
+# Builds and local work (not part of the source)
+build/
+build-*/
+build_prof/
+b/
+backups/
+release/
+research/
+samples_prueba/
+samples_referencia/
+ia/
+x/
+external/eval/
+external/signalsmith-linear-repo/
+external/signalsmith-stretch/
+*.log
+/*.png
+/Pluck A3.wav
+.vs/
+.DS_Store
+/x
