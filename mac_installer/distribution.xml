@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Reanima 0.9.5</title>
+    <organization>com.blackpanda</organization>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="license.txt" mime-type="text/plain"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="allow" require-scripts="false" hostArchitectures="x86_64,arm64" rootVolumeOnly="true"/>
+    <domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
+    <allowed-os-versions>
+        <os-version min="10.13"/>
+    </allowed-os-versions>
+    <choices-outline>
+        <line choice="vst3"/>
+        <line choice="au"/>
+    </choices-outline>
+    <choice id="vst3" title="Reanima VST3" description="Para Ableton Live, Cubase, Bitwig, REAPER, Studio One... Se instala en /Library/Audio/Plug-Ins/VST3/Blackpanda.">
+        <pkg-ref id="com.blackpanda.reanima.vst3"/>
+    </choice>
+    <choice id="au" title="Reanima Audio Unit" description="Para Logic Pro, GarageBand y Ableton Live (AU). Se instala en /Library/Audio/Plug-Ins/Components.">
+        <pkg-ref id="com.blackpanda.reanima.au"/>
+    </choice>
+    <pkg-ref id="com.blackpanda.reanima.vst3" version="0.9.5" onConclusion="none">ReanimaVST3.pkg</pkg-ref>
+    <pkg-ref id="com.blackpanda.reanima.au" version="0.9.5" onConclusion="none">ReanimaAU.pkg</pkg-ref>
+</installer-gui-script>

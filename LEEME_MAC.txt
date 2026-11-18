@@ -2,13 +2,14 @@ REANIMA 0.9.5 para Mac (Blackpanda)
 Funciona en Mac con Apple Silicon (M1, M2, M3...) y en Mac Intel.
 
 INSTALAR
-1. Haz clic derecho sobre "Instalar Reanima.command" y elige "Abrir", y luego "Abrir" otra vez.
-   (La primera vez macOS avisa porque el plugin no está firmado por un desarrollador de Apple.)
-2. Se abre el Terminal, copia los plugins y dice "Instalado". Ya puedes cerrarlo.
-3. Abre Ableton Live: Preferencias > Plug-Ins > "Volver a escanear".
+1. Haz doble clic en "Instalar Reanima.pkg" y sigue el asistente (te pedirá la contraseña del Mac).
+   Si macOS dice que no puede abrirlo porque es de un desarrollador no identificado:
+   - Haz clic derecho sobre "Instalar Reanima.pkg" y elige "Abrir", y luego "Abrir" otra vez.
+   - En macOS 15 o posterior: Ajustes del Sistema > Privacidad y seguridad > "Abrir igualmente".
+2. Abre Ableton Live: Preferencias > Plug-Ins > "Volver a escanear".
 
-Dónde se instala:
-  VST3: ~/Library/Audio/Plug-Ins/VST3/Blackpanda/Reanima.vst3
-  AU:   ~/Library/Audio/Plug-Ins/Components/Reanima.component
+Dónde se instala (para todos los usuarios del Mac):
+  VST3: /Library/Audio/Plug-Ins/VST3/Blackpanda/Reanima.vst3
+  AU:   /Library/Audio/Plug-Ins/Components/Reanima.component
 
 Licencia: AGPLv3 (código en https://github.com/AndresLim-Hash/reanima). Ver LICENSE.md y LICENCIAS_TERCEROS.md.

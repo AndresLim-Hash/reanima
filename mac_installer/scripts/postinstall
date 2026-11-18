@@ -1,0 +1,10 @@
+#!/bin/sh
+# Runs after the Audio Unit is installed.
+# Removes copies left in the user's own Library by the earlier script installer (otherwise the DAW would list Reanima twice),
+# then tells macOS to look for new Audio Units.
+U="$(stat -f%Su /dev/console 2>/dev/null)"
+if [ -n "$U" ] && [ "$U" != "root" ] && [ -d "/Users/$U" ]; then
+    rm -rf "/Users/$U/Library/Audio/Plug-Ins/VST3/Blackpanda/Reanima.vst3" "/Users/$U/Library/Audio/Plug-Ins/Components/Reanima.component"
+fi
+killall -9 AudioComponentRegistrar 2>/dev/null || true
+exit 0

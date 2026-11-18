@@ -41,8 +41,8 @@ jobs:
       - name: Disk image (.dmg)
         run: |
           mkdir -p dmg
-          cp -R out/Reanima.vst3 out/Reanima.component dmg/
-          cp out/install_mac.command "dmg/Instalar Reanima.command" && chmod +x "dmg/Instalar Reanima.command"
+          sh mac_installer/build_pkg.sh out "dmg/Instalar Reanima.pkg"
+          pkgutil --payload-files "dmg/Instalar Reanima.pkg"
           cp LEEME_MAC.txt dmg/LEEME.txt
           cp LICENSE.md LICENCIAS_TERCEROS.md dmg/
           hdiutil create -volname "Reanima 0.9.5" -srcfolder dmg -fs HFS+ -format UDZO -ov Reanima-0.9.5-macOS.dmg
@@ -50,9 +50,13 @@ jobs:
           # Mount it once and check the plugins inside are intact and still signed.
           hdiutil attach -nobrowse -mountpoint /tmp/rdmg Reanima-0.9.5-macOS.dmg
           ls -la /tmp/rdmg
-          codesign --verify --deep --strict /tmp/rdmg/Reanima.vst3 /tmp/rdmg/Reanima.component && echo "firmas OK"
-          lipo -info /tmp/rdmg/Reanima.component/Contents/MacOS/Reanima
+          # Run the installer from the disk image exactly as a user would (same package, same postinstall), then check the result.
+          sudo installer -pkg "/tmp/rdmg/Instalar Reanima.pkg" -target / -verboseR
           hdiutil detach /tmp/rdmg
+          ls -la /Library/Audio/Plug-Ins/VST3/Blackpanda /Library/Audio/Plug-Ins/Components | grep -i reanima
+          codesign --verify --deep --strict /Library/Audio/Plug-Ins/VST3/Blackpanda/Reanima.vst3 /Library/Audio/Plug-Ins/Components/Reanima.component && echo "firmas OK"
+          lipo -info /Library/Audio/Plug-Ins/Components/Reanima.component/Contents/MacOS/Reanima
+          auval -v aumu Rnm1 Bpnd | tail -3
 
       - uses: actions/upload-artifact@v4
         with:
