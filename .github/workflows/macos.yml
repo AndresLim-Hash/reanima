@@ -38,7 +38,28 @@ jobs:
           cp install_mac.command out/ && chmod +x out/install_mac.command
           cd out && zip -qry ../Reanima-macOS.zip .
 
+      - name: Disk image (.dmg)
+        run: |
+          mkdir -p dmg
+          cp -R out/Reanima.vst3 out/Reanima.component dmg/
+          cp out/install_mac.command "dmg/Instalar Reanima.command" && chmod +x "dmg/Instalar Reanima.command"
+          cp LEEME_MAC.txt dmg/LEEME.txt
+          cp LICENSE.md LICENCIAS_TERCEROS.md dmg/
+          hdiutil create -volname "Reanima 0.9.5" -srcfolder dmg -fs HFS+ -format UDZO -ov Reanima-0.9.5-macOS.dmg
+          hdiutil verify Reanima-0.9.5-macOS.dmg
+          # Mount it once and check the plugins inside are intact and still signed.
+          hdiutil attach -nobrowse -mountpoint /tmp/rdmg Reanima-0.9.5-macOS.dmg
+          ls -la /tmp/rdmg
+          codesign --verify --deep --strict /tmp/rdmg/Reanima.vst3 /tmp/rdmg/Reanima.component && echo "firmas OK"
+          lipo -info /tmp/rdmg/Reanima.component/Contents/MacOS/Reanima
+          hdiutil detach /tmp/rdmg
+
       - uses: actions/upload-artifact@v4
         with:
           name: Reanima-macOS
           path: Reanima-macOS.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Reanima-macOS-dmg
+          path: Reanima-0.9.5-macOS.dmg
