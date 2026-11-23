@@ -16,6 +16,7 @@ enum Type
 {
     Empty, HyperDim, Distortion, Flanger, Phaser, Chorus, Delay, Compressor, Reverb, EQ, Filter, Bode, Utility,
     SplitLH, SplitLMH, SplitMS,
+    Impronta,       // after the splitters: the menu's order is the order saved in projects
     NumTypes
 };
 
@@ -65,6 +66,9 @@ struct Module
 
     // Gives the dry signal the same delay and phase the wet one picked up inside the module.
     virtual void alignDry (float*, float*, int) {}
+
+    // The sidechain's audio for the samples the next process() call gets (null: none). Impronta listens to it.
+    virtual void setSidechain (const float*, const float*) {}
 };
 
 std::unique_ptr<Module> create (int type);
@@ -84,6 +88,13 @@ public:
 
     // Audio thread.
     void process (juce::AudioBuffer<float>& buffer, const ParamSnapshot& p, double bpm);
+    // Audio thread, before process(): the sidechain for that block (null: none), for Impronta.
+    void setSidechain (const float* left, const float* right, int length) noexcept
+    {
+        sideL = left;
+        sideR = right;
+        sideLen = left != nullptr ? length : 0;
+    }
 
     static int chainStart (int chain) noexcept { return chain == 0 ? 0 : P::fxMainSlots + (chain - 1) * P::fxBusSlots; }
     static int chainSize (int chain) noexcept { return chain == 0 ? P::fxMainSlots : P::fxBusSlots; }
@@ -111,4 +122,7 @@ private:
     float mainLevel = 1.0f, sendLevel[2] { 0.0f, 0.0f }, busLevel[2] { 1.0f, 1.0f };
     int silentSamples = 0;
     bool prepared = false;
+    const float* sideL = nullptr;
+    const float* sideR = nullptr;
+    int sideLen = 0, sideStart = 0;     // sideStart: where the rack block being processed starts in the host's block
 };

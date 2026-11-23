@@ -260,6 +260,7 @@ public:
 private:
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
     void timerCallback() override;
+    void updateModulationRings();
     void updateSampleInfo();
     void buildPages();
     void buildSamplePage();
@@ -282,12 +283,23 @@ private:
     template <typename Condition>
     void dimUnless (juce::Component& control, Condition condition) { dimRules.push_back ({ &control, condition }); }
 
+    // A control that only exists in one mode of its panel (the filter's Armónico) is shown only then, and the panel
+    // lays its row out again.
+    template <typename Condition>
+    juce::Component& showOnly (Section& panel, juce::Component& control, Condition condition)
+    {
+        showRules.push_back ({ &panel, &control, condition });
+        return control;
+    }
+    struct ShowRule { Section* panel; juce::Component* control; std::function<bool()> shown; };
+    std::vector<ShowRule> showRules;
+
     // The parameters the waveform draws; it repaints when one of them changes.
     static constexpr int watched[] = { P::AmpA, P::AmpCurve, P::AmpD, P::AmpS, P::AmpFade, P::AmpR, P::Engine,
                                        P::SustainMode, P::SustainType, P::TransientMs, P::SnapC, P::StartPos,
                                        P::GrainPos, P::GrainMs, P::Spray, P::EnvMode, P::DroneStretch, P::DroneFreeze,
                                        P::DroneSize, P::PlayMode, P::LoopKind, P::LoopBeats, P::LoopBpm, P::SliceBy,
-                                       P::SliceDivision, P::SliceSensitivity, P::SliceStart };
+                                       P::SliceDivision, P::SliceSensitivity, P::SliceStart, P::LoopHitEnv, P::LoopWinLen, P::LoopWinPos };
 
     ReanimaProcessor& proc;
     ReanimaLook look;
@@ -298,6 +310,14 @@ private:
     juce::Label sampleLabel, rootLabel;
     PresetBar presetBar;
     juce::TextButton loadButton;
+    // The sample browser (Splice's folders among them), over the tabs while it is open.
+    struct FolderButton : juce::Button
+    {
+        FolderButton() : juce::Button ("explorar") { setClickingTogglesState (true); }
+        void paintButton (juce::Graphics& g, bool over, bool down) override;
+    } browseButton;
+    std::unique_ptr<class SampleBrowser> browser;
+    void showBrowser (bool show);
     std::unique_ptr<Toggle> snapToggle;
     std::unique_ptr<Choice> engineChoice;
     OutputMeter* meter = nullptr;
@@ -312,7 +332,8 @@ private:
     int scaleSettleTicks = -1;          // counts down after a drag-resize, then the size is remembered
 
     juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };
-    juce::Component samplePage, editPage, filterPage, matrixPage;
+    juce::Component samplePage, editPage, filterPage, matrixPage, arpPage;
+    void buildArpPage();
     EditView* editView = nullptr;
     std::unique_ptr<EditView> editViewOwner;
     std::unique_ptr<EditToolbar> editToolbar;

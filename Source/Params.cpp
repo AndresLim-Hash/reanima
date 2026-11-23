@@ -7,9 +7,9 @@ namespace P
 namespace
 {
 constexpr const char* lfoDivs = "1/32|1/16T|1/16|1/8T|1/8|1/4T|1/4|1/2|1 comp|2 comp|4 comp";
-constexpr const char* lfoShapes = "Seno|Triángulo|Sierra ↑|Sierra ↓|Cuadrada|S&H";
-constexpr const char* sources = "—|LFO 1|LFO 2|LFO 3|Env 2|Env Amp|Velocidad|Nota|Mod Wheel|Aftertouch|Macro 1|Macro 2|Macro 3|Macro 4|Aleatorio";
-constexpr const char* dests = "—|Tono|Volumen|Pan|Frecuencia filtro|Resonancia|Drive filtro|Morph filtro|Inicio|Spray|Grano|Detune unison|Vel. LFO 1|Vel. LFO 2|Transitorio|Arco/aliento|Respiración";
+constexpr const char* lfoShapes = "Seno|Triángulo|Sierra ↑|Sierra ↓|Cuadrada|S&H|Deriva";
+constexpr const char* sources = "—|LFO 1|LFO 2|LFO 3|Env 2|Env Amp|Velocidad|Nota|Mod Wheel|Aftertouch|Macro 1|Macro 2|Macro 3|Macro 4|Aleatorio|Sidechain";
+constexpr const char* dests = "—|Tono|Volumen|Pan|Frecuencia filtro|Resonancia|Drive filtro|Morph filtro|Inicio|Spray|Grano|Detune unison|Vel. LFO 1|Vel. LFO 2|Transitorio|Arco/aliento|Respiración|Tono fino";
 
 using K = Def::Kind;
 
@@ -117,7 +117,7 @@ std::array<Def, Count> buildDefs()
     b (DroneCurveOn, "droneCurveOn", "Filtro dibujado", false);
 
     b (FltOn, "fltOn", "Filtro", false);
-    c (FltType, "fltType", "Tipo", "Lowpass|Highpass|Bandpass|Notch|Morph|DJ|Comb|Vowel");
+    c (FltType, "fltType", "Tipo", "Lowpass|Highpass|Bandpass|Notch|Morph|DJ|Comb|Vowel|Armónico");
     c (FltSlope, "fltSlope", "Pendiente", "12 dB|24 dB", 1);
     c (FltCircuit, "fltCircuit", "Circuito", "Clean|OSR|MS2|SMP|PRD");
     f (FltFreq, "fltFreq", "Frecuencia", 20, 20000, 2000, 1000, "Hz");
@@ -136,10 +136,10 @@ std::array<Def, Count> buildDefs()
     f (E2S, "e2S", "Sustain", 0, 1, 0.3f);
     f (E2R, "e2R", "Release", 1, 30000, 300, 1000, "ms");
 
-    static const char* lfoIds[numLfos][5] = {
-        { "lfo1Rate", "lfo1Sync", "lfo1Div", "lfo1Shape", "lfo1Retrig" },
-        { "lfo2Rate", "lfo2Sync", "lfo2Div", "lfo2Shape", "lfo2Retrig" },
-        { "lfo3Rate", "lfo3Sync", "lfo3Div", "lfo3Shape", "lfo3Retrig" } };
+    static const char* lfoIds[numLfos][6] = {
+        { "lfo1Rate", "lfo1Sync", "lfo1Div", "lfo1Shape", "lfo1Retrig", "lfo1Smooth" },
+        { "lfo2Rate", "lfo2Sync", "lfo2Div", "lfo2Shape", "lfo2Retrig", "lfo2Smooth" },
+        { "lfo3Rate", "lfo3Sync", "lfo3Div", "lfo3Shape", "lfo3Retrig", "lfo3Smooth" } };
 
     for (int l = 0; l < numLfos; ++l)
     {
@@ -149,6 +149,7 @@ std::array<Def, Count> buildDefs()
         c (base + 2, lfoIds[l][2], "División", lfoDivs, 6);
         c (base + 3, lfoIds[l][3], "Forma", lfoShapes);
         b (base + 4, lfoIds[l][4], "Retrig", true);
+        f (base + 5, lfoIds[l][5], "Suavidad", 0, 1, 0);
     }
 
     f (Macro1, "macro1", "Macro 1", 0, 1, 0);
@@ -193,12 +194,38 @@ std::array<Def, Count> buildDefs()
     b (SliceThru, "sliceThru", "Thru", false);
     f (SliceFade, "sliceFade", "Fundido", 0, 100, 2, 10, "ms");
     b (LoopHitEnv, "loopHitEnv", "Por golpe", false);
+    b (MechPerHit, "mechPerHit", "Mecanismo por golpe", false);
+    c (LoopWinLen, "loopWinLen", "Ventana", "Completo|4 comp.|2 comp.|1 comp.|1/2|1/4.|1/4|1/4T|1/8.|1/8|1/8T|1/16|1/16T|1/32");
+    f (LoopWinPos, "loopWinPos", "Posición", 0, 64, 0, 0, "tiempos");
+    c (KeySource, "keySource", "Tonalidad de", "A mano|Sample|MIDI|Audio externo");
+    c (KeyRoot, "keyRoot", "Tónica", "Do|Do#|Re|Re#|Mi|Fa|Fa#|Sol|Sol#|La|La#|Si");
+    c (KeyScale, "keyScale", "Escala", "Mayor|Menor");
+    b (ArpOn, "arpOn", "Arp/Seq", false);
+    c (ArpMode, "arpMode", "Modo", "Arp|Seq");
+    c (ArpStyle, "arpStyle", "Estilo", "Arriba|Abajo|Arriba y abajo|Abajo y arriba|Como tocas|Aleatorio|Acorde");
+    c (SeqDir, "seqDir", "Dirección", "Adelante|Atrás|Péndulo|Aleatoria");
+    c (ArpRate, "arpRate", "Ritmo", "1/1|1/2|1/4.|1/4|1/4T|1/8.|1/8|1/8T|1/16.|1/16|1/16T|1/32", 9);
+    f (ArpOctaves, "arpOctaves", "Octavas", 1, 4, 1, 0, "", 1);
+    f (ArpSwing, "arpSwing", "Swing", 0, 100, 0, 0, "%");
+    f (ArpGate, "arpGate", "Gate", 10, 200, 100, 0, "%");
+    b (ArpLatch, "arpLatch", "Latch", false);
+    c (ArpSync, "arpSync", "Tempo", "DAW|Propio");
+    f (ArpBpm, "arpBpm", "BPM propio", 40, 240, 120, 0, "", 1);
+    f (ArpDensity, "arpDensity", "Densidad", 0, 100, 70, 0, "%");
+    b (GrainCoherent, "grainCoherent", "Coherente", false);
+    f (FltHarmGain, "fltHarmGain", "Realce", -24, 24, 9, 0, "dB");
+    f (FltHarmRegion, "fltHarmRegion", "Región", 0.5f, 10, 4, 3, "oct");
+    f (SustainMotion, "sustainMotion", "Movimiento", 0, 1, 0);
+    f (ScSens, "scSens", "Sensibilidad", -24, 24, 0, 0, "dB");
+    f (ScAttack, "scAttack", "Ataque", 0.1f, 200, 5, 20, "ms");
+    f (ScRelease, "scRelease", "Release", 5, 2000, 150, 200, "ms");
+    c (ScResponse, "scResponse", "Respuesta", "Nivel|Graves|Medios|Agudos|Brillo");
 
     // Slot ids and names must outlive the defs, so they live in static storage.
     static std::vector<std::string> strings;
     strings.reserve ((size_t) numFxSlots * fxSlotStride * 2);
     auto keep = [] (std::string str) { strings.push_back (std::move (str)); return strings.back().c_str(); };
-    static const char* types = "—|Hyper/Dimension|Distorsión|Flanger|Phaser|Chorus|Delay|Compresor|Reverb|EQ|Filtro|Bode|Utility|Splitter L/H|Splitter L/M/H|Splitter M/S";
+    static const char* types = "—|Hyper/Dimension|Distorsión|Flanger|Phaser|Chorus|Delay|Compresor|Reverb|EQ|Filtro|Bode|Utility|Splitter L/H|Splitter L/M/H|Splitter M/S|Impronta";
 
     for (int slot = 0; slot < numFxSlots; ++slot)
     {
@@ -238,8 +265,10 @@ juce::StringArray choicesOf (int index)
 static juce::String hostName (int index)
 {
     const auto name = u8 (defs()[(size_t) index].name);
-    if (index > FltOn && index <= FltMix)
+    if ((index > FltOn && index <= FltMix) || index == FltHarmGain || index == FltHarmRegion)
         return "Filtro " + name;
+    if (index >= ScSens && index <= ScResponse)
+        return "Sidechain " + name;
     if (index >= E2A && index <= E2R)
         return "Env 2 " + name;
     if (index >= Lfo1Rate && index < Macro1)

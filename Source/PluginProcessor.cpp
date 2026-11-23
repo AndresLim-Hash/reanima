@@ -1,4 +1,6 @@
 #include "PluginProcessor.h"
+#include <numeric>
+#include "HitEdits.h"
 #include <rubberband/RubberBandStretcher.h>
 #include "PluginEditor.h"
 #include "FxRack.h"
@@ -13,7 +15,7 @@ constexpr int currentStateVersion = 5;      // 2: "Inicio" is a fraction of the 
 }
 
 ReanimaProcessor::ReanimaProcessor()
-    : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+    : AudioProcessor (buses()),
       apvts (*this, nullptr, "REANIMA", P::createLayout())
 {
     for (int i = 0; i < P::Count; ++i)
@@ -33,7 +35,12 @@ ReanimaProcessor::ReanimaProcessor()
 
 ReanimaProcessor::~ReanimaProcessor()
 {
+    masterReference.clear();        // a key estimate still on its way finds no processor
     stopTimer();
+    delete previewMail.exchange (nullptr);
+    delete previewTrash.exchange (nullptr);
+    delete previewPlaying;
+    previewPlaying = nullptr;
     apvts.removeParameterListener (P::defs()[P::Reverse].id, this);
     apvts.removeParameterListener (P::defs()[P::Engine].id, this);
     apvts.removeParameterListener (P::defs()[P::EnvMode].id, this);
@@ -59,6 +66,10 @@ double ReanimaProcessor::getTailLengthSeconds() const
 
 void ReanimaProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    sideRate.store (sampleRate);
+    sideCopy.setSize (2, std::max (4096, samplesPerBlock));
+    arp.prepare (sampleRate);
+    arpMidi.ensureSize (8192);
     engine.prepare (sampleRate);
     masterStage.prepare (sampleRate, std::max (64, samplesPerBlock));
     setLatencySamples (masterStage.latency());          // the output stage's linear-phase oversampling
@@ -91,6 +102,7 @@ void ReanimaProcessor::timerCallback()
     commitHistory();
     updateSlices();
     serviceRubber();
+    serviceKey();
 
     // The audio thread hands the replaced sample back here, to be freed away from it (once no note
     // plays it any more).
@@ -106,12 +118,14 @@ void ReanimaProcessor::timerCallback()
 
 // The loop stretched offline by Rubber Band R3 for one tempo and pitch: three rounds, the middle one kept, its
 // seam closed. Runs on the background thread (and offline renders wait for it).
-std::unique_ptr<RubberRender> makeRubberRender (std::shared_ptr<const SampleData> data, int length, double tempo, double pitch)
+// start, length: the part of the file that loops (the whole loop, or the Ventana).
+std::unique_ptr<RubberRender> makeRubberRender (std::shared_ptr<const SampleData> data, int start, int length, double tempo, double pitch)
 {
     using RB = RubberBand::RubberBandStretcher;
     const auto& buf = data->loopAudio.getNumSamples() >= data->length ? data->loopAudio : data->audio;
-    const float* a = buf.getReadPointer (0);
-    const float* b = buf.getReadPointer (std::min (1, buf.getNumChannels() - 1));
+    start = juce::jlimit (0, std::max (0, buf.getNumSamples() - length), start);
+    const float* a = buf.getReadPointer (0) + start;
+    const float* b = buf.getReadPointer (std::min (1, buf.getNumChannels() - 1)) + start;
     const int total = 3 * length;
     std::vector<float> inL ((size_t) total), inR ((size_t) total);
     for (int i = 0; i < total; ++i)
@@ -156,6 +170,7 @@ std::unique_ptr<RubberRender> makeRubberRender (std::shared_ptr<const SampleData
     render->pitch = pitch;
     render->sample = data.get();
     render->loopLength = length;
+    render->loopStart = start;
     return render;
 }
 
@@ -183,16 +198,19 @@ void ReanimaProcessor::serviceRubber()
         return;
     const double tempo = engine.rubberWantTempo.load(), pitch = engine.rubberWantPitch.load();
     const auto data = uiSample;
-    const int length = std::max (1, data->loopInfo.length > 0 ? std::min (data->loopInfo.length, data->length) : data->length);
-    if (rubberCurrent != nullptr && rubberCurrent->sample == data.get() && rubberCurrent->loopLength == length
+    const int full = std::max (1, data->loopInfo.length > 0 ? std::min (data->loopInfo.length, data->length) : data->length);
+    // The part the voice plays (Ventana), as it asked for it.
+    const int length = juce::jlimit (1, full, engine.rubberWantLength.load() > 0 ? engine.rubberWantLength.load() : full);
+    const int start = juce::jlimit (0, full - length, engine.rubberWantStart.load());
+    if (rubberCurrent != nullptr && rubberCurrent->sample == data.get() && rubberCurrent->loopLength == length && rubberCurrent->loopStart == start
         && std::abs (rubberCurrent->tempo - tempo) < 1.0e-6 && std::abs (rubberCurrent->pitch - pitch) < 1.0e-6)
         return;
     if (tempo < 0.05 || tempo > 20.0 || pitch < 0.05 || pitch > 20.0)
         return;
     rubberBusy = true;
-    rubberPool.addJob ([this, data, tempo, pitch, length]
+    rubberPool.addJob ([this, data, tempo, pitch, start, length]
     {
-        delete rubberDone.exchange (makeRubberRender (data, length, tempo, pitch).release());
+        delete rubberDone.exchange (makeRubberRender (data, start, length, tempo, pitch).release());
         rubberBusy = false;
     });
 }
@@ -221,11 +239,14 @@ void ReanimaProcessor::updateSlices()
     const auto data = uiSample;
     const auto marks = apvts.state.getProperty ("sliceMarks").toString();
     const auto orderText = apvts.state.getProperty ("sliceOrder").toString();
+    const auto editsText = apvts.state.getProperty ("hitEdits").toString();
+    const auto edits = HitEdits::fromString (editsText);
     const int by = (int) paramValue (P::SliceBy), division = (int) paramValue (P::SliceDivision);
     const float sensitivity = paramValue (P::SliceSensitivity);
     const double beats = loopBeatsNow();
     const juce::String signature = juce::String::toHexString ((juce::pointer_sized_int) data.get()) + "|" + juce::String (by) + "|"
-                                 + juce::String (division) + "|" + juce::String (sensitivity, 3) + "|" + juce::String (beats, 4) + "|" + marks + "|" + orderText;
+                                 + juce::String (division) + "|" + juce::String (sensitivity, 3) + "|" + juce::String (beats, 4) + "|" + marks + "|" + orderText
+                                 + "|" + editsText;
     if (signature == sliceSignature)
         return;
     sliceSignature = signature;
@@ -275,6 +296,9 @@ void ReanimaProcessor::updateSlices()
             for (const auto& h : s.loopInfo.hits)
                 if (h.second >= threshold && peak (h.first, h.first + after) >= 1.047f * peak (h.first - before, h.first))
                     points.push_back (h.first);
+            // The hits the user turned off or added (HitEdits).
+            std::sort (points.begin(), points.end());
+            points = edits.apply (points, length, minGap, HitEdits::tolerance (s.sampleRate));
         }
         std::sort (points.begin(), points.end());
         std::vector<int> kept { 0 };
@@ -286,6 +310,29 @@ void ReanimaProcessor::updateSlices()
         points = std::move (kept);
     }
     slicePoints = points;
+    // Beats's cuts with the same corrections (none: the analysis's own, as they always were).
+    beatPoints.clear();
+    if (data != nullptr && ! edits.empty())
+    {
+        const auto& s = *data;
+        const int length = std::max (1, s.loopInfo.length > 0 ? std::min (s.loopInfo.length, s.length) : s.length);
+        beatPoints = edits.apply (s.loopInfo.slices, length, std::max (1, (int) (0.04 * s.sampleRate)), HitEdits::tolerance (s.sampleRate));
+    }
+    engine.setBeatCuts (data.get(), beatPoints);
+    // Por golpe in TIMBRE: a hit whose peak is that of the loop's strong hits (three quarters under it) counts as full.
+    {
+        float ref = 1.0f;
+        if (data != nullptr && ! data->loopInfo.hits.empty())
+        {
+            std::vector<float> strengths;
+            for (const auto& h : data->loopInfo.hits)
+                strengths.push_back (SynthEngine::hitPeak (*data, h.first));
+            const size_t k = (size_t) (0.75 * (double) (strengths.size() - 1));
+            std::nth_element (strengths.begin(), strengths.begin() + (long) k, strengths.end());
+            ref = std::max (1.0e-6f, strengths[k]);
+        }
+        engine.hitStrengthRef.store (ref, std::memory_order_relaxed);
+    }
     // The order of the slices on the keys (EDICIÓN): kept while it fits these slices, else the file's order.
     sliceOrder.clear();
     for (const auto& t : juce::StringArray::fromTokens (orderText, ",", ""))
@@ -446,6 +493,8 @@ bool ReanimaProcessor::renderExport (const juce::File& out, int format, double r
         curve[i] = droneCurve[i].load (std::memory_order_relaxed);
     e.setDroneCurve (curve.data());
     e.setSlices (slicePoints, sliceOrder);
+    e.setBeatCuts (data.get(), beatPoints);
+    e.hitStrengthRef.store (engine.hitStrengthRef.load (std::memory_order_relaxed), std::memory_order_relaxed);
     constexpr int block = 256;
     std::unique_ptr<RubberRender> rubber;
     if (looping && ! slicing && (int) p[P::LoopAlgo] == P::LoopRubberBand && ! events.empty())
@@ -462,7 +511,9 @@ bool ReanimaProcessor::renderExport (const juce::File& out, int format, double r
         probe.process (b, m, p, tempo);
         if (probe.rubberWanted.load())
         {
-            rubber = makeRubberRender (data, length, probe.rubberWantTempo.load(), probe.rubberWantPitch.load());
+            const int wantLength = probe.rubberWantLength.load() > 0 ? std::min (probe.rubberWantLength.load(), length) : length;
+            rubber = makeRubberRender (data, juce::jlimit (0, length - wantLength, probe.rubberWantStart.load()), wantLength,
+                                       probe.rubberWantTempo.load(), probe.rubberWantPitch.load());
             e.rubberReady.store (rubber.get());
         }
     }
@@ -524,6 +575,55 @@ bool ReanimaProcessor::renderExport (const juce::File& out, int format, double r
         return false;
     }
     return true;
+}
+
+void ReanimaProcessor::setHitEdits (const HitEdits& edits)
+{
+    const auto text = edits.toString();
+    if (text.isEmpty())
+        apvts.state.removeProperty ("hitEdits", nullptr);
+    else
+        apvts.state.setProperty ("hitEdits", text, nullptr);
+    updateSlices();
+}
+
+HitEdits ReanimaProcessor::getHitEdits() const
+{
+    return HitEdits::fromString (apvts.state.getProperty ("hitEdits").toString());
+}
+
+std::vector<int> ReanimaProcessor::getLoopCuts() const
+{
+    if (uiSample == nullptr)
+        return {};
+    if ((int) paramValue (P::LoopKind) == P::LoopSlice || paramValue (P::LoopHitEnv) > 0.5f)
+        return slicePoints;
+    return beatPoints.empty() ? uiSample->loopInfo.slices : beatPoints;
+}
+
+bool ReanimaProcessor::hitsEditable() const
+{
+    if (uiSample == nullptr || (int) paramValue (P::PlayMode) != P::PlayLoop)
+        return false;
+    return (int) paramValue (P::LoopKind) != P::LoopSlice || (int) paramValue (P::SliceBy) == P::SliceTransients;
+}
+
+void ReanimaProcessor::toggleHit (int at, bool isCut)
+{
+    if (uiSample == nullptr)
+        return;
+    auto edits = getHitEdits();
+    if (edits.toggle (at, isCut, HitEdits::tolerance (uiSample->sampleRate)))
+        setHitEdits (edits);
+}
+
+void ReanimaProcessor::addHit (int at)
+{
+    if (uiSample == nullptr)
+        return;
+    auto edits = getHitEdits();
+    edits.add (at, HitEdits::tolerance (uiSample->sampleRate));
+    setHitEdits (edits);
 }
 
 void ReanimaProcessor::setSliceMarks (std::vector<int> marks)
@@ -616,9 +716,24 @@ void ReanimaProcessor::moveFxSlot (int fromSlot, int toChain, int toIndex)
     timerCallback();
 }
 
+juce::AudioProcessor::BusesProperties ReanimaProcessor::buses()
+{
+    // The output, and an input on the side (the sidechain: the key of another track). Not in the standalone
+    // app, where an input would be the computer's microphone.
+    auto b = BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true);
+    if (juce::PluginHostType::getPluginLoadedAs() != wrapperType_Standalone)
+        b = b.withInput ("Sidechain", juce::AudioChannelSet::stereo(), true);
+    return b;
+}
+
 bool ReanimaProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
-    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo();
+    if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
+        return false;
+    for (const auto& in : layouts.inputBuses)
+        if (! in.isDisabled() && in != juce::AudioChannelSet::mono() && in != juce::AudioChannelSet::stereo())
+            return false;
+    return true;
 }
 
 void ReanimaProcessor::snapshot (ParamSnapshot& out) const
@@ -664,7 +779,70 @@ void ReanimaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     for (size_t i = 0; i < curve.size(); ++i)
         curve[i] = droneCurve[i].load (std::memory_order_relaxed);
     engine.setDroneCurve (curve.data());
-    engine.process (buffer, midi, audioParams, bpm);
+    // the key from the notes played: each note-on (note and velocity in one int) into a ring the message thread empties
+    for (const auto meta : midi)
+    {
+        const auto msg = meta.getMessage();
+        if (msg.isNoteOn())
+        {
+            const unsigned w = noteRingWrite.load (std::memory_order_relaxed);
+            noteRing[w % noteRing.size()].store (msg.getNoteNumber() | (msg.getVelocity() << 8), std::memory_order_relaxed);
+            noteRingWrite.store (w + 1, std::memory_order_release);
+        }
+        // the keys down now (the chord played)
+        if (msg.isNoteOn())
+            keysDown[(size_t) (msg.getNoteNumber() / 64)].fetch_or (std::uint64_t (1) << (msg.getNoteNumber() % 64), std::memory_order_relaxed);
+        else if (msg.isNoteOff())
+            keysDown[(size_t) (msg.getNoteNumber() / 64)].fetch_and (~(std::uint64_t (1) << (msg.getNoteNumber() % 64)), std::memory_order_relaxed);
+        else if (msg.isAllNotesOff() || msg.isAllSoundOff())
+            for (auto& k : keysDown)
+                k.store (0, std::memory_order_relaxed);
+    }
+    // ARP · SEQ: the keys pressed become the steps' notes (off: the MIDI as it came, untouched)
+    juce::MidiBuffer* engineMidi = &midi;
+    if (audioParams[(size_t) P::ArpOn] > 0.5f || arp.active())
+    {
+        arpPattern.read (arpPatternAudio);
+        arp.process (midi, arpMidi, buffer.getNumSamples(), seqSettings (audioParams), arpPatternAudio, playing, ppq, bpm);
+        engineMidi = &arpMidi;
+    }
+    // the sidechain (before the engine writes over the buffer), in mono, into a ring the message thread analyses
+    bool sideGiven = false;
+    if (getBusCount (true) > 0)
+    {
+        const auto side = getBusBuffer (buffer, true, 0);
+        const int ch = side.getNumChannels(), n = side.getNumSamples();
+        // and as it is, for the matrix's Sidechain source and Impronta (a block longer than the copy has room for
+        // goes without: never an allocation here)
+        if (ch > 0 && n <= sideCopy.getNumSamples() && sideCopy.getNumChannels() >= 2)
+        {
+            sideCopy.copyFrom (0, 0, side, 0, 0, n);
+            sideCopy.copyFrom (1, 0, side, std::min (1, ch - 1), 0, n);
+            engine.setSidechain (sideCopy.getReadPointer (0), sideCopy.getReadPointer (1), n);
+            sideGiven = true;
+        }
+        if (ch > 0)
+        {
+            int start1, size1, start2, size2;
+            sideFifo.prepareToWrite (n, start1, size1, start2, size2);
+            const auto copy = [&] (int to, int from, int count)
+            {
+                for (int i = 0; i < count; ++i)
+                {
+                    float v = 0.0f;
+                    for (int c = 0; c < ch; ++c)
+                        v += side.getSample (c, from + i);
+                    sideRing[(size_t) (to + i)] = v;
+                }
+            };
+            copy (start1, 0, size1);
+            copy (start2, size1, size2);
+            sideFifo.finishedWrite (size1 + size2);        // (a full ring: the rest of the block is dropped)
+        }
+    }
+    if (! sideGiven)
+        engine.setSidechain (nullptr, nullptr, 0);
+    engine.process (buffer, *engineMidi, audioParams, bpm);
     if (isNonRealtime() && engine.rubberWanted.load())
     {
         // An offline render (bounce, freeze, the DAW's export) runs faster than the background render: it
@@ -675,8 +853,356 @@ void ReanimaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         serviceRubber();
     }
     matchLoudness (buffer);
+    mixPreview (buffer);
     measureOutput (buffer);     // the meter shows the level before the output stage: 0 dB is where saturation starts
     saturateOutput (buffer);
+}
+
+void ReanimaProcessor::serviceKey()
+{
+    // the notes played since the last tick, and the histogram fading (half in 30 s)
+    const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
+    if (keyClock > 0.0)
+        midiHistogram.fade (now - keyClock);
+    keyClock = now;
+    const unsigned w = noteRingWrite.load (std::memory_order_acquire);
+    if (w - noteRingRead > noteRing.size())
+        noteRingRead = w - (unsigned) noteRing.size();          // fell behind: the newest only
+    for (; noteRingRead != w; ++noteRingRead)
+    {
+        const int v = noteRing[noteRingRead % noteRing.size()].load (std::memory_order_relaxed);
+        midiHistogram.noteOn (v & 0x7f, (float) ((v >> 8) & 0x7f) / 127.0f);
+    }
+    // ARP · SEQ: the key in use and the pattern, for the audio thread
+    {
+        const auto k = keyInUse();
+        keyRootNow.store (k.root);
+        keyMinorNow.store (k.minor);
+        const auto text = apvts.state.getProperty ("seqPattern").toString();
+        if (text != arpPatternText)
+        {
+            arpPatternText = text;
+            arpPattern.write (StepSeq::Pattern::fromString (text));
+        }
+    }
+    // the chord played or heard: a new one goes on the progression once it has held for two ticks (0.2 s; the
+    // notes of a chord pressed one after another, an arpeggio, do not each count)
+    {
+        auto now = midiChord();
+        if (now.root < 0)
+        {
+            const auto heard = externalChord();
+            if (heard.confidence >= chordHeardSure)
+                now = heard;
+        }
+        if (now.root >= 0 && now == chordCandidate)
+        {
+            if (++chordTicks == 2 && (progression.empty() || progression.back() != now))
+            {
+                progression.push_back (now);
+                if (progression.size() > 8)
+                    progression.erase (progression.begin());
+            }
+        }
+        else
+        {
+            chordCandidate = now;
+            chordTicks = now.root >= 0 ? 1 : 0;
+        }
+    }
+    // the sidechain's sound since the last tick
+    {
+        const double rate = sideRate.load();
+        if (rate != sideStreamRate)
+        {
+            sideStreamRate = rate;
+            sideStream.reset (rate);
+        }
+        if (keyClock > 0.0 && lastSideFade > 0.0)
+            sideStream.fade (now - lastSideFade);
+        lastSideFade = now;
+        int start1, size1, start2, size2;
+        const int ready = sideFifo.getNumReady();
+        sideFifo.prepareToRead (ready, start1, size1, start2, size2);
+        sideStream.push (sideRing.data() + start1, size1);
+        sideStream.push (sideRing.data() + start2, size2);
+        sideFifo.finishedRead (size1 + size2);
+    }
+
+    // the sample's key: its name at once, its sound on the analysis pool
+    const auto data = uiSample;
+    if (data.get() != keyEstimatedFor)
+    {
+        keyEstimatedFor = data.get();
+        auto named = data != nullptr ? KeyDetect::fromName (sampleFile.getFileName().isNotEmpty() ? sampleFile.getFileName() : data->name) : KeyDetect::Estimate();
+        if (named.root < 0 && data != nullptr)
+            named = KeyDetect::fromName (data->name);
+        {
+            const juce::ScopedLock sl (keyLock);
+            sampleKeyEstimate = named;
+        }
+        if (data != nullptr && named.root < 0)
+        {
+            const juce::WeakReference<ReanimaProcessor> self (this);
+            loader.addJob ([self, data]
+            {
+                const auto heard = KeyDetect::fromAudio (data->audio, data->sampleRate);
+                juce::MessageManager::callAsync ([self, data, heard]
+                {
+                    if (auto* p = self.get())
+                        if (p->uiSample == data)
+                        {
+                            const juce::ScopedLock sl (p->keyLock);
+                            p->sampleKeyEstimate = heard;
+                        }
+                });
+            });
+        }
+    }
+}
+
+KeyDetect::Estimate ReanimaProcessor::sampleKey() const
+{
+    const juce::ScopedLock sl (keyLock);
+    return sampleKeyEstimate;
+}
+
+ReanimaProcessor::KeyInUse ReanimaProcessor::keyInUse()
+{
+    KeyInUse k;
+    const int source = (int) paramValue (P::KeySource);
+    if (source == 0)
+    {
+        k.root = (int) paramValue (P::KeyRoot);
+        k.minor = (int) paramValue (P::KeyScale) == 1;
+        return k;
+    }
+    k.estimate = source == 1 ? sampleKey() : source == 2 ? midiKey() : externalKey();
+    // From the sample: what its name says applies; what its sound says is a suggestion only (measured: the key or
+    // its relative some 3 times in 4 at best), applied with Fijar. From the notes played and from the sidechain
+    // (measured: 9 times in 10 when it is sure, on 20 to 40 s of material in one key): when sure enough.
+    const bool sure = k.estimate.root >= 0 && (source == 1 ? k.estimate.fromName : k.estimate.confidence >= keySure);
+    if (sure)
+    {
+        lastSureRoot = k.estimate.root;
+        lastSureMinor = k.estimate.minor;
+    }
+    else
+        k.doubtful = true;
+    k.root = lastSureRoot;
+    k.minor = lastSureMinor;
+    return k;
+}
+
+KeyDetect::Chord ReanimaProcessor::midiChord() const
+{
+    std::vector<int> notes;
+    for (int n = 0; n < 128; ++n)
+        if ((keysDown[(size_t) (n / 64)].load (std::memory_order_relaxed) >> (n % 64)) & 1u)
+            notes.push_back (n);
+    return KeyDetect::chordFromNotes (notes);
+}
+
+StepSeq::Settings ReanimaProcessor::seqSettings (const ParamSnapshot& p) const noexcept
+{
+    StepSeq::Settings s;
+    s.on = p[(size_t) P::ArpOn] > 0.5f;
+    s.seq = p[(size_t) P::ArpMode] > 0.5f;
+    s.style = (int) p[(size_t) P::ArpStyle];
+    s.direction = (int) p[(size_t) P::SeqDir];
+    s.stepBeats = StepSeq::rateBeats ((int) p[(size_t) P::ArpRate]);
+    s.octaves = juce::roundToInt (p[(size_t) P::ArpOctaves]);
+    s.swing = p[(size_t) P::ArpSwing] / 100.0f;
+    s.gate = p[(size_t) P::ArpGate] / 100.0f;
+    s.latch = p[(size_t) P::ArpLatch] > 0.5f;
+    s.sync = p[(size_t) P::ArpSync] < 0.5f;
+    s.freeBpm = p[(size_t) P::ArpBpm];
+    s.keyRoot = keyRootNow.load (std::memory_order_relaxed);
+    s.keyMinor = keyMinorNow.load (std::memory_order_relaxed);
+    return s;
+}
+
+void ReanimaProcessor::setSeqPattern (const StepSeq::Pattern& p)
+{
+    if (p == StepSeq::Pattern())
+        apvts.state.removeProperty ("seqPattern", nullptr);
+    else
+        apvts.state.setProperty ("seqPattern", p.toString(), nullptr);
+    arpPatternText = apvts.state.getProperty ("seqPattern").toString();
+    arpPattern.write (p);
+}
+
+juce::File ReanimaProcessor::patternFolder()
+{
+    return juce::File::getSpecialLocation (juce::File::userDocumentsDirectory).getChildFile ("Blackpanda").getChildFile ("Reanima").getChildFile ("Patrones");
+}
+
+// The pattern as a MIDI clip: the step engine run offline as the DAW would play it from bar 1 (its tempo, or
+// 120), with the chord last held (Arp; none yet: Do mayor from Do3) or the key last pressed (Seq; none: Do3).
+// Probabilidad and the random orders come out as one take (a fixed seed: the same clip each time).
+juce::File ReanimaProcessor::writeSeqMidi (int bars) const
+{
+    const auto pattern = seqPattern();
+    ParamSnapshot p;
+    snapshot (p);
+    auto s = seqSettings (p);
+    s.on = true;
+    s.sync = true;
+    const double bpm = lastBpm.load() > 0.0 ? lastBpm.load() : 120.0;
+    if (bars <= 0)
+    {
+        // until the lanes meet again (their lengths' least common multiple), whole bars, 1 to 8
+        juce::int64 steps = 1;
+        for (const int len : pattern.length)
+            steps = std::lcm (steps, (juce::int64) juce::jlimit (1, StepSeq::maxSteps, len));
+        bars = juce::jlimit (1, 8, (int) std::ceil (steps * s.stepBeats / 4.0 - 1.0e-9));
+    }
+    const double rate = 48000.0;
+    const int block = 480;
+    StepSeq::Player player;
+    player.prepare (rate);
+    player.setSeed (2026);
+    juce::MidiBuffer keys, out;
+    auto chord = arp.lastChord();
+    if (chord.count == 0)
+    {
+        chord.count = s.seq ? 1 : 3;
+        chord.note = { 60, 64, 67 };
+        chord.velocity = { 100, 100, 100 };
+    }
+    if (s.seq)
+    {
+        // the key pressed last: the chord's last note as held
+        chord.note[0] = chord.note[(size_t) chord.count - 1];
+        chord.count = 1;
+    }
+    for (int i = 0; i < chord.count; ++i)
+        keys.addEvent (juce::MidiMessage::noteOn (1, chord.note[(size_t) i], (juce::uint8) juce::jlimit (1, 127, chord.velocity[(size_t) i])), 0);
+    constexpr int ppqTicks = 960;
+    juce::MidiMessageSequence track;
+    track.addEvent (juce::MidiMessage::tempoMetaEvent ((int) std::round (60000000.0 / bpm)), 0.0);
+    track.addEvent (juce::MidiMessage::timeSignatureMetaEvent (4, 4), 0.0);
+    const double beats = bars * 4.0;
+    const double samplesPerBeat = rate * 60.0 / bpm;
+    const auto total = (juce::int64) std::ceil (beats * samplesPerBeat);
+    for (juce::int64 at = 0; at < total + block * 4; at += block)
+    {
+        const double ppq = at / samplesPerBeat;
+        // past the clip's end: the keys let go, the last notes end
+        juce::MidiBuffer in;
+        if (at == 0)
+            in = keys;
+        else if (at >= total && at < total + block)
+            for (int i = 0; i < chord.count; ++i)
+                in.addEvent (juce::MidiMessage::noteOff (1, chord.note[(size_t) i]), 0);
+        player.process (in, out, block, s, pattern, at < total, ppq, bpm);
+        for (const auto meta : out)
+        {
+            const auto msg = meta.getMessage();
+            if (! msg.isNoteOnOrOff())
+                continue;
+            const double tick = std::min (beats * ppqTicks, std::round ((at + meta.samplePosition) / samplesPerBeat * ppqTicks));
+            if (msg.isNoteOn() && tick >= beats * ppqTicks)
+                continue;
+            track.addEvent (msg, tick);
+        }
+    }
+    track.addEvent (juce::MidiMessage::endOfTrack(), beats * ppqTicks);
+    track.sort();
+    track.updateMatchedPairs();
+    // a note left without its end (cut by the clip's end) ends there
+    for (int i = 0; i < track.getNumEvents(); ++i)
+        if (auto* e = track.getEventPointer (i); e->message.isNoteOn() && e->noteOffObject == nullptr)
+            track.addEvent (juce::MidiMessage::noteOff (1, e->message.getNoteNumber()), beats * ppqTicks - 1);
+    track.sort();
+    track.updateMatchedPairs();
+    juce::MidiFile file;
+    file.setTicksPerQuarterNote (ppqTicks);
+    file.addTrack (track);
+    const auto folder = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Reanima MIDI");
+    folder.createDirectory();
+    const auto outFile = folder.getChildFile (juce::String (s.seq ? "Reanima secuencia " : "Reanima arpegio ") + juce::String (bars) + " comp.mid");
+    outFile.deleteFile();
+    juce::FileOutputStream stream (outFile);
+    if (! stream.openedOk() || ! file.writeTo (stream, 1))
+        return {};
+    return outFile;
+}
+
+void ReanimaProcessor::fixKey (const KeyDetect::Estimate& e)
+{
+    if (e.root < 0)
+        return;
+    setParam (P::KeyRoot, (float) e.root);
+    setParam (P::KeyScale, e.minor ? 1.0f : 0.0f);
+    setParam (P::KeySource, 0.0f);
+}
+
+bool ReanimaProcessor::previewFile (const juce::File& file)
+{
+    delete previewTrash.exchange (nullptr, std::memory_order_acq_rel);     // the clip the audio thread let go of
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
+    if (reader == nullptr || reader->sampleRate <= 0.0)
+        return false;
+    auto clip = std::make_unique<PreviewClip>();
+    const int length = (int) std::min<juce::int64> (reader->lengthInSamples, (juce::int64) (15.0 * reader->sampleRate));
+    clip->audio.setSize (2, std::max (1, length));
+    clip->audio.clear();
+    reader->read (&clip->audio, 0, length, 0, true, reader->numChannels > 1);
+    if (reader->numChannels == 1)
+        clip->audio.copyFrom (1, 0, clip->audio, 0, 0, length);
+    clip->rate = reader->sampleRate;
+    previewStop.store (false, std::memory_order_release);
+    delete previewMail.exchange (clip.release(), std::memory_order_acq_rel);   // one the audio thread never took
+    return true;
+}
+
+void ReanimaProcessor::mixPreview (juce::AudioBuffer<float>& buffer) noexcept
+{
+    if (auto* fresh = previewMail.exchange (nullptr, std::memory_order_acq_rel))
+    {
+        if (previewPlaying != nullptr)
+        {
+            // handed back to the message thread (it empties this before each new clip)
+            if (auto* left = previewTrash.exchange (previewPlaying, std::memory_order_acq_rel))
+                previewTrash.store (left, std::memory_order_release);     // never: kept rather than freed here
+        }
+        previewPlaying = fresh;
+        previewPos = 0.0;
+        previewGain = 1.0f;
+    }
+    if (previewPlaying == nullptr || buffer.getNumChannels() < 2)
+    {
+        previewOn.store (false, std::memory_order_release);
+        return;
+    }
+    const auto& a = previewPlaying->audio;
+    const int length = a.getNumSamples();
+    const double step = previewPlaying->rate / std::max (1.0, getSampleRate());
+    const float fade = 1.0f / (float) std::max (1.0, 0.005 * getSampleRate());
+    const bool stopping = previewStop.load (std::memory_order_acquire);
+    float* L = buffer.getWritePointer (0);
+    float* R = buffer.getWritePointer (1);
+    const float* l = a.getReadPointer (0);
+    const float* r = a.getReadPointer (1);
+    for (int i = 0; i < buffer.getNumSamples() && previewGain > 0.0f; ++i)
+    {
+        const int k = (int) previewPos;
+        if (k + 1 >= length)
+        {
+            previewGain = 0.0f;
+            break;
+        }
+        if (stopping || k + (int) (0.005 * previewPlaying->rate) >= length)
+            previewGain = std::max (0.0f, previewGain - fade);
+        const float f = (float) (previewPos - k), g = 0.5f * previewGain;      // -6 dB
+        L[i] += g * (l[k] + f * (l[k + 1] - l[k]));
+        R[i] += g * (r[k] + f * (r[k + 1] - r[k]));
+        previewPos += step;
+    }
+    previewOn.store (previewGain > 0.0f, std::memory_order_release);
 }
 
 // The output stage (MasterStage): clean up to the meter's 0 dB, saturation from 0 to +6 dB, never past -1 dBFS,
@@ -953,6 +1479,7 @@ void ReanimaProcessor::finishLoad (Load& load)
         startFresh();
         apvts.state.removeProperty ("sliceMarks", nullptr);     // a new sample's slices are its own
         apvts.state.removeProperty ("sliceOrder", nullptr);
+        apvts.state.removeProperty ("hitEdits", nullptr);       // and so are its hits
         if ((int) paramValue (P::SliceBy) == P::SliceManual)
             setParam (P::SliceBy, (float) P::SliceTransients);
     }

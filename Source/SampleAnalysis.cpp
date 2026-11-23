@@ -696,6 +696,36 @@ void analysePartials (SampleData& d, const std::vector<float>& mono)
     for (int k = 0; k < K; ++k) current[(size_t) k] = chosen[(size_t) k].bin;
     for (int f = refFrame - 1; f >= 0; --f) track (f);
 
+    // The partials of a frame cannot hold more power than the sound has there (measured over the same window).
+    // Peaks read off a noisy spectrum each take the level of its loudest bin near them, and many of them added up
+    // to more than the whole: they are scaled down together to it.
+    {
+        double wPower = 0.0;
+        for (const float x : w)
+            wPower += (double) x * x;
+        for (int f = 0; f < pm.numFrames; ++f)
+        {
+            const int c = f * hop;
+            double power = 0.0;
+            for (int i = 0; i < N; ++i)
+            {
+                const int t = c - N / 2 + i;
+                if (t >= 0 && t < (int) mono.size())
+                    power += (double) (mono[(size_t) t] * w[(size_t) i]) * (mono[(size_t) t] * w[(size_t) i]);
+            }
+            power /= wPower;
+            double partials = 0.0;
+            for (int k = 0; k < K; ++k)
+                partials += 0.5 * (double) pm.amp[(size_t) f * K + k] * pm.amp[(size_t) f * K + k];
+            if (partials > power && partials > 0.0)
+            {
+                const float scale = (float) std::sqrt (power / partials);
+                for (int k = 0; k < K; ++k)
+                    pm.amp[(size_t) f * K + k] *= scale;
+            }
+        }
+    }
+
     pm.pan.resize ((size_t) K);
     for (int k = 0; k < K; ++k)
         pm.pan[(size_t) k] = panWeight[(size_t) k] > 0.0 ? (float) (panSum[(size_t) k] / panWeight[(size_t) k]) : 0.0f;
@@ -713,6 +743,9 @@ void analysePartials (SampleData& d, const std::vector<float>& mono)
         pm.lastFrame = pm.numFrames - 1;
         while (pm.lastFrame > refFrame && energy[(size_t) pm.lastFrame] < maxEnergy * 1.0e-6)
             --pm.lastFrame;
+        // (only for a file cut while it still sounds, its last frame within 30 dB of the loudest: one that fades
+        // out to its end reads its last frames as they are, and its tail falls as it was measured)
+        pm.holdFrame = energy[(size_t) pm.lastFrame] >= maxEnergy * 1.0e-3 ? juce::jlimit (0, pm.lastFrame, (n - N / 2) / hop) : pm.lastFrame;
 
         pm.decayDbPerSec.assign ((size_t) K, std::max (3.0f, d.detected.fadeDbPerSec));
         const int from = std::max (refFrame, pm.lastFrame / 2);
@@ -772,7 +805,8 @@ void analysePartials (SampleData& d, const std::vector<float>& mono)
 
         constexpr int size = NoiseSynth::size;
         const auto& win = NoiseSynth::window();
-        std::vector<float> buf ((size_t) size * 2);
+        std::vector<float> buf ((size_t) size * 2), orig ((size_t) size * 2);
+        std::vector<char> covered ((size_t) size / 2 + 1);
         pm.noise.assign ((size_t) pm.numFrames * SampleData::PartialModel::numBands, 0.0f);
         const float nBinHz = (float) (sr / size);
 
@@ -788,19 +822,196 @@ void analysePartials (SampleData& d, const std::vector<float>& mono)
             }
             NoiseSynth::fft().performRealOnlyForwardTransform (buf.data(), true);
 
+            // The same frame of the sound itself, and the bins its partials do not cover (more than 2 bins from
+            // each, the main lobe of the window): the noise between them, measured without the partials. Where the
+            // partials taken away from the sound do not cancel it exactly (a phase a little off) what is left was
+            // counted as noise, and engine C sounded noisier than the sample (39 of 321 one-shots, the most by
+            // 19 dB of flatness): each band takes the lower of the two measures.
+            std::fill (orig.begin(), orig.end(), 0.0f);
+            for (int i = 0; i < size; ++i)
+            {
+                const int t = c - size / 2 + i;
+                if (t >= 0 && t < n)
+                    orig[(size_t) i] = mono[(size_t) t] * win[(size_t) i];
+            }
+            NoiseSynth::fft().performRealOnlyForwardTransform (orig.data(), true);
+            std::fill (covered.begin(), covered.end(), (char) 0);
+            for (int k = 0; k < K; ++k)
+                if (pm.amp[(size_t) f * K + k] > 1.0e-6f)
+                {
+                    const int at = (int) std::round (pm.freq[(size_t) f * K + k] / nBinHz);
+                    for (int j = std::max (0, at - 2); j <= std::min (size / 2, at + 2); ++j)
+                        covered[(size_t) j] = 1;
+                }
+
             for (int b = 0; b < SampleData::PartialModel::numBands; ++b)
             {
                 int k0 = (int) std::ceil (pm.bandEdges[(size_t) b] / nBinHz);
                 int k1 = (int) std::floor (pm.bandEdges[(size_t) b + 1] / nBinHz);
                 k1 = std::min (k1, size / 2 - 1);
                 if (k1 < k0) k1 = k0 = juce::jlimit (1, size / 2 - 1, (int) std::round (0.5f * (pm.bandEdges[(size_t) b] + pm.bandEdges[(size_t) b + 1]) / nBinHz));
-                double power = 0.0;
+                double power = 0.0, between = 0.0;
+                int free = 0;
                 for (int k = k0; k <= k1; ++k)
+                {
                     power += (double) buf[(size_t) k * 2] * buf[(size_t) k * 2] + (double) buf[(size_t) k * 2 + 1] * buf[(size_t) k * 2 + 1];
-                pm.noise[(size_t) f * SampleData::PartialModel::numBands + b] = (float) std::sqrt (power / (k1 - k0 + 1));
+                    if (! covered[(size_t) k])
+                    {
+                        between += (double) orig[(size_t) k * 2] * orig[(size_t) k * 2] + (double) orig[(size_t) k * 2 + 1] * orig[(size_t) k * 2 + 1];
+                        ++free;
+                    }
+                }
+                double perBin = power / (k1 - k0 + 1);
+                if (free > 0)
+                    perBin = std::max (0.25 * perBin, std::min (perBin, between / free));       // down by 6 dB at most
+                pm.noise[(size_t) f * SampleData::PartialModel::numBands + b] = (float) std::sqrt (perBin);
             }
         }
     }
+}
+
+// Engine C on a sound whose sides differ (their correlation under 0.3): each side analysed on its own, the
+// partials of both in one model ordered by frequency (so that Parciales takes the lowest of both), each marked
+// with its side; the noise, the two sides' mean (in power). Twice the partials to play: about twice the work.
+void splitPartials (SampleData& d)
+{
+    if (! d.partials.valid() || d.audio.getNumChannels() < 2)
+        return;
+    const int n = std::min (d.length, (int) (d.sampleRate * 20.0));
+    const float* L = d.audio.getReadPointer (0);
+    const float* R = d.audio.getReadPointer (1);
+    double lr = 0.0, ll = 0.0, rr = 0.0;
+    for (int i = 0; i < n; ++i)
+    {
+        lr += (double) L[i] * R[i];
+        ll += (double) L[i] * L[i];
+        rr += (double) R[i] * R[i];
+    }
+    // (only a wide sound, its sides correlated under 0.3: measured on the reference library, side by side the two
+    // apart come closer to the sample, by 0.7 dB of spectrum under 0.3, 0.3 dB to 0.6, 0.1 dB to 0.9; summed to mono
+    // they come 0.4 to 0.7 dB further; where the sides are much alike that is not worth it)
+    if (ll <= 1.0e-12 || rr <= 1.0e-12 || lr / std::sqrt (ll * rr) >= 0.3)
+        return;
+    const auto side = [&d] (int ch)
+    {
+        SampleData t;
+        t.sampleRate = d.sampleRate;
+        t.length = d.length;
+        t.pitched = d.pitched;
+        t.period = d.period;
+        t.peak = d.peak;
+        t.rootMidi = d.rootMidi;
+        t.detected = d.detected;
+        t.audio.setSize (2, d.length);
+        t.audio.copyFrom (0, 0, d.audio, ch, 0, d.length);
+        t.audio.copyFrom (1, 0, d.audio, ch, 0, d.length);
+        std::vector<float> m (d.audio.getReadPointer (ch), d.audio.getReadPointer (ch) + d.length);
+        analysePartials (t, m);
+        tunePartials (t);
+        return t.partials;
+    };
+    auto pl = side (0), pr = side (1);
+    if (! pl.valid() || ! pr.valid() || pl.numFrames != pr.numFrames || pl.hop != pr.hop)
+        return;
+    // The same partial on both sides (the same note, as most stereo recordings have it): one frequency for both,
+    // their mean, so that the two keep the phase between them they had. Each side measured its own, a little
+    // apart, and the two drifted in and out of phase: summed to mono a pluck lost 19 dB at moments.
+    {
+        const auto loudest = [] (const SampleData::PartialModel& pm, int k)
+        {
+            float top = 0.0f, hz = 0.0f;
+            for (int f = 0; f < pm.numFrames; ++f)
+                if (const float a = pm.amp[(size_t) f * pm.numPartials + k]; a > top)
+                {
+                    top = a;
+                    hz = pm.freq[(size_t) f * pm.numPartials + k];
+                }
+            return hz;
+        };
+        std::vector<float> hzR ((size_t) pr.numPartials);
+        for (int k = 0; k < pr.numPartials; ++k)
+            hzR[(size_t) k] = loudest (pr, k);
+        std::vector<bool> taken ((size_t) pr.numPartials, false);
+        const float tolerance = (float) (pl.hop * 4) > 0.0f ? (float) (d.sampleRate / 8192.0) : 3.0f;     // about a bin
+        for (int k = 0; k < pl.numPartials; ++k)
+        {
+            const float hz = loudest (pl, k);
+            int match = -1;
+            for (int j = 0; j < pr.numPartials; ++j)
+                if (! taken[(size_t) j] && std::abs (hzR[(size_t) j] - hz) <= std::max (tolerance, 0.004f * hz)
+                    && (match < 0 || std::abs (hzR[(size_t) j] - hz) < std::abs (hzR[(size_t) match] - hz)))
+                    match = j;
+            if (match < 0)
+                continue;
+            taken[(size_t) match] = true;
+            for (int f = 0; f < pl.numFrames; ++f)
+            {
+                auto& a = pl.freq[(size_t) f * pl.numPartials + k];
+                auto& b = pr.freq[(size_t) f * pr.numPartials + match];
+                const float mean = a > 0.0f && b > 0.0f ? 0.5f * (a + b) : std::max (a, b);
+                a = b = mean;
+                // and never more than a quarter of a cycle apart (phases in cycles): in a sound whose sides are
+                // unrelated, the phase between them at the moment the partials are set is anyone's, and frozen
+                // opposed it cancelled summed to mono (a pluck at -0.66 of correlation, where the sample is at 0)
+                const float pa = pl.phase[(size_t) f * pl.numPartials + k];
+                auto& pb = pr.phase[(size_t) f * pr.numPartials + match];
+                float apart = pb - pa;
+                apart -= std::round (apart);
+                pb = pa + juce::jlimit (-0.25f, 0.25f, apart);
+            }
+        }
+    }
+    // the order: by each partial's frequency where it is loudest
+    struct Entry { float hz; int side, k; };
+    std::vector<Entry> order;
+    for (int s = 0; s < 2; ++s)
+    {
+        const auto& pm = s == 0 ? pl : pr;
+        for (int k = 0; k < pm.numPartials; ++k)
+        {
+            float top = 0.0f, hz = 0.0f;
+            for (int f = 0; f < pm.numFrames; ++f)
+                if (const float a = pm.amp[(size_t) f * pm.numPartials + k]; a > top)
+                {
+                    top = a;
+                    hz = pm.freq[(size_t) f * pm.numPartials + k];
+                }
+            order.push_back ({ hz, s, k });
+        }
+    }
+    std::stable_sort (order.begin(), order.end(), [] (const Entry& a, const Entry& b) { return a.hz < b.hz; });
+    auto& pm = d.partials;
+    const int K = (int) order.size(), frames = pl.numFrames;
+    pm.numPartials = K;
+    pm.numFrames = frames;
+    pm.hop = pl.hop;
+    pm.lastFrame = std::max (pl.lastFrame, pr.lastFrame);
+    pm.holdFrame = std::min (pl.holdFrame, pr.holdFrame);
+    pm.refFreq = std::min (pl.refFreq, pr.refFreq);
+    pm.amp.assign ((size_t) frames * K, 0.0f);
+    pm.freq.assign ((size_t) frames * K, 0.0f);
+    pm.phase.assign ((size_t) frames * K, 0.0f);
+    pm.pan.assign ((size_t) K, 0.0f);
+    pm.decayDbPerSec.assign ((size_t) K, 0.0f);
+    for (int j = 0; j < K; ++j)
+    {
+        const auto& e = order[(size_t) j];
+        const auto& src = e.side == 0 ? pl : pr;
+        for (int f = 0; f < frames; ++f)
+        {
+            const size_t from = (size_t) f * src.numPartials + e.k, to = (size_t) f * K + j;
+            pm.amp[to] = src.amp[from];
+            pm.freq[to] = src.freq[from];
+            pm.phase[to] = src.phase[from];
+        }
+        pm.pan[(size_t) j] = e.side == 0 ? -1.0f : 1.0f;
+        pm.decayDbPerSec[(size_t) j] = src.decayDbPerSec[(size_t) e.k];
+    }
+    pm.bandEdges = pl.bandEdges;
+    pm.noise.assign (pl.noise.size(), 0.0f);
+    for (size_t i = 0; i < pm.noise.size() && i < pr.noise.size(); ++i)
+        pm.noise[i] = std::sqrt (0.5f * (pl.noise[i] * pl.noise[i] + pr.noise[i] * pr.noise[i]));
+    pm.split = true;
 }
 
 // Crossfades the tail [loopLen, loopLen + xf) into the head [0, xf) of `region` so the
@@ -1035,7 +1246,7 @@ bool makeAdditiveFreeze (const SampleData& d, int start, int end, juce::AudioBuf
         const double pitchRate = 1 + rng.nextInt (3), pitchPhase = rng.nextDouble();
         const double pitchDepth = freq[(size_t) k] * 0.0009 / (juce::MathConstants<double>::twoPi * pitchRate / seconds);
         float gl, gr;
-        Dsp::panGains (pm.pan[(size_t) k], gl, gr);
+        pm.gains (k, gl, gr);
         gl *= a;
         gr *= a;
 
@@ -1325,6 +1536,102 @@ static void findMarks (SampleData& d, const std::vector<float>& mono)
         d.marks.push_back (m);
 }
 
+// The colour of a sound in SampleData::Colour's octave bands: the power of each band in one frame (Hann window)
+// of `x` at `centre`, in dB.
+static void colourOfFrame (const juce::dsp::FFT& fft, std::vector<float>& work, const std::vector<float>& window,
+                           const float* x, int length, int centre, double sr, float* outDb)
+{
+    using C = SampleData::Colour;
+    const int size = fft.getSize();
+    std::fill (work.begin(), work.end(), 0.0f);
+    for (int i = 0; i < size; ++i)
+    {
+        const int at = centre - size / 2 + i;
+        if (at >= 0 && at < length)
+            work[(size_t) i] = x[at] * window[(size_t) i];
+    }
+    fft.performFrequencyOnlyForwardTransform (work.data());
+    std::array<double, C::numBands> power {};
+    const double binHz = sr / size;
+    for (int k = 1; k <= size / 2; ++k)
+    {
+        const double hz = k * binHz;
+        const int b = (int) std::floor (std::log2 (hz / C::lowestHz) + 0.5);    // the band whose centre is nearest
+        if (b >= 0 && b < C::numBands)
+            power[(size_t) b] += (double) work[(size_t) k] * work[(size_t) k];
+    }
+    for (int b = 0; b < C::numBands; ++b)
+        outDb[b] = (float) (10.0 * std::log10 (power[(size_t) b] + 1.0e-20));
+}
+
+// SampleData::Colour: the sound's colour frame by frame, and that of its two sustain sources (their whole loop).
+static void measureColour (SampleData& d, const std::vector<float>& mono)
+{
+    using C = SampleData::Colour;
+    auto& c = d.colour;
+    const double sr = d.sampleRate;
+    int order = 12;
+    while (order > 9 && (1 << order) > 0.1 * sr)        // about 85 ms at 44.1 and 48 kHz, as long at any rate
+        --order;
+    while ((1 << order) < 0.07 * sr && order < 15)
+        ++order;
+    const juce::dsp::FFT fft (order);
+    const int size = 1 << order;
+    c.hop = size / 4;
+    std::vector<float> work ((size_t) size * 2), window ((size_t) size);
+    for (int i = 0; i < size; ++i)
+        window[(size_t) i] = 0.5f - 0.5f * std::cos (Dsp::twoPi * (float) i / (float) size);
+
+    c.numFrames = std::max (1, d.length / c.hop + 1);
+    c.db.assign ((size_t) c.numFrames * C::numBands, -200.0f);
+    std::vector<float> total ((size_t) c.numFrames, -200.0f);
+    float loudest = -200.0f;
+    for (int f = 0; f < c.numFrames; ++f)
+    {
+        float* out = c.db.data() + (size_t) f * C::numBands;
+        colourOfFrame (fft, work, window, mono.data(), d.length, f * c.hop, sr, out);
+        double sum = 0.0;
+        for (int b = 0; b < C::numBands; ++b)
+            sum += std::pow (10.0, out[b] / 10.0);
+        total[(size_t) f] = (float) (10.0 * std::log10 (sum + 1.0e-20));
+        loudest = std::max (loudest, total[(size_t) f]);
+    }
+    const int endFrame = std::min (c.numFrames - 1, (int) (std::max (d.onset, d.usableEnd) / c.hop));
+    c.lastGood = 0;
+    for (int f = 0; f <= endFrame; ++f)
+        if (total[(size_t) f] > loudest - 50.0f)
+            c.lastGood = f;
+
+    // A sustain source: its colour over the whole loop (read round, as it plays).
+    const auto ofSource = [&] (const SampleData::SustainSource& src, std::array<float, C::numBands>& out)
+    {
+        out.fill (-200.0f);
+        const int len = src.loop.getNumSamples();
+        if (len <= 0)
+            return;
+        std::vector<float> loop ((size_t) len * 3);
+        for (int i = 0; i < len; ++i)
+        {
+            const float v = 0.5f * (src.loop.getSample (0, i) + src.loop.getSample (std::min (1, src.loop.getNumChannels() - 1), i));
+            loop[(size_t) i] = loop[(size_t) (i + len)] = loop[(size_t) (i + 2 * len)] = v;
+        }
+        std::array<double, C::numBands> power {};
+        int frames = 0;
+        std::array<float, C::numBands> one {};
+        for (int centre = len; centre < 2 * len || frames == 0; centre += c.hop)
+        {
+            colourOfFrame (fft, work, window, loop.data(), 3 * len, centre, sr, one.data());
+            for (int b = 0; b < C::numBands; ++b)
+                power[(size_t) b] += std::pow (10.0, one[(size_t) b] / 10.0);
+            ++frames;
+        }
+        for (int b = 0; b < C::numBands; ++b)
+            out[(size_t) b] = (float) (10.0 * std::log10 (power[(size_t) b] / frames + 1.0e-20));
+    };
+    ofSource (d.early, c.early);
+    ofSource (d.late, c.late);
+}
+
 // How the sound is set going (SampleData::Excitation): its attack and how it holds, how much
 // of it is tone and how much noise, its colour and its lowest register, and the moment and
 // polarity of the first peak. Measured on the mix of both channels.
@@ -1347,6 +1654,19 @@ static void measureExcitation (SampleData& d, const std::vector<float>& mono)
     e.attackMs = d.detected.attack * 1000.0f;
     e.transientDb = (float) (20.0 * std::log10 (rms (0.0, 0.015) / rms (0.06, 0.25)));
     e.sustain = juce::jlimit (0.0f, 1.0f, (20.0f * std::log10 (std::max (1.0e-6f, d.envAt (d.peak + 0.4 * sr))) + 30.0f) / 27.0f);
+    {
+        Dsp::Biquad low;
+        low.set (Dsp::Biquad::LowPass, sr, 120.0f, 0.7071f);
+        const int to = juce::jlimit (on, n, (int) std::max (d.usableEnd, (double) on + 1.0));
+        double all = 0.0, lows = 0.0;
+        for (int i = on; i < to; ++i)
+        {
+            const float x = mono[(size_t) i], y = low.process (0, x);
+            all += (double) x * x;
+            lows += (double) y * y;
+        }
+        e.lowShare = all > 1.0e-20 ? (float) std::min (1.0, lows / all) : 0.0f;
+    }
 
     // The strike, within the attack and 10 ms more (40 ms at most): where the attack first
     // reaches half its height and climbs on to its first top (RMS over 1 ms, every quarter of a
@@ -1647,26 +1967,75 @@ std::vector<Onset> onsets (const std::vector<float>& fl, const std::vector<float
         if (fl[(size_t) f] < median + 0.15f * p95 || fl[(size_t) f] < 0.08f * p95)
             continue;
         // The frame sees the rise somewhere in its window. The hit's peak there, then back from it while the
-        // level (the peak of each 0.5 ms) stays over a tenth of it: where that rise begins is the hit.
-        const int from = std::max (0, f * hop - hop / 2), to = std::min ((int) mono.size(), f * hop + frameSize);
+        // level (the peak of each 0.5 ms) stays over a tenth of the rise: where that rise begins is the hit.
+        // The rise is counted from what sounded in the 20 ms before the frame (the tail of the note before; 20 ms
+        // hold a cycle down to 50 Hz), not from silence: over a loud tail the level never fell under a tenth of
+        // the peak, and the walk went back through the tail itself, up to 25 ms early. A low tail can be well under
+        // its peak just when the hit comes, and the hit then shows late in the level; its attack shows at once in
+        // the slope (the difference from one sample to the next), where a low tail hardly is: the walk is made on
+        // both, and the earlier start is taken when the slope's peak stands clear of what came before (a low hit
+        // over a noisy tail has no slope of its own).
+        const int from = std::max (0, f * hop - frameSize), to = std::min ((int) mono.size(), f * hop + frameSize);
         const int w = std::max (8, frameSize / 48);        // about 0.5 ms
-        int top = from;
-        float topLevel = 0.0f;
-        for (int i = from; i < to; ++i)
-            if (std::abs (mono[(size_t) i]) > topLevel)
-            {
-                topLevel = std::abs (mono[(size_t) i]);
-                top = i;
-            }
-        int begin = top;
-        for (int at = top - w; at >= from; at -= w)
+        const int before = 40 * w;          // some 20 ms
+        const auto walk = [&] (auto value)
         {
-            float level = 0.0f;
-            for (int i = at; i < at + w; ++i)
-                level = std::max (level, std::abs (mono[(size_t) i]));
-            if (level < 0.1f * topLevel)
-                break;
-            begin = at;
+            int top = from;
+            float topLevel = 0.0f;
+            for (int i = std::max (1, from); i < to; ++i)
+                if (value (i) > topLevel)
+                {
+                    topLevel = value (i);
+                    top = i;
+                }
+            float earlier = 0.0f;
+            for (int i = std::max (1, from - before); i < from; ++i)
+                earlier = std::max (earlier, value (i));
+            const float threshold = earlier + 0.1f * std::max (0.0f, topLevel - earlier);
+            // A low tone crosses zero every half cycle, and a window of 0.5 ms there is nearly silent (6 ms into an
+            // 80 Hz hit): the walk ends only after 10 ms under the threshold, at the last window over it.
+            int begin = top, under = 0;
+            for (int at = top - w; at >= std::max (1, from) && under < 20; at -= w)
+            {
+                float level = 0.0f;
+                for (int i = at; i < at + w; ++i)
+                    level = std::max (level, value (i));
+                if (level < threshold)
+                    ++under;
+                else
+                {
+                    under = 0;
+                    begin = at;
+                }
+            }
+            return std::pair<int, float> { begin, topLevel / std::max (1.0e-9f, earlier) };
+        };
+        const auto byLevel = walk ([&mono] (int i) { return std::abs (mono[(size_t) i]); });
+        const auto bySlope = walk ([&mono] (int i) { return std::abs (mono[(size_t) i] - mono[(size_t) i - 1]); });
+        int begin = bySlope.second > 2.0f ? std::min (byLevel.first, bySlope.first) : byLevel.first;
+        if (byLevel.second < 1.15f)
+        {
+            // The hit does not stand over what sounded before (a tone straight after another as loud, with no
+            // gap): as it was, back from the peak while the level stays over a tenth of it, within the frame.
+            const int start = std::max (0, f * hop - hop / 2);
+            int top = start;
+            float topLevel = 0.0f;
+            for (int i = start; i < to; ++i)
+                if (std::abs (mono[(size_t) i]) > topLevel)
+                {
+                    topLevel = std::abs (mono[(size_t) i]);
+                    top = i;
+                }
+            begin = top;
+            for (int at = top - w; at >= start; at -= w)
+            {
+                float level = 0.0f;
+                for (int i = at; i < at + w; ++i)
+                    level = std::max (level, std::abs (mono[(size_t) i]));
+                if (level < 0.1f * topLevel)
+                    break;
+                begin = at;
+            }
         }
         out.push_back ({ std::max (0, begin - w), fl[(size_t) f] / std::max (1.0e-9f, p95) });
     }
@@ -1703,27 +2072,27 @@ static void detectLoop (SampleData& d, const std::vector<float>& mono)
 
     // A length a DAW writes: a whole number of beats at a whole (or half) tempo, to 2 samples.
     static constexpr int counts[] = { 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64 };
+    // Every count that does (a length of 64 beats at 116 is also 48 at 87, and 16 at 120 is 12 at 90): which one,
+    // the hits say below. The first one found, the smallest, used to win: 39 of 102 song stems at 3/4 of their tempo.
+    constexpr int numCounts = (int) std::size (counts);
+    std::array<bool, numCounts> exactAt {};
     bool exact = false;
-    int exactBeats = 0;
-    double exactBpm = 0.0;
-    for (const int beats : counts)
-        for (double bpm = 60.0; bpm <= 200.0 && ! exact; bpm += 0.5)
-            if (std::abs (seconds - beats * 60.0 / bpm) * sr < 2.5)
-            {
-                exact = true;
-                exactBeats = beats;
-                exactBpm = bpm;
-            }
+    for (int c = 0; c < numCounts; ++c)
+        for (double bpm = 60.0; bpm <= 200.0 && ! exactAt[(size_t) c]; bpm += 0.5)
+            if (std::abs (seconds - counts[c] * 60.0 / bpm) * sr < 2.5)
+                exactAt[(size_t) c] = exact = true;
 
     // The grid: for each count of beats, how well the hits fall on its sixteenths from the first sample on,
     // above what hits anywhere would do by chance; weighed by how likely such a tempo and length are.
     double bestScore = 0.0, bestFit = 0.0;
     int bestBeats = 0;
     double hitWeight = 0.0;
+    std::array<double, numCounts> scoreAt {};
     for (const auto& h : hits)
         hitWeight += std::min (2.0f, h.strength);
-    for (const int beats : counts)
+    for (int c = 0; c < numCounts; ++c)
     {
+        const int beats = counts[c];
         const double bpm = beats * 60.0 / seconds;
         if (bpm < 55.0 || bpm > 210.0)
             continue;
@@ -1741,6 +2110,7 @@ static void detectLoop (SampleData& d, const std::vector<float>& mono)
         const double prior = std::exp (-0.5 * (octaves / 0.55) * (octaves / 0.55))
                            * (beats == 4 || beats == 8 || beats == 16 || beats == 32 ? 1.0 : beats == 2 || beats == 64 || beats == 12 || beats == 24 ? 0.7 : 0.45);
         const double score = std::max (0.0, excess) * prior;
+        scoreAt[(size_t) c] = score;
         if (score > bestScore)
         {
             bestScore = score;
@@ -1799,10 +2169,21 @@ static void detectLoop (SampleData& d, const std::vector<float>& mono)
         }
     }
     if (beats == 0 && exact)
-        beats = exactBeats;
+    {
+        // the exact count whose grid the hits fit best (the prior already prefers 4, 8, 16, 32 and a tempo near
+        // 120); with no hits to tell, the one of those counts, else the largest
+        int pick = -1;
+        for (int c = 0; c < numCounts; ++c)
+            if (exactAt[(size_t) c] && (pick < 0 || scoreAt[(size_t) c] > scoreAt[(size_t) pick] + 1.0e-9))
+                pick = c;
+        if (pick >= 0 && scoreAt[(size_t) pick] <= 1.0e-9)
+            for (int c = 0; c < numCounts; ++c)
+                if (exactAt[(size_t) c] && (counts[c] == 4 || counts[c] == 8 || counts[c] == 16 || counts[c] == 32 || counts[c] == 64))
+                    pick = c;
+        beats = counts[pick];
+    }
     if (beats == 0 && bestBeats > 0 && bestFit > 0.3)
         beats = bestBeats;
-    juce::ignoreUnused (exactBpm);
 
     double confidence = 0.0;
     confidence += 0.55 * why + (why > 0.0 && nameError < 0.003 ? 0.2 : 0.0);
@@ -2174,6 +2555,22 @@ std::shared_ptr<SampleData> analyse (const juce::AudioBuffer<float>& source, dou
     while (usableFrame > peakFrame && env[(size_t) usableFrame] < 0.01f)
         --usableFrame;
     d->usableEnd = std::min ((double) n, (double) usableFrame * hop);
+    d->endFallDbPerSec = 0.0f;
+    {
+        double sum = 0.0;
+        int count = 0;
+        for (int f = std::max (0, (int) (d->onset / hop)); f <= usableFrame && f < frames; ++f, ++count)
+            sum += (double) env[(size_t) f] * env[(size_t) f];
+        d->meanLevel = count > 0 ? (float) juce::jlimit (0.01, 1.0, std::sqrt (sum / count)) : 1.0f;
+    }
+    if (endFrame + 1 < frames)
+    {
+        const int from = std::max (peakFrame, endFrame - (int) std::ceil (0.05 * sr / hop));
+        const double seconds = std::max (1, endFrame + 1 - from) * (double) hop / sr;
+        const float a = std::max (1.0e-6f, env[(size_t) from]), b = std::max (1.0e-6f, env[(size_t) endFrame + 1]);
+        d->endFallDbPerSec = (float) juce::jlimit (3.0, 2000.0, 20.0 * std::log10 (a / b) / seconds);
+        d->soundEnd = std::min ((double) n, (double) (endFrame + 1) * hop);
+    }
 
     // The envelope when the attack ends at `peakPos` (frame `fromFrame`); `underTop`: below the loudest.
     // `earlier`: also the one 0.9.5 found there (its decay fit could let the sustain fall first).
@@ -2270,12 +2667,14 @@ std::shared_ptr<SampleData> analyse (const juce::AudioBuffer<float>& source, dou
     {
         analysePartials (*d, mono);
         tunePartials (*d);
+        splitPartials (*d);
 
         // Sustain sources: at the sustain point (Sostenido) and the last part of the
         // audible sample (Natural, so the original plays almost to the end).
         buildSource (*d, d->early, d->sustainPos);
         const double lateLen = std::min (0.6 * sr, std::max (0.08 * sr, (d->usableEnd - d->sustainPos) * 0.5));
         buildSource (*d, d->late, std::max (d->onset, d->usableEnd - lateLen));
+        measureColour (*d, mono);
         d->forAllEngines = true;
     }
 

@@ -88,11 +88,23 @@ public:
 class LfoShape : public ParamView
 {
 public:
-    LfoShape (ReanimaProcessor& p, int shapeParam);
+    LfoShape (ReanimaProcessor& p, int shapeParam, int smoothParam);
     void paint (juce::Graphics& g) override;
 
 private:
-    const int shape;
+    const int shape, smooth;
+};
+
+// The matrix's Sidechain source now: a bar from 0 to 1, and whether anything comes in.
+class SidechainMeter : public ParamView, private juce::Timer
+{
+public:
+    explicit SidechainMeter (ReanimaProcessor& p);
+    void paint (juce::Graphics& g) override;
+
+private:
+    void timerCallback() override;
+    float shown = 0.0f;
 };
 
 // Engine F's drawn filter: a gain from 20 Hz to 20 kHz, drawn with the mouse. Double click

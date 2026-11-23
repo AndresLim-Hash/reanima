@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "SampleBrowser.h"
 #include "FactoryPresets.h"
 #include "Mechanism.h"
 
@@ -396,6 +397,11 @@ ReanimaEditor::ReanimaEditor (ReanimaProcessor& p)
     loadButton.setColour (juce::TextButton::textColourOffId, Theme::text);
     loadButton.onClick = [this] { openFileChooser(); };
     content.addAndMakeVisible (loadButton);
+    browseButton.setTooltip (P::u8 ("Explorador de samples: tus carpetas de Ableton Live (también las de Splice: lo que Live descarga "
+                                    "de su pestaña Splice y la carpeta de la app de Splice) y las que añadas. Clic escucha, doble clic carga. "
+                                    "Ableton no deja arrastrar desde su pestaña Splice a un plug-in de otra marca: desde aquí sí llegas a esos samples."));
+    browseButton.onClick = [this] { showBrowser (browseButton.getToggleState()); };
+    content.addAndMakeVisible (browseButton);
 
     sampleLabel.setFont (Theme::font (15.0f, true));
     sampleLabel.setBorderSize ({});
@@ -425,8 +431,10 @@ ReanimaEditor::ReanimaEditor (ReanimaProcessor& p)
     tabs.addTab (P::u8 ("FILTRO · MOD"), Theme::bg, &filterPage, false);
     tabs.addTab ("MATRIZ", Theme::bg, &matrixPage, false);
     tabs.addTab ("FX", Theme::bg, &fxPage, false);
+    tabs.addTab (P::u8 ("ARP · SEQ"), Theme::bg, &arpPage, false);
     const char* tabHelp[] = { "Sample, motor, timbre, envolvente y voz.", "Recorte, fundidos, bucle, ganancia y envolvente de pitch.", "Filtro, segunda envolvente, macros y LFO.",
-                              "Conecta fuentes de modulación con destinos.", "Efectos: cadena Main y dos buses en paralelo." };
+                              "Conecta fuentes de modulación con destinos.", "Efectos: cadena Main y dos buses en paralelo.",
+                              "Tonalidad, arpegiador y secuenciador." };
     for (int i = 0; i < tabs.getNumTabs(); ++i)
     {
         auto* tab = tabs.getTabbedButtonBar().getTabButton (i);
@@ -568,6 +576,7 @@ void ReanimaEditor::buildPages()
     buildEditPage();
     buildFilterPage();
     buildMatrixPage();
+    buildArpPage();
 
     for (auto& s : sections)
         s->resized();
@@ -712,7 +721,9 @@ void ReanimaEditor::startWelcome()
         "EDICIÓN: recorta, corta, pega, funde y haz bucles en el sample sin tocar el archivo original.",
         "FILTRO · MOD: el filtro con su envolvente, tres LFO, cuatro macros y la expresión de tu teclado.",
         "MATRIZ: conecta cualquier fuente de movimiento (LFO, velocidad, rueda, azar...) con lo que quieras mover.",
-        "FX: una cadena MAIN y dos buses en paralelo, con reverbs, delays, distorsiones y más." };
+        "FX: una cadena MAIN y dos buses en paralelo, con reverbs, delays, distorsiones y más.",
+        "ARP · SEQ: la tonalidad (a mano, del sample o de lo que tocas) y, pronto, el arpegiador y el secuenciador." };
+    static_assert (std::size (tabText) == (size_t) TabGuides::numTabs, "a text for each tab");
     std::vector<Step> steps {
         { "Bienvenido a Reanima", P::u8 ("Reanima convierte un solo sample en un instrumento. En un minuto: dónde está cada cosa y cómo empezar. "
                                          "Puedes cerrar este tour cuando quieras."), {}, 0 },
@@ -806,6 +817,8 @@ void ReanimaEditor::buildSamplePage()
     onlyFor (motor.add (make<Knob> (st, P::Flatten)), { B, D });
     onlyFor (motor.add (make<Knob> (st, P::GrainFade)), { B, D });
     onlyFor (motor.add (make<Knob> (st, P::GrainBlend)), { B, D });
+    dimUnless (onlyFor (motor.add (make<Knob> (st, P::SustainMotion)), { B, D }),
+               [this] { return (int) proc.paramValue (P::SustainType) == P::SustainHold; });
     onlyFor (motor.add (make<Knob> (st, P::Partials)), { C });
     onlyFor (motor.add (make<Knob> (st, P::NoiseLevel)), { C });
 
@@ -814,6 +827,7 @@ void ReanimaEditor::buildSamplePage()
     onlyFor (motor.add (make<Knob> (st, P::GrainPos)), { E, F });
     for (const int id : { P::GrainMs, P::GrainDensity, P::Spray })
         onlyFor (motor.add (make<Knob> (st, id)), { E });
+    onlyFor (motor.add (make<Toggle> (st, P::GrainCoherent), 1.0f, 28), { E });
     motor.row();
     for (const int id : { P::GranSpeed, P::GrainPitch, P::GrainReverse, P::GrainWidth })
         onlyFor (motor.add (make<Knob> (st, id)), { E });
@@ -833,6 +847,7 @@ void ReanimaEditor::buildSamplePage()
     onlyFor (motor.add (make<Choice> (st, P::LoopKind)), { loopPanel, slicePanel });
     onlyFor (motor.add (make<Choice> (st, P::LoopBeats)), { loopPanel });
     dimUnless (onlyFor (motor.add (make<Choice> (st, P::LoopAlgo)), { loopPanel }), warping);
+    onlyFor (motor.add (make<Choice> (st, P::LoopWinLen)), { loopPanel });
     onlyFor (motor.add (make<Choice> (st, P::SliceBy)), { slicePanel });
     dimUnless (onlyFor (motor.add (make<Choice> (st, P::SliceDivision)), { slicePanel }),
                [this] { return (int) proc.paramValue (P::SliceBy) == P::SliceGrid; });
@@ -848,6 +863,7 @@ void ReanimaEditor::buildSamplePage()
                [this] { return (int) proc.paramValue (P::SliceBy) == P::SliceTransients; });
     dimUnless (onlyFor (motor.add (make<Knob> (st, P::SliceSensitivity)), { loopPanel }),
                [this] { return proc.paramValue (P::LoopHitEnv) > 0.5f && (int) proc.paramValue (P::SliceBy) == P::SliceTransients; });
+    dimUnless (onlyFor (motor.add (make<Knob> (st, P::LoopWinPos)), { loopPanel }), [this] { return (int) proc.paramValue (P::LoopWinLen) > 0; });
     onlyFor (motor.add (make<Knob> (st, P::SliceStart)), { slicePanel });
     onlyFor (motor.add (make<Knob> (st, P::SliceFade)), { slicePanel });
     motor.row (44);
@@ -892,6 +908,9 @@ void ReanimaEditor::buildSamplePage()
     dimUnless (timbreKnob (P::Bow), [this]
     {
         const auto sample = proc.getSample();
+        // In a loop with Por golpe it darkens each hit's Ataque.
+        if ((int) proc.paramValue (P::PlayMode) == P::PlayLoop)
+            return proc.paramValue (P::LoopHitEnv) > 0.5f;
         return (int) proc.paramValue (P::Engine) != P::EngineRebuild
             || (sample != nullptr && proc.paramValue (P::AmpA) * 0.001f > 3.0f * sample->detected.attack);
     });
@@ -928,6 +947,11 @@ void ReanimaEditor::buildSamplePage()
         listenButton->setToggleState (now != SynthEngine::ListenAll, juce::dontSendNotification);
         listenButton->setColour (juce::TextButton::buttonOnColourId, Theme::good.withAlpha (0.55f));
     }
+    // Mecanismo por golpe: lit only where it acts (a loop with Por golpe, Mecanismo on).
+    dimUnless (timbre.add (make<Toggle> (st, P::MechPerHit, "Por golpe"), 0.42f), [this, mechanismOn]
+    {
+        return mechanismOn() && (int) proc.paramValue (P::PlayMode) == P::PlayLoop && proc.paramValue (P::LoopHitEnv) > 0.5f;
+    });
     mechAdvice = &timbre.add (std::make_unique<MechanismAdvice> (proc, mechMenu.box));
 
     auto& amp = addSection (samplePage, "ENVOLVENTE", {}, Theme::accent2);
@@ -1273,12 +1297,19 @@ void ReanimaEditor::buildFilterPage()
     flt.row (84);
     flt.add (make<Knob> (st, P::FltFreq));
     flt.add (make<Knob> (st, P::FltRes));
-    dimUnless (flt.add (make<Knob> (st, P::FltDrive)), [this] { return (int) proc.paramValue (P::FltCircuit) != P::Clean; });
-    dimUnless (flt.add (make<Knob> (st, P::FltMorph)), [this]
+    const auto harmonic = [this] { return (int) proc.paramValue (P::FltType) == P::Harmonic; };
+    const auto notHarmonic = [this] { return (int) proc.paramValue (P::FltType) != P::Harmonic; };
+    dimUnless (showOnly (flt, flt.add (make<Knob> (st, P::FltDrive)), notHarmonic),
+               [this] { return (int) proc.paramValue (P::FltCircuit) != P::Clean; });
+    dimUnless (showOnly (flt, flt.add (make<Knob> (st, P::FltMorph)), notHarmonic), [this]
     {
         const int type = (int) proc.paramValue (P::FltType);
         return type == P::Morph || type == P::DJ || type == P::Comb || type == P::Vowel;
     });
+    // Armónico: how much and where its harmonics are raised or lowered, and odd against even (Morph/DJ's value).
+    showOnly (flt, flt.add (make<Knob> (st, P::FltHarmGain)), harmonic);
+    showOnly (flt, flt.add (make<Knob> (st, P::FltHarmRegion)), harmonic);
+    showOnly (flt, flt.add (make<Knob> (st, P::FltMorph, P::u8 ("Pares/impares"))), harmonic);
     flt.add (make<Knob> (st, P::FltMix));
     flt.add (make<Knob> (st, P::FltKey));
     flt.add (make<Knob> (st, P::FltEnvAmt));
@@ -1301,12 +1332,13 @@ void ReanimaEditor::buildFilterPage()
                                 { margin + l * (lfoWidth + gap), bottomY, lfoWidth, bottomHeight },
                                 l == 0 ? Theme::violet : l == 1 ? Theme::teal : Theme::warning);
         lfo.row();
-        views.push_back (&lfo.add (make<LfoShape> (proc, base + 3)));
+        views.push_back (&lfo.add (make<LfoShape> (proc, base + 3, base + 5)));
         lfo.row (46);
         lfo.add (make<Choice> (st, base + 3));
         auto& division = lfo.add (make<Choice> (st, base + 2));
         lfo.row (84);
         auto& rate = lfo.add (make<Knob> (st, base + 0));
+        lfo.add (make<Knob> (st, base + 5));
         lfo.add (make<Toggle> (st, base + 1), 1.0f, 28);
         lfo.add (make<Toggle> (st, base + 4), 1.0f, 28);
 
@@ -1333,9 +1365,549 @@ void ReanimaEditor::buildFilterPage()
     expression.add (make<Knob> (st, P::VibRate), 1.0f, 116);
 }
 
+namespace
+{
+// TONALIDAD: the key in use, and what the sample and the notes say, with how sure.
+class KeyView : public juce::Component, private juce::Timer
+{
+public:
+    explicit KeyView (ReanimaProcessor& p) : proc (p)
+    {
+        fix.setButtonText ("Fijar");
+        fix.setTooltip (P::u8 ("Pasa la tonalidad sugerida a mano (Tonalidad de: A mano), para que no cambie."));
+        fix.onClick = [this] { proc.fixKey (shown); };
+        addAndMakeVisible (fix);
+        clearChords.setButtonText ("Borrar");
+        clearChords.setTooltip (P::u8 ("Vacía la progresión de acordes."));
+        clearChords.onClick = [this] { proc.clearProgression(); };
+        addAndMakeVisible (clearChords);
+        startTimerHz (5);
+    }
+    void resized() override
+    {
+        fix.setBounds (getWidth() - 74, getHeight() - 30, 70, 26);
+        clearChords.setBounds (getWidth() - 74, progressionTop, 70, 22);
+    }
+    void paint (juce::Graphics& g) override
+    {
+        auto r = getLocalBounds().reduced (4, 2);
+        const auto k = lastInUse;
+        g.setColour (Theme::text);
+        g.setFont (Theme::font (22.0f, true));
+        g.drawText (juce::String::fromUTF8 (KeyDetect::noteName (k.root)) + (k.minor ? " menor" : " mayor"), r.removeFromTop (30), juce::Justification::centredLeft);
+        g.setFont (Theme::font (12.0f));
+        g.setColour (k.doubtful ? Theme::warning : Theme::dim);
+        const int source = (int) proc.paramValue (P::KeySource);
+        g.drawText (source == 0 ? P::u8 ("en uso: elegida a mano")
+                    : k.doubtful ? P::u8 ("en uso: la última segura (la estimación de ahora es dudosa)")
+                                 : P::u8 ("en uso: la estimada"),
+                    r.removeFromTop (18), juce::Justification::centredLeft);
+        r.removeFromTop (8);
+        const auto line = [&g, &r] (const juce::String& what, const juce::String& text, juce::Colour c)
+        {
+            auto row = r.removeFromTop (36);
+            g.setColour (Theme::dim);
+            g.setFont (Theme::caps (10.0f));
+            g.drawText (what, row.removeFromTop (14), juce::Justification::centredLeft);
+            g.setColour (c);
+            g.setFont (Theme::font (12.5f));
+            g.drawFittedText (text, row, juce::Justification::topLeft, 2, 0.9f);
+        };
+        const auto s = sampleEstimate;
+        line ("SAMPLE", s.root < 0 ? P::u8 ("sin tonalidad clara")
+                        : s.fromName ? s.text() + P::u8 (" · por su nombre")
+                        : s.text() + P::u8 (" · por el sonido: acierta unas ") + juce::String (juce::roundToInt (KeyDetect::measuredReliability (s.confidence) * 10.0f))
+                              + P::u8 (" de cada 10 veces (sugerencia)"),
+              s.fromName ? Theme::text : Theme::warning);
+        const auto m = midiEstimate;
+        line ("MIDI", m.root < 0 || m.confidence <= 0.0f ? P::u8 ("toca unas notas...")
+                      : m.text() + " · " + juce::String (juce::roundToInt (m.confidence * 100.0f)) + " %" + (m.confidence < ReanimaProcessor::keySure ? P::u8 (" (dudosa)") : juce::String()),
+              m.confidence >= ReanimaProcessor::keySure ? Theme::text : Theme::warning);
+        const auto x = externalEstimate;
+        line ("AUDIO EXTERNO", ! proc.hasSidechain() ? P::u8 ("sin entrada lateral (sólo en el plugin, no en la aplicación)")
+                               : x.root < 0 || proc.externalSeconds() < 1.0 ? P::u8 ("elige una pista en el panel Sidechain del dispositivo...")
+                               : x.text() + " · " + juce::String (juce::roundToInt (x.confidence * 100.0f)) + " %"
+                                     + (x.confidence < ReanimaProcessor::keySure ? P::u8 (" (dudosa, escuchados ") + juce::String (juce::roundToInt (proc.externalSeconds())) + " s)"
+                                                                                  : juce::String()),
+              x.confidence >= ReanimaProcessor::keySure ? Theme::text : Theme::warning);
+
+        // The chord: the one played (exact), else the one the sidechain's sound suggests; its degree in the key in
+        // use; the last ones played or heard.
+        r.removeFromTop (10);
+        const auto keyName = juce::String::fromUTF8 (KeyDetect::noteName (k.root)) + (k.minor ? " menor" : " mayor");
+        {
+            auto row = r.removeFromTop (44);
+            g.setColour (Theme::dim);
+            g.setFont (Theme::caps (10.0f));
+            g.drawText ("ACORDE", row.removeFromTop (14), juce::Justification::centredLeft);
+            const bool played = playedChord.root >= 0;
+            const auto& c = played ? playedChord : heardChord;
+            if (c.root < 0)
+            {
+                g.setColour (Theme::dim);
+                g.setFont (Theme::font (12.5f));
+                g.drawText (P::u8 ("toca un acorde (3 notas o más)..."), row, juce::Justification::topLeft);
+            }
+            else
+            {
+                g.setColour (played ? Theme::text : Theme::warning);
+                g.setFont (Theme::font (18.0f, true));
+                g.drawText (c.name(), row.removeFromTop (22), juce::Justification::centredLeft);
+                g.setFont (Theme::font (11.5f));
+                g.drawText (c.degreeIn (k.root) + P::u8 (" en ") + keyName
+                                + (played ? P::u8 (" · tocado") : P::u8 (" · audio externo (sugerencia: acierta unas 7 de cada 10 veces)")),
+                            row, juce::Justification::centredLeft, true);
+            }
+        }
+        {
+            auto row = r.removeFromTop (48);
+            if (row.getY() + 14 != progressionTop)
+            {
+                progressionTop = row.getY() + 14;
+                clearChords.setBounds (getWidth() - 74, progressionTop, 70, 22);
+            }
+            g.setColour (Theme::dim);
+            g.setFont (Theme::caps (10.0f));
+            g.drawText (P::u8 ("PROGRESIÓN"), row.removeFromTop (14), juce::Justification::centredLeft);
+            if (progression.empty())
+            {
+                g.setFont (Theme::font (12.0f));
+                g.drawText (P::u8 ("los acordes que toques irán apareciendo aquí"), row, juce::Justification::topLeft);
+            }
+            else
+            {
+                juce::StringArray names, degrees;
+                for (const auto& c : progression)
+                {
+                    names.add (c.name());
+                    degrees.add (c.degreeIn (k.root));
+                }
+                g.setColour (Theme::text);
+                g.setFont (Theme::font (12.5f, true));
+                g.drawFittedText (names.joinIntoString (juce::String::fromUTF8 (" – ")), row.removeFromTop (17).withTrimmedRight (78),
+                                  juce::Justification::centredLeft, 1, 0.8f);
+                g.setColour (Theme::dim);
+                g.setFont (Theme::font (11.5f));
+                g.drawFittedText (degrees.joinIntoString (juce::String::fromUTF8 (" – ")), row.removeFromTop (16).withTrimmedRight (78),
+                                  juce::Justification::centredLeft, 1, 0.8f);
+            }
+        }
+    }
+
+private:
+    void timerCallback() override
+    {
+        lastInUse = proc.keyInUse();
+        sampleEstimate = proc.sampleKey();
+        midiEstimate = proc.midiKey();
+        externalEstimate = proc.externalKey();
+        playedChord = proc.midiChord();
+        heardChord = proc.externalChord();
+        if (heardChord.confidence < ReanimaProcessor::chordHeardSure)
+            heardChord = {};
+        progression = proc.chordProgression();
+        clearChords.setVisible (! progression.empty());
+        const int source = (int) proc.paramValue (P::KeySource);
+        shown = source == 2 ? midiEstimate : source == 3 ? externalEstimate : sampleEstimate;
+        fix.setEnabled (source != 0 && shown.root >= 0);
+        fix.setButtonText (source == 2 ? "Fijar MIDI" : source == 3 ? "Fijar audio" : "Fijar");
+        repaint();
+    }
+    ReanimaProcessor& proc;
+    juce::TextButton fix;
+    ReanimaProcessor::KeyInUse lastInUse;
+    KeyDetect::Estimate sampleEstimate, midiEstimate, externalEstimate, shown;
+    KeyDetect::Chord playedChord, heardChord;
+    std::vector<KeyDetect::Chord> progression;
+    juce::TextButton clearChords;
+    int progressionTop = 268;       // where the progression's line is (paint sets it)
+};
+
+// ARP · SEQ: the lanes of the pattern. Each row a lane (its name, its length, a die), sixteen cells; the step
+// playing lit. Click or drag over the cells to set them (PASO: on and off), double-click a cell for its default.
+class StepGrid : public juce::Component, private juce::Timer
+{
+public:
+    explicit StepGrid (ReanimaProcessor& p) : proc (p)
+    {
+        pattern = proc.seqPattern();
+        const auto setup = [this] (juce::TextButton& b, const char* text, const char* tip)
+        {
+            b.setButtonText (P::u8 (text));
+            b.setTooltip (P::u8 (tip));
+            addAndMakeVisible (b);
+        };
+        setup (generateButton, "Generar", "Un patrón nuevo al azar, en la tonalidad: notas del acorde sobre todo, con la Densidad de pasos encendidos. "
+                                          "Las longitudes de los carriles se quedan.");
+        setup (clearButton, "Borrar", "El patrón por defecto: 16 pasos encendidos, la nota de la tecla, velocidad 100, gate 50 %.");
+        setup (saveButton, "Guardar...", "Guarda el patrón en un archivo (Documentos/Blackpanda/Reanima/Patrones) para usarlo en otros proyectos.");
+        setup (loadButton, "Cargar...", "Carga un patrón guardado.");
+        generateButton.onClick = [this]
+        {
+            juce::Random rng;
+            StepSeq::generate (pattern, -1, proc.paramValue (P::ArpDensity) / 100.0f, rng);
+            commit();
+        };
+        clearButton.onClick = [this] { pattern = StepSeq::Pattern(); commit(); };
+        saveButton.onClick = [this] { savePattern(); };
+        loadButton.onClick = [this] { loadPattern(); };
+        drag = std::make_unique<SeqMidiDrag> (proc);
+        addAndMakeVisible (*drag);
+        startTimerHz (30);
+    }
+
+    void resized() override
+    {
+        auto bar = getLocalBounds().removeFromBottom (28);
+        for (auto* b : { &generateButton, &clearButton, &saveButton, &loadButton })
+        {
+            b->setBounds (bar.removeFromLeft (92));
+            bar.removeFromLeft (6);
+        }
+        drag->setBounds (bar.removeFromRight (170));
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const bool seq = proc.paramValue (P::ArpMode) > 0.5f;
+        for (int lane = 0; lane < StepSeq::numLanes; ++lane)
+        {
+            const auto row = rowArea (lane);
+            const auto head = row.withWidth (headWidth);
+            g.setColour (Theme::dim);
+            g.setFont (Theme::caps (10.0f));
+            g.drawText (StepSeq::laneName (lane), head.withHeight (14), juce::Justification::centredLeft);
+            g.setFont (Theme::font (11.0f));
+            const auto lenBox = lengthArea (lane);
+            g.setColour (Theme::well);
+            g.fillRoundedRectangle (lenBox.toFloat(), 3.0f);
+            g.setColour (Theme::text);
+            g.drawText (juce::String (pattern.length[(size_t) lane]) + P::u8 (" pasos ▾"), lenBox, juce::Justification::centred);
+            drawDie (g, dieArea (lane).toFloat());
+            if (lane == StepSeq::Note)
+            {
+                g.setColour (Theme::dim);
+                g.setFont (Theme::font (9.0f));
+                g.drawText (seq ? P::u8 ("grados desde la tecla") : P::u8 ("grados sobre la nota"), head.withTrimmedTop (head.getHeight() - 12), juce::Justification::centredLeft);
+            }
+
+            const int playing = proc.seqPlayer().shownStep[(size_t) lane].load (std::memory_order_relaxed);
+            for (int k = 0; k < StepSeq::maxSteps; ++k)
+                drawCell (g, lane, k, cellArea (lane, k).toFloat(), k == playing);
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const auto pos = e.getPosition();
+        for (int lane = 0; lane < StepSeq::numLanes; ++lane)
+        {
+            if (lengthArea (lane).contains (pos))
+            {
+                chooseLength (lane);
+                return;
+            }
+            if (dieArea (lane).contains (pos))
+            {
+                juce::Random rng;
+                StepSeq::generate (pattern, lane, proc.paramValue (P::ArpDensity) / 100.0f, rng);
+                commit();
+                return;
+            }
+        }
+        dragLane = -1;
+        if (const auto hit = cellAt (pos); hit.first >= 0)
+        {
+            dragLane = hit.first;
+            if (dragLane == StepSeq::On)
+                paintOn = pattern.at (StepSeq::On, hit.second) < 0.5f ? 1.0f : 0.0f;
+            setCell (hit.first, hit.second, pos.y);
+        }
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (dragLane < 0)
+            return;
+        const auto pos = e.getPosition();
+        const int k = juce::jlimit (0, StepSeq::maxSteps - 1, (pos.x - cellsLeft()) / std::max (1, cellWidth()));
+        setCell (dragLane, k, pos.y);
+    }
+
+    void mouseUp (const juce::MouseEvent&) override { dragLane = -1; }
+
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        if (const auto hit = cellAt (e.getPosition()); hit.first >= 0 && hit.first != StepSeq::On)
+        {
+            pattern.value[(size_t) hit.first][(size_t) hit.second] = StepSeq::laneRange (hit.first).def;
+            commit();
+        }
+    }
+
+private:
+    struct SeqMidiDrag : juce::TextButton
+    {
+        explicit SeqMidiDrag (ReanimaProcessor& p) : juce::TextButton (P::u8 ("ARRASTRAR MIDI")), proc (p)
+        {
+            setTooltip (P::u8 ("Arrastra este botón a una pista MIDI de Ableton: crea un clip con lo que tocaría el patrón, desde el compás 1, "
+                               "con el acorde (Arp) o la tecla (Seq) que pulsaste por última vez (si no, Do mayor). Dura hasta que los carriles "
+                               "vuelven a coincidir (de 1 a 8 compases). Clic: guardarlo como archivo .mid."));
+        }
+        void mouseDrag (const juce::MouseEvent& e) override
+        {
+            if (dragging || e.getDistanceFromDragStart() < 6)
+                return;
+            const auto file = proc.writeSeqMidi();
+            if (! file.existsAsFile())
+                return;
+            dragging = true;
+            juce::DragAndDropContainer::performExternalDragDropOfFiles ({ file.getFullPathName() }, false, this,
+                                                                        [safe = juce::Component::SafePointer<SeqMidiDrag> (this)]
+                                                                        { if (safe != nullptr) safe->dragging = false; });
+        }
+        void clicked() override
+        {
+            if (dragging)
+                return;
+            const auto file = proc.writeSeqMidi();
+            if (! file.existsAsFile())
+                return;
+            chooser = std::make_unique<juce::FileChooser> (P::u8 ("Guardar el clip MIDI"),
+                                                           juce::File::getSpecialLocation (juce::File::userDocumentsDirectory).getChildFile (file.getFileName()), "*.mid");
+            chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
+                                  [file] (const juce::FileChooser& fc)
+                                  {
+                                      const auto target = fc.getResult();
+                                      if (target != juce::File())
+                                          file.copyFileTo (target.withFileExtension ("mid"));
+                                  });
+        }
+        ReanimaProcessor& proc;
+        bool dragging = false;
+        std::unique_ptr<juce::FileChooser> chooser;
+    };
+
+    static constexpr int headWidth = 132;
+    int laneHeight() const { return std::max (20, (getHeight() - 36) / StepSeq::numLanes - 4); }
+    juce::Rectangle<int> rowArea (int lane) const { return { 0, lane * (laneHeight() + 4), getWidth(), laneHeight() }; }
+    juce::Rectangle<int> lengthArea (int lane) const { const auto r = rowArea (lane); return { r.getX(), r.getY() + 16, 74, 18 }; }
+    juce::Rectangle<int> dieArea (int lane) const { const auto r = rowArea (lane); return { r.getX() + 80, r.getY() + 15, 20, 20 }; }
+    int cellsLeft() const { return headWidth; }
+    int cellWidth() const { return (getWidth() - headWidth) / StepSeq::maxSteps; }
+    juce::Rectangle<int> cellArea (int lane, int k) const
+    {
+        const auto r = rowArea (lane);
+        return { cellsLeft() + k * cellWidth() + 1, r.getY(), cellWidth() - 2, r.getHeight() };
+    }
+    std::pair<int, int> cellAt (juce::Point<int> p) const
+    {
+        for (int lane = 0; lane < StepSeq::numLanes; ++lane)
+            if (rowArea (lane).contains (p) && p.x >= cellsLeft())
+                return { lane, juce::jlimit (0, StepSeq::maxSteps - 1, (p.x - cellsLeft()) / std::max (1, cellWidth())) };
+        return { -1, -1 };
+    }
+
+    void drawDie (juce::Graphics& g, juce::Rectangle<float> r)
+    {
+        g.setColour (Theme::well);
+        g.fillRoundedRectangle (r, 4.0f);
+        g.setColour (Theme::dim);
+        g.drawRoundedRectangle (r.reduced (0.5f), 4.0f, 1.0f);
+        const auto c = r.getCentre();
+        const float d = r.getWidth() * 0.24f;
+        for (const auto off : { juce::Point<float> (-d, -d), juce::Point<float> (d, d), juce::Point<float> (0.0f, 0.0f), juce::Point<float> (d, -d), juce::Point<float> (-d, d) })
+            g.fillEllipse (juce::Rectangle<float> (2.6f, 2.6f).withCentre (c + off));
+    }
+
+    void drawCell (juce::Graphics& g, int lane, int k, juce::Rectangle<float> r, bool playing)
+    {
+        const auto range = StepSeq::laneRange (lane);
+        const float v = pattern.at (lane, k);
+        const bool inLength = k < pattern.length[(size_t) lane];
+        const auto colour = Theme::accent.withAlpha (inLength ? 1.0f : 0.25f);
+        g.setColour (Theme::well.brighter (k % 4 == 0 ? 0.12f : 0.0f));
+        g.fillRoundedRectangle (r, 3.0f);
+        if (playing)
+        {
+            g.setColour (Theme::accent2);
+            g.drawRoundedRectangle (r.reduced (0.5f), 3.0f, 1.5f);
+        }
+        const auto inner = r.reduced (2.0f);
+        g.setColour (colour);
+        if (lane == StepSeq::On)
+        {
+            if (v > 0.5f)
+                g.fillRoundedRectangle (inner.reduced (inner.getWidth() * 0.12f, inner.getHeight() * 0.18f), 3.0f);
+            return;
+        }
+        if (range.lo < 0.0f)
+        {
+            // around zero: up or down
+            const float zero = inner.getBottom() - inner.getHeight() * (-range.lo) / (range.hi - range.lo);
+            const float y = inner.getBottom() - inner.getHeight() * (v - range.lo) / (range.hi - range.lo);
+            g.setColour (Theme::dim.withAlpha (0.4f));
+            g.drawHorizontalLine ((int) zero, inner.getX(), inner.getRight());
+            g.setColour (colour);
+            g.fillRect (juce::Rectangle<float>::leftTopRightBottom (inner.getX(), std::min (y, zero), inner.getRight(), std::max (y, zero) + 1.0f));
+        }
+        else
+        {
+            const float frac = (v - range.lo) / (range.hi - range.lo);
+            g.fillRect (inner.withTop (inner.getBottom() - std::max (1.0f, inner.getHeight() * frac)));
+        }
+        g.setColour (Theme::text.withAlpha (inLength ? 0.9f : 0.35f));
+        g.setFont (Theme::font (9.0f));
+        juce::String text;
+        switch (lane)
+        {
+            case StepSeq::Note:     text = v > 0 ? "+" + juce::String ((int) v) : juce::String ((int) v); break;
+            case StepSeq::Octave:   text = v > 0 ? "+" + juce::String ((int) v) : juce::String ((int) v); break;
+            case StepSeq::Velocity: text = juce::String ((int) v); break;
+            case StepSeq::Gate:     text = juce::String (juce::roundToInt (v * 100.0f)); break;
+            case StepSeq::Chance:   text = juce::String (juce::roundToInt (v * 100.0f)); break;
+            case StepSeq::Ratchet:  text = "x" + juce::String ((int) v); break;
+            default: break;
+        }
+        g.drawText (text, r.withHeight (12.0f).translated (0.0f, 1.0f), juce::Justification::centred);
+    }
+
+    void setCell (int lane, int k, int y)
+    {
+        const auto range = StepSeq::laneRange (lane);
+        float v;
+        if (lane == StepSeq::On)
+            v = paintOn;
+        else
+        {
+            const auto r = cellArea (lane, k).toFloat().reduced (2.0f);
+            const float frac = juce::jlimit (0.0f, 1.0f, (r.getBottom() - (float) y) / std::max (1.0f, r.getHeight()));
+            v = range.lo + frac * (range.hi - range.lo);
+            v = range.whole ? std::round (v) : std::round (v * 100.0f) / 100.0f;
+        }
+        if (pattern.value[(size_t) lane][(size_t) k] != v)
+        {
+            pattern.value[(size_t) lane][(size_t) k] = v;
+            commit();
+        }
+    }
+
+    void chooseLength (int lane)
+    {
+        juce::PopupMenu menu;
+        for (int n = 1; n <= StepSeq::maxSteps; ++n)
+            menu.addItem (n, juce::String (n) + P::u8 (n == 1 ? " paso" : " pasos"), true, n == pattern.length[(size_t) lane]);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (localAreaToGlobal (lengthArea (lane))),
+                            [safe = juce::Component::SafePointer<StepGrid> (this), lane] (int n)
+                            {
+                                if (safe != nullptr && n > 0)
+                                {
+                                    safe->pattern.length[(size_t) lane] = n;
+                                    safe->commit();
+                                }
+                            });
+    }
+
+    void savePattern()
+    {
+        const auto folder = ReanimaProcessor::patternFolder();
+        folder.createDirectory();
+        chooser = std::make_unique<juce::FileChooser> (P::u8 ("Guardar el patrón"), folder.getChildFile ("Patron.reanimapat"), "*.reanimapat");
+        chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
+                              [text = pattern.toString()] (const juce::FileChooser& fc)
+                              {
+                                  const auto target = fc.getResult();
+                                  if (target != juce::File())
+                                      target.withFileExtension ("reanimapat").replaceWithText (text);
+                              });
+    }
+
+    void loadPattern()
+    {
+        const auto folder = ReanimaProcessor::patternFolder();
+        folder.createDirectory();
+        chooser = std::make_unique<juce::FileChooser> (P::u8 ("Cargar un patrón"), folder, "*.reanimapat");
+        chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                              [safe = juce::Component::SafePointer<StepGrid> (this)] (const juce::FileChooser& fc)
+                              {
+                                  const auto file = fc.getResult();
+                                  if (safe != nullptr && file.existsAsFile())
+                                  {
+                                      safe->pattern = StepSeq::Pattern::fromString (file.loadFileAsString().trim());
+                                      safe->commit();
+                                  }
+                              });
+    }
+
+    void commit()
+    {
+        proc.setSeqPattern (pattern);
+        shownText = proc.apvts.state.getProperty ("seqPattern").toString();
+        repaint();
+    }
+
+    void timerCallback() override
+    {
+        // a project, preset or undo that changed the pattern
+        const auto text = proc.apvts.state.getProperty ("seqPattern").toString();
+        if (text != shownText)
+        {
+            shownText = text;
+            pattern = StepSeq::Pattern::fromString (text);
+        }
+        repaint();
+    }
+
+    ReanimaProcessor& proc;
+    StepSeq::Pattern pattern;
+    juce::String shownText;
+    int dragLane = -1;
+    float paintOn = 1.0f;
+    juce::TextButton generateButton, clearButton, saveButton, loadButton;
+    std::unique_ptr<SeqMidiDrag> drag;
+    std::unique_ptr<juce::FileChooser> chooser;
+};
+}
+
+void ReanimaEditor::buildArpPage()
+{
+    auto& st = proc.apvts;
+    const int keyWidth = 300;
+    auto& key = addSection (arpPage, "TONALIDAD", { margin, gap, keyWidth, pageHeight }, Theme::violet);
+    key.row (46);
+    key.add (make<Choice> (st, P::KeySource));
+    key.row (46);
+    const auto byHand = [this] { return (int) proc.paramValue (P::KeySource) == 0; };
+    dimUnless (key.add (make<Choice> (st, P::KeyRoot)), byHand);
+    dimUnless (key.add (make<Choice> (st, P::KeyScale)), byHand);
+    key.row (0, 1.0f);
+    key.add (std::make_unique<KeyView> (proc));
+
+    auto& arp = addSection (arpPage, P::u8 ("ARPEGIADOR · SECUENCIADOR"), { margin + keyWidth + gap, gap, pageWidth - keyWidth - gap, pageHeight }, Theme::accent);
+    const auto arpMode = [this] { return proc.paramValue (P::ArpMode) < 0.5f; };
+    const auto seqMode = [this] { return proc.paramValue (P::ArpMode) > 0.5f; };
+    arp.row (46);
+    arp.add (make<Toggle> (st, P::ArpOn), 0.8f, 30);
+    arp.add (make<Choice> (st, P::ArpMode), 0.7f);
+    dimUnless (arp.add (make<Choice> (st, P::ArpStyle), 1.2f), arpMode);
+    dimUnless (arp.add (make<Choice> (st, P::SeqDir), 1.0f), seqMode);
+    arp.add (make<Choice> (st, P::ArpRate), 0.8f);
+    arp.add (make<Choice> (st, P::ArpSync), 0.8f);
+    arp.row (76);
+    dimUnless (arp.add (make<Knob> (st, P::ArpOctaves)), arpMode);
+    arp.add (make<Knob> (st, P::ArpSwing));
+    arp.add (make<Knob> (st, P::ArpGate));
+    dimUnless (arp.add (make<Knob> (st, P::ArpBpm)), [this] { return proc.paramValue (P::ArpSync) > 0.5f; });
+    arp.add (make<Knob> (st, P::ArpDensity));
+    arp.add (make<Toggle> (st, P::ArpLatch), 1.0f, 30);
+    arp.row (0, 1.0f);
+    arp.add (std::make_unique<StepGrid> (proc));
+}
+
 void ReanimaEditor::buildMatrixPage()
 {
-    auto& matrix = addSection (matrixPage, P::u8 ("MATRIZ DE MODULACIÓN"), { margin, gap, pageWidth, pageHeight }, Theme::good);
+    constexpr int sideWidth = 250;
+    auto& matrix = addSection (matrixPage, P::u8 ("MATRIZ DE MODULACIÓN"), { margin, gap, pageWidth - sideWidth - gap, pageHeight }, Theme::good);
     matrix.row (16);
     matrix.add (make<MatrixTitles>());
 
@@ -1346,14 +1918,38 @@ void ReanimaEditor::buildMatrixPage()
     }
 
     auto help = make<juce::Label>();
-    help->setText (P::u8 ("Cada fila conecta una fuente con un destino. Alcance al 100 %: Tono ±24 st · Volumen ±24 dB · Frecuencia ±60 st · "
+    help->setText (P::u8 ("Cada fila conecta una fuente con un destino. Alcance al 100 %: Tono ±24 st · Tono fino ±100 ct · Volumen ±24 dB · Frecuencia ±60 st · "
                           "Drive ±24 dB. Inicio y Spray se suman al valor del mando."),
                    juce::dontSendNotification);
     help->setFont (Theme::font (12.5f));
     help->setColour (juce::Label::textColourId, Theme::dim);
     help->setJustificationType (juce::Justification::centred);
+    help->setMinimumHorizontalScale (0.7f);
     matrix.row (24);
     matrix.add (std::move (help));
+
+    // The sidechain as a source of the matrix: how it is heard, and what it gives now.
+    auto& st = proc.apvts;
+    auto& side = addSection (matrixPage, "SIDECHAIN", { margin + pageWidth - sideWidth, gap, sideWidth, pageHeight }, Theme::pink);
+    side.row (46);
+    side.add (make<Choice> (st, P::ScResponse));
+    side.row (64);
+    views.push_back (&side.add (make<SidechainMeter> (proc)));
+    side.row();
+    side.add (make<Knob> (st, P::ScSens));
+    side.row();
+    side.add (make<Knob> (st, P::ScAttack));
+    side.add (make<Knob> (st, P::ScRelease));
+    auto note = make<juce::Label>();
+    note->setText (P::u8 ("Elige la fuente «Sidechain» en una fila. En Live: panel Sidechain del dispositivo. "
+                          "La aplicación independiente no tiene entrada lateral."),
+                   juce::dontSendNotification);
+    note->setFont (Theme::font (12.0f));
+    note->setColour (juce::Label::textColourId, Theme::dim);
+    note->setJustificationType (juce::Justification::topLeft);
+    note->setMinimumHorizontalScale (1.0f);
+    side.row (76);
+    side.add (std::move (note));
 }
 
 // Each engine shows its own controls, and the panels share the width by what they hold.
@@ -1472,7 +2068,11 @@ void ReanimaEditor::resized()
     presetBar.setBounds (presetCard.reduced (7, 8));
 
     auto card = sampleCard.reduced (7, 6);
-    loadButton.setBounds (card.removeFromLeft (70));
+    loadButton.setBounds (card.removeFromLeft (64));
+    card.removeFromLeft (4);
+    browseButton.setBounds (card.removeFromLeft (30));
+    if (browser != nullptr)
+        browser->setBounds (tabs.getBounds().withTrimmedTop (tabDepth).reduced (margin, 4));
     snapToggle->setBounds (card.removeFromRight (78));
     card.reduce (10, -3);
     sampleLabel.setBounds (card.removeFromTop (card.getHeight() / 2 + 2));
@@ -1480,6 +2080,8 @@ void ReanimaEditor::resized()
 
     engineChoice->setBounds (engineCard.withTrimmedLeft (engineLabelWidth).reduced (7, 6));
     tabs.setBounds (0, headerHeight, railX - 4, designH - headerHeight);
+    if (browser != nullptr)
+        browser->setBounds (tabs.getBounds().withTrimmedTop (tabDepth).reduced (margin, 4));
     helpButton.setBounds (railX - 4 - margin - 28, headerHeight + 2, 28, tabDepth - 6);
     redoButton.setBounds (helpButton.getX() - 6 - 86, headerHeight + 2, 86, tabDepth - 6);
     undoButton.setBounds (redoButton.getX() - 6 - 92, headerHeight + 2, 92, tabDepth - 6);
@@ -1558,9 +2160,40 @@ juce::String ReanimaEditor::loopText() const
     return text;
 }
 
+// The knobs the matrix moves: their outer ring where the modulation takes them now (the last note's, or the macros
+// alone). Only the ones on screen.
+void ReanimaEditor::updateModulationRings()
+{
+    std::function<void (juce::Component&)> visit = [&] (juce::Component& c)
+    {
+        for (auto* child : c.getChildren())
+        {
+            if (! child->isVisible())
+                continue;
+            if (auto* knob = dynamic_cast<Knob*> (child))
+            {
+                const int id = knob->parameterIndex();
+                const int dst = id >= 0 && id < P::Count ? SynthEngine::destOf (id) : P::DstNone;
+                const float amount = dst != P::DstNone ? proc.engine.modShown[(size_t) dst].load (std::memory_order_relaxed) : 0.0f;
+                if (dst == P::DstNone || std::abs (amount) < 1.0e-5f)
+                    knob->setModulation (-1.0f);
+                else
+                {
+                    const float moved = SynthEngine::modulated (id, proc.paramValue (id), amount);
+                    knob->setModulation ((float) juce::jlimit (0.0, 1.0, knob->slider.valueToProportionOfLength (moved)));
+                }
+                continue;
+            }
+            visit (*child);
+        }
+    };
+    visit (*this);
+}
+
 void ReanimaEditor::timerCallback()
 {
     meter->update (proc.takeMeterReading());
+    updateModulationRings();
 
     // Each engine has its own controls; LOOP has its own instead of the engine's.
     const bool looping = (int) proc.paramValue (P::PlayMode) == P::PlayLoop;
@@ -1587,6 +2220,21 @@ void ReanimaEditor::timerCallback()
 
     for (const auto& rule : dimRules)
         rule.control->setAlpha (rule.inUse() ? 1.0f : 0.38f);
+    {
+        std::vector<Section*> moved;
+        for (const auto& rule : showRules)
+        {
+            const bool show = rule.shown();
+            if (rule.control->isVisible() != show)
+            {
+                rule.control->setVisible (show);
+                if (std::find (moved.begin(), moved.end(), rule.panel) == moved.end())
+                    moved.push_back (rule.panel);
+            }
+        }
+        for (auto* panel : moved)
+            panel->resized();
+    }
 
     // A sample that Tonos cannot lay out cycle by cycle plays it as Textura in A, B and D: the menu says so.
     if (warpChoice != nullptr)
@@ -1686,6 +2334,47 @@ void ReanimaEditor::updateSampleInfo()
         text << P::u8 ("  · Do3 lo toca tal cual");
 
     rootLabel.setText (text, juce::dontSendNotification);
+}
+
+void ReanimaEditor::FolderButton::paintButton (juce::Graphics& g, bool over, bool down)
+{
+    const auto r = getLocalBounds().toFloat().reduced (0.5f);
+    const bool on = getToggleState();
+    g.setColour (on ? Theme::accent.withAlpha (0.35f) : (over ? Theme::panelEdge.brighter (0.2f) : Theme::panelEdge));
+    g.fillRoundedRectangle (r, 4.0f);
+    // a folder
+    const auto f = r.reduced (r.getWidth() * 0.22f, r.getHeight() * 0.3f).translated (0.0f, down ? 1.0f : 0.0f);
+    juce::Path p;
+    p.startNewSubPath (f.getX(), f.getBottom());
+    p.lineTo (f.getX(), f.getY());
+    p.lineTo (f.getX() + f.getWidth() * 0.4f, f.getY());
+    p.lineTo (f.getX() + f.getWidth() * 0.5f, f.getY() + f.getHeight() * 0.18f);
+    p.lineTo (f.getRight(), f.getY() + f.getHeight() * 0.18f);
+    p.lineTo (f.getRight(), f.getBottom());
+    p.closeSubPath();
+    g.setColour (on ? Theme::accent : Theme::text);
+    g.strokePath (p, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+}
+
+void ReanimaEditor::showBrowser (bool show)
+{
+    if (show && browser == nullptr)
+    {
+        browser = std::make_unique<SampleBrowser> (proc);
+        browser->onClose = [this] { showBrowser (false); };
+        content.addChildComponent (*browser);
+        resized();
+    }
+    browseButton.setToggleState (show, juce::dontSendNotification);
+    if (browser != nullptr)
+    {
+        browser->setVisible (show);
+        if (show)
+        {
+            browser->toFront (true);
+            browser->grabKeyboardFocus();
+        }
+    }
 }
 
 void ReanimaEditor::openFileChooser()

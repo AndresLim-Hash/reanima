@@ -468,7 +468,11 @@ void Stream::build (const Settings& d, int half) noexcept
             lowsInMiddle = x * x * (3.0 - 2.0 * x);
         }
         const double ph = phases.nextDouble();
-        const double phr = ph + (double) d.width * lowsInMiddle * (apart.nextDouble() - 0.5);
+        // The right channel moves away from the left by at most a quarter of a cycle (at Estéreo 100 %): every
+        // frequency stays between in phase and 90 degrees apart, never opposed. Half a cycle each way put about a
+        // third of them in opposition: summed to mono the drone lost 2.6 to 5.3 dB, and some notes their colour.
+        // Now it loses under 1 dB, and still sounds wide (the two sides are 64 % alike, against 0 before).
+        const double phr = ph + (double) d.width * lowsInMiddle * 0.5 * (apart.nextDouble() - 0.5);
         const Complex a (ml[k] * sn (ph + 0.25), ml[k] * sn (ph));
         const Complex b (mr[k] * sn (phr + 0.25), mr[k] * sn (phr));
         frame[(size_t) k] = a + Complex (-b.imag(), b.real());                          // a + i b

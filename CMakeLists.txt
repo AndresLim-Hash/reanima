@@ -79,6 +79,7 @@ target_sources(Reanima
         Source/FactoryPresets.cpp
         Source/Randomizer.cpp
         Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
         Source/Displays.cpp
         Source/EditPage.cpp
         Source/Guide.cpp
@@ -88,6 +89,8 @@ target_sources(Reanima
         Source/HelpText.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp
@@ -126,6 +129,8 @@ target_sources(ReanimaTests
         Source/FxRack.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp)
@@ -156,6 +161,7 @@ target_sources(ReanimaSnapshot
         Source/FactoryPresets.cpp
         Source/Randomizer.cpp
         Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
         Source/Displays.cpp
         Source/EditPage.cpp
         Source/Guide.cpp
@@ -165,6 +171,8 @@ target_sources(ReanimaSnapshot
         Source/HelpText.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp
@@ -195,6 +203,7 @@ target_sources(ReanimaRtCheck
         Source/FactoryPresets.cpp
         Source/Randomizer.cpp
         Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
         Source/Displays.cpp
         Source/EditPage.cpp
         Source/Guide.cpp
@@ -204,6 +213,8 @@ target_sources(ReanimaRtCheck
         Source/HelpText.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp
@@ -234,6 +245,7 @@ target_sources(ReanimaCpuBench
         Source/FactoryPresets.cpp
         Source/Randomizer.cpp
         Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
         Source/Displays.cpp
         Source/EditPage.cpp
         Source/Guide.cpp
@@ -243,6 +255,8 @@ target_sources(ReanimaCpuBench
         Source/HelpText.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp
@@ -273,6 +287,7 @@ target_sources(ReanimaPresetRender
         Source/FactoryPresets.cpp
         Source/Randomizer.cpp
         Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
         Source/Displays.cpp
         Source/EditPage.cpp
         Source/Guide.cpp
@@ -282,6 +297,8 @@ target_sources(ReanimaPresetRender
         Source/HelpText.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp
@@ -312,6 +329,7 @@ target_sources(ReanimaClickCheck
         Source/FactoryPresets.cpp
         Source/Randomizer.cpp
         Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
         Source/Displays.cpp
         Source/EditPage.cpp
         Source/Guide.cpp
@@ -321,6 +339,8 @@ target_sources(ReanimaClickCheck
         Source/HelpText.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp
@@ -350,6 +370,8 @@ target_sources(ReanimaDemos
         Source/FxRack.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp)
@@ -379,6 +401,8 @@ target_sources(ReanimaBatch
         Source/FxRack.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp)
@@ -408,6 +432,8 @@ target_sources(ReanimaRelease
         Source/FxRack.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp)
@@ -438,6 +464,7 @@ target_sources(ReanimaAudit
         Source/FactoryPresets.cpp
         Source/Randomizer.cpp
         Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
         Source/Displays.cpp
         Source/EditPage.cpp
         Source/Guide.cpp
@@ -447,6 +474,8 @@ target_sources(ReanimaAudit
         Source/HelpText.cpp
         Source/Reconstruct.cpp
         Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
         Source/SynthEngine.cpp
         Source/Mechanism.cpp
         Source/DroneStretch.cpp

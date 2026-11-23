@@ -208,6 +208,13 @@ void samplePage (Writer& w)
            "para un bajo o un lead: Mono con Glide de unos 80 ms.");
 
     w.level = 3;
+    w.add ("Movimiento",
+           "Motores B y D con Sostenido: la nota mantenida cambia de color como lo hacía el sample en ese momento (un "
+           "piano que se oscurece, una cuerda que se abre) en vez de quedarse en un color fijo. Sólo cambia el timbre, "
+           "no el volumen. A 0 suena como antes.",
+           either (w.param (P::SustainMotion), w.section ("MOTOR")),
+           "con el motor B y Sostenido, mantén una nota y sube Movimiento.",
+           "entre 50 % y 100 % en pianos, cuerdas y teclados.");
     w.add ("Mecanismo",
            "Añade el gesto de un instrumento real, grabado: el golpe al pulsar y al soltar. El tipo se elige en el menú "
            "junto al título TIMBRE (» marca el que mejor encaja con tu sample). Mecanismo es cuánto suena; Entrada y "
@@ -348,10 +355,11 @@ void filterPage (Writer& w)
            "Keytrack 50 % para que las notas agudas no queden apagadas.");
     w.add ("LFO",
            "Ondas lentas que mueven lo que conectes en MATRIZ: solas no hacen nada. Forma, Velocidad o División con "
-           "Sync (sigue el tempo), y Retrig, que las reinicia en cada nota.",
+           "Sync (sigue el tempo), Retrig, que las reinicia en cada nota, y Suavidad, que redondea la forma. La forma "
+           "Deriva es un movimiento lento y aleatorio, distinto en cada nota, como un instrumento real o un analógico.",
            both (w.section ("LFO 1"), both (w.section ("LFO 2"), w.section ("LFO 3"))),
            "activa Sync y elige una División; después conéctalo en MATRIZ.",
-           "una forma suave y Retrig encendido.");
+           "una forma suave y Retrig encendido; para dar vida: Deriva a 0,3-1 Hz hacia Tono fino con poca cantidad.");
     w.add ("Macros",
            "Cuatro mandos libres. En MATRIZ cada uno puede mover varios destinos a la vez, y en Ableton se automatizan "
            "o se asignan a tu controlador.",
@@ -378,6 +386,13 @@ void filterPage (Writer& w)
            w.params ({ P::FltFollow, P::FltFolAtk, P::FltFolRel }),
            "sube Follower y toca fuerte y suave.",
            "Fol. ataque 5 ms y Fol. release 100 ms.");
+    w.add ("Armónico",
+           "Un tipo de filtro que trabaja sobre los armónicos de la nota que tocas: Realce los sube (+) o los baja (-) "
+           "dentro de una Región de octavas alrededor de Frecuencia, y Pares/impares elige cuáles. La fundamental y la "
+           "afinación se quedan, y el volumen no cambia. También afina ruidos y texturas.",
+           w.param (P::FltType),
+           "elige Armónico, Realce +9 dB, y mueve Frecuencia mientras tocas.",
+           "Keytrack 100 % para que la región siga a la nota; Pares/impares 0 % para un sonido hueco.");
     w.add ("Dry/Wet",
            "Mezcla el sonido filtrado con el original: menos de 100 % filtra en paralelo y conserva cuerpo.",
            w.param (P::FltMix),
@@ -397,14 +412,14 @@ void matrixPage (Writer& w)
            w.section ("MATRIZ DE MODULACIÓN"),
            "", "rellena las filas de arriba abajo.");
     w.add ("Fuente",
-           "Lo que mueve: LFO 1-3, Env 2, Env Amp, Velocidad, Nota, Mod Wheel, Aftertouch, Macro 1-4 o Aleatorio "
-           "(un valor nuevo en cada nota).",
+           "Lo que mueve: LFO 1-3, Env 2, Env Amp, Velocidad, Nota, Mod Wheel, Aftertouch, Macro 1-4, Aleatorio "
+           "(un valor nuevo en cada nota) o Sidechain (otra pista del DAW, con sus ajustes en el panel de la derecha).",
            w.param (row1),
            "elige LFO 1 en la primera fila.",
            "LFO 1 para movimiento; Velocidad para que responda a tu forma de tocar.");
     w.add ("Destino",
            "Lo que se mueve: Tono, Volumen, Pan, frecuencia, resonancia, drive o morph del filtro, Inicio, Spray, Grano, "
-           "Detune unison, la velocidad de los LFO 1 y 2, Transitorio, Arco/aliento o Respiración.",
+           "Detune unison, la velocidad de los LFO 1 y 2, Transitorio, Arco/aliento, Respiración o Tono fino (±100 cents, para derivas sutiles).",
            w.param (row1 + 1),
            "elige Tono como destino.",
            "empieza por Tono, Volumen o Frecuencia filtro.");
@@ -439,6 +454,13 @@ void matrixPage (Writer& w)
            w.section ("MATRIZ DE MODULACIÓN"),
            "pon Macro 1 en dos filas: Frecuencia filtro y Drive filtro.",
            "cantidades opuestas compensan: +Frecuencia y -Volumen.");
+    w.add ("Sidechain",
+           "Otra pista del DAW mueve el sonido: elige la fuente Sidechain en una fila y, en Live, la pista en el panel "
+           "Sidechain del dispositivo. Respuesta elige qué escucha (el nivel, sus graves, medios o agudos, o su brillo); "
+           "Sensibilidad, Ataque y Release, cómo la sigue. La barra muestra lo que da.",
+           w.section ("SIDECHAIN"),
+           "Sidechain → Frecuencia filtro con un Lowpass y un bombo en la pista lateral.",
+           "Graves para seguir un bombo; Brillo para seguir platos y voces.");
     w.add ("Aleatorio",
            "Un valor nuevo en cada nota: hacia Pan reparte las notas en el estéreo; hacia Inicio hace que cada nota "
            "empiece en otro punto del sample.",
@@ -513,6 +535,13 @@ void fxPage (Writer& w)
            w.param (P::FxBus1ToMain),
            "enciéndelo con un Compresor en MAIN.",
            "apagado si MAIN tiene efectos que no quieres en el eco.");
+    w.add ("Impronta",
+           "Colorea el sonido con el espectro de otra pista (la entrada lateral): sus graves, medios y agudos moldean "
+           "el timbre. Color cambia sólo el timbre; Vocoder también el volumen; Invertido hace sonar la otra pista con "
+           "el timbre de tus notas. Sin pista lateral, el sonido pasa igual.",
+           w.id ("fx-editor"),
+           "pon Impronta en MAIN y elige una voz o una batería como pista lateral.",
+           "Color con Profundidad 50-70 %; Bandas 16; usa Profundidad en vez de Mix.");
     w.add ("Sin exceso",
            "Cada efecto suma volumen y quita claridad. Compara con A/B y = nivel: si el sonido con efectos sólo gana "
            "por sonar más fuerte, sobra algún efecto.",
@@ -532,8 +561,87 @@ Area Targets::area (const juce::String& name) const
 
 juce::String tabName (int tab)
 {
-    const char* names[] { "SAMPLE", "EDICIÓN", "FILTRO · MOD", "MATRIZ", "FX" };
+    const char* names[] { "SAMPLE", "EDICIÓN", "FILTRO · MOD", "MATRIZ", "FX", "ARP · SEQ" };
     return P::u8 (names[juce::jlimit (0, numTabs - 1, tab)]);
+}
+
+void arpPage (Writer& w)
+{
+    w.level = 1;
+    w.add ("La tonalidad",
+           "La tonalidad que seguirán el arpegiador y el secuenciador. Arriba, la que está en uso; debajo, lo que dicen el sample y "
+           "las notas que tocas, con lo seguras que son.",
+           w.section ("TONALIDAD"),
+           "", "mira qué dice de tu sample.");
+    w.add ("De dónde sale",
+           "A mano: la eliges tú. Sample: la del nombre del archivo si lo dice (Splice casi siempre). MIDI: la de las notas que "
+           "tocas, cuando ya hay bastantes.",
+           w.param (P::KeySource),
+           "elige Sample con un sample de Splice cargado.",
+           "con un sample sin tonalidad en el nombre, mejor A mano.");
+    w.add ("Por el sonido, sólo sugerencia",
+           "Si el nombre no la dice, Reanima la estima por el sonido y te dice cuántas veces suele acertar. No se aplica sola: "
+           "con Fijar la pasas a mano si te convence.",
+           w.section ("TONALIDAD"),
+           "pulsa Fijar si la sugerencia te suena bien.",
+           "fíate más de tu oído que del porcentaje.");
+
+    w.add ("El arpegiador",
+           "Enciende Arp/Seq y mantén un acorde: en modo Arp, cada paso toca la siguiente nota del acorde, en el orden de Estilo, al "
+           "ritmo de Ritmo. Las teclas que pulsas ya no suenan tal cual.",
+           w.param (P::ArpOn),
+           "enciéndelo y mantén Do-Mi-Sol.",
+           "con Latch el acorde sigue al soltar.");
+    w.add ("Los carriles",
+           "Cada fila cambia algo de cada paso: si suena (PASO), la nota en grados de la tonalidad (NOTA), la octava, la velocidad, "
+           "lo que dura (GATE), la probabilidad y cuántas veces se repite dentro del paso. Haz clic o arrastra sobre las casillas; "
+           "doble clic vuelve al valor por defecto.",
+           w.section ("ARPEGIADOR · SECUENCIADOR"),
+           "apaga algunos pasos en PASO.",
+           "el recuadro naranja marca el paso que suena.");
+
+    w.level = 2;
+    w.add ("Receta: la tonalidad de tu canción",
+           "Pon Tonalidad de en MIDI y toca unos compases de los acordes o la melodía de tu tema. Cuando la estimación pasa del 60 % "
+           "se usa; con Fijar la dejas quieta aunque luego toques otra cosa.",
+           w.param (P::KeySource),
+           "elige MIDI y toca una escala o unos acordes.",
+           "unas 16 notas bastan para que sea segura.");
+    w.add ("Receta: la tonalidad de otra pista",
+           "Pon Tonalidad de en Audio externo. En Ableton, abre el panel Sidechain del dispositivo (el triángulo de su barra de título), "
+           "actívalo y elige la pista con la música. Dale al play: tras unos 20 s de música con notas la estimación se vuelve segura y "
+           "se usa. Medido con 236 trozos de 40 s: cuando la da segura, acierta la tonalidad o su relativa unas 9 de cada 10 veces.",
+           w.param (P::KeySource),
+           "elige Audio externo y una pista con acordes en el panel Sidechain.",
+           "las baterías no dicen tonalidad: elige la pista de los acordes o del bajo.");
+
+    w.add ("El acorde y la progresión",
+           "Mientras mantienes tres notas o más, ACORDE dice qué acorde es (Lam7, Do/Mi...) y qué grado ocupa en la tonalidad en uso "
+           "(vi7, I...). Sin teclas pulsadas, sugiere el que suena por la entrada lateral (acierta unas 7 de cada 10 veces). "
+           "PROGRESIÓN guarda los últimos ocho, con sus grados: I – vi – IV – V.",
+           w.section ("TONALIDAD"),
+           "toca Do, Lam, Fa y Sol y mira la progresión.",
+           "Borrar la vacía para empezar otra.");
+    w.add ("Receta: una frase con el secuenciador",
+           "Pon Modo en Seq, pulsa Generar y mantén una tecla: suena una frase en la tonalidad, que la tecla transporta. Si te gusta, "
+           "arrastra ARRASTRAR MIDI a una pista para tenerla como clip, o guárdala con Guardar...",
+           w.param (P::ArpMode),
+           "Seq, Generar, y toca distintas teclas.",
+           "baja Densidad para frases con más silencios.");
+
+    w.level = 3;
+    w.add ("Relativas y quintas",
+           "Las dudas típicas son la relativa (La menor y Do mayor comparten notas) y la tonalidad a una quinta: para el arpegiador "
+           "casi da igual, porque usan casi las mismas notas. Si dudas, elige a mano la que te diga el oído.",
+           w.param (P::KeyScale),
+           "compara mayor y menor con la misma tónica.",
+           "la tónica la marca la nota en la que la música descansa.");
+    w.add ("Carriles de distinta longitud",
+           "Cada carril tiene su longitud (el menú «16 pasos»): un PASO de 5 y una VELOCIDAD de 3 se desplazan uno contra otro y el "
+           "patrón tarda 15 pasos en repetirse igual (polirritmo). El dado de cada carril sólo cambia ese carril.",
+           w.section ("ARPEGIADOR · SECUENCIADOR"),
+           "pon PASO en 5 pasos y escucha.",
+           "el clip MIDI dura hasta que los carriles vuelven a coincidir (como mucho 8 compases).");
 }
 
 std::vector<GuideOverlay::Step> forTab (int tab, const Targets& targets)
@@ -546,6 +654,7 @@ std::vector<GuideOverlay::Step> forTab (int tab, const Targets& targets)
         case 2: filterPage (w); break;
         case 3: matrixPage (w); break;
         case 4: fxPage (w); break;
+        case 5: arpPage (w); break;
         default: break;
     }
     return std::move (w.steps);

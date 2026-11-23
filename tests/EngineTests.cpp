@@ -166,6 +166,17 @@ float peakHz (const std::vector<float>& y, double at)
     return (float) (best * sr / n);
 }
 
+// The usual peak over several moments: engine F's random phases make one partial or another the loudest now
+// and then (the pluck's second harmonic is close to its first), so one moment alone is a draw.
+float steadyPeakHz (const std::vector<float>& y, double from, double to)
+{
+    std::vector<float> peaks;
+    for (double at = from; at <= to + 1.0e-9; at += 0.25)
+        peaks.push_back (peakHz (y, at));
+    std::sort (peaks.begin(), peaks.end());
+    return peaks[peaks.size() / 2];
+}
+
 float detectHz (const std::vector<float>& y, double at)
 {
     juce::AudioBuffer<float> b (1, (int) (0.5 * sr));
@@ -564,8 +575,8 @@ int main()
         const double steady = 20.0 * std::log10 (rms (y, 1.0, 3.0) / rms (y, 3.5, 5.5));
         check (std::abs (steady) < 3.0, "engine F drones on while the key is held", juce::String (steady, 1) + " dB over 2.5 s");
 
-        const float f60 = peakHz (y, 2.0);
-        const float f72 = peakHz (play (pluck, q, 72, 3.0, 3.2), 2.0);
+        const float f60 = steadyPeakHz (y, 1.0, 4.0);
+        const float f72 = steadyPeakHz (play (pluck, q, 72, 3.0, 3.2), 1.0, 2.5);
         check (std::abs (f60 - 220.0f) < 6.0f && std::abs (f72 - 440.0f) < 6.0f, "engine F follows the keyboard",
                juce::String (f60, 0) + " Hz and " + juce::String (f72, 0) + " Hz an octave up");
 
@@ -573,7 +584,7 @@ int main()
         sub[P::DroneSub1] = 1.0f;
         sub[P::DroneHarm] = 1.0f;
         const auto ys = play (pluck, sub, 60, 3.0, 3.2);
-        const float fs = peakHz (ys, 2.0);
+        const float fs = steadyPeakHz (ys, 1.0, 2.5);
         check (std::abs (fs - 110.0f) < 6.0f || std::abs (fs - 220.0f) < 6.0f, "engine F octave below and harmonics", juce::String (fs, 0) + " Hz");
 
         // An octave copy must actually be there: energy around 110 Hz rises.

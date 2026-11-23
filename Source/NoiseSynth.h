@@ -15,6 +15,8 @@ public:
 
     explicit NoiseSynth (juce::int64 seed = 1) : rng (seed) {}
 
+    void seed (juce::int64 s) noexcept { rng.setSeed (s); }
+
     void reset() noexcept
     {
         accL.fill (0.0f);

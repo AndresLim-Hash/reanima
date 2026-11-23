@@ -16,7 +16,7 @@ Los fondos, los textos y los controles apagados siguen neutros.
 | Violeta | #b79bff | voz y afinación, LFO 1 |
 | Turquesa | #4fd8c4 | Drone Maker, LFO 2 |
 | Amarillo | #ffd257 | LFO 3 |
-| Rosa | #ff86b4 | expresión MIDI |
+| Rosa | #ff86b4 | expresión MIDI, entrada lateral (SIDECHAIN) |
 | Plata | #c3cddd | SALIDA (columna derecha, siempre visible) |
 
 | Pestaña | Módulos |
@@ -24,7 +24,7 @@ Los fondos, los textos y los controles apagados siguen neutros.
 | SAMPLE | MOTOR azul · DRONE MAKER turquesa · TIMBRE verde · ENVOLVENTE naranja · VOZ·AFINACIÓN violeta |
 | EDICIÓN | RECORTE Y NIVEL azul · BUCLE verde · ENVOLVENTE DE PITCH naranja |
 | FILTRO·MOD | FILTRO azul · ENV 2 naranja · LFO 1 violeta · LFO 2 turquesa · LFO 3 amarillo · MACROS verde · EXPRESIÓN MIDI rosa |
-| MATRIZ | MATRIZ DE MODULACIÓN verde |
+| MATRIZ | MATRIZ DE MODULACIÓN verde · SIDECHAIN rosa (fuente lateral de la matriz, 23-11) |
 | FX | Principal azul · Bus 1 verde · Bus 2 naranja |
 
 El rojo queda reservado para avisos y saturación (medidor).

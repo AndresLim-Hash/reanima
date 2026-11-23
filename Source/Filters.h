@@ -8,7 +8,15 @@
 
 //==============================================================================
 // Auto Filter-style filter: SVF (Clean/OSR/MS2), transistor ladder (SMP/PRD lowpass),
-// DJ, Comb and Vowel modes, 12/24 dB, drive and dry/wet.
+// DJ, Comb and Vowel modes, 12/24 dB, drive and dry/wet; and Armónico, resonances on the harmonics of the note.
+//
+// Armónico (setHarmonic, after set, every block): up to 32 resonances at k times the note's frequency, inside a region
+// of the spectrum (Región octaves around Frecuencia, faded in and out at its edges), each raising (Realce +) or
+// lowering (-) its harmonic as a peaking EQ does: the sound plus, or minus, a band-pass of itself at that harmonic.
+// What lies between the harmonics passes untouched and the fundamental is never lowered, so the note keeps its
+// pitch and body. Morph/DJ is the balance of odd (0) and even (1) harmonics, all of them at 0.5; Resonancia, how
+// narrow each resonance is (a fraction of the note's frequency, the same for every harmonic). The level is kept: the
+// output follows the input's power over some 80 ms, so raising harmonics does not make the note louder.
 // The circuits that saturate run at four times the sample rate (twice at 88.2 kHz and above: the same
 // 176-192 kHz inside, half the work): their saturation makes harmonics far above the audible band, and
 // at the host's rate those fold back as notes foreign to the sound (measured: -3 dB of folded energy for
@@ -29,6 +37,10 @@ public:
             c.assign ((size_t) size, 0.0f);
         combMask = size - 1;
         dcPole = 1.0f - (float) (2.0 * pi * 5.0 / sr);
+        // 80 ms: quick enough for a pluck (with 300 ms a short note had gone before its level was kept: up to +3 dB),
+        // slow enough not to follow the wave. A linear filter's gain hardly moves, so a quick follower does not pump.
+        powerCoef = 1.0f - std::exp (-1.0f / (0.08f * (float) sr));
+        compCoef = 1.0f - std::exp (-1.0f / (0.02f * (float) sr));
 
         // Outer stage (1x to 2x): flat to 20 kHz at 48 kHz. Inner stage (2x to 4x): wider band.
         static const auto outer = HalfBand::design (outerCoefs, 0.0417);
@@ -54,6 +66,15 @@ public:
         for (auto& c : comb) std::fill (c.begin(), c.end(), 0.0f);
         combIndex = 0;
         dcX[0] = dcX[1] = dcY[0] = dcY[1] = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int j = 0; j < maxHarmonics; ++j)
+                harmIc1[ch][j] = harmIc2[ch][j] = 0.0f;
+        harmGain.fill (0.0f);
+        harmStep.fill (0.0f);
+        harmCount = harmPadded = harmRamp = 0;
+        harmFirst = 1;
+        powerIn = powerOut = 0.0f;
+        harmComp = harmCompTarget = 1.0f;
         resetOversampling();
     }
 
@@ -91,7 +112,7 @@ public:
         }
 
         fc = juce::jlimit (20.0f, (float) sampleRate * 0.45f, fc);
-        const int oversampling = circuit != P::Clean && type != P::Comb && type != P::Vowel ? (sampleRate < 60000.0 ? 4 : 2) : 1;
+        const int oversampling = circuit != P::Clean && type != P::Comb && type != P::Vowel && type != P::Harmonic ? (sampleRate < 60000.0 ? 4 : 2) : 1;
         if (oversampling != factor)
         {
             factor = oversampling;
@@ -109,8 +130,10 @@ public:
             morphFrac = pos - (float) morphIndex;
         }
 #if HALFBAND_SSE
-        pairPath = ! useLadder && type != P::Comb && type != P::Vowel;
+        pairPath = ! useLadder && type != P::Comb && type != P::Vowel && type != P::Harmonic;
 #endif
+        harmCentre = fc;
+        harmRes = res;
 
         combDelay = juce::jlimit (2.0f, (float) combMask - 2.0f, (float) sampleRate / fc);
         combFb = res * 0.97f * (morph < 0.5f ? 1.0f : -1.0f);
@@ -136,9 +159,125 @@ public:
         }
     }
 
+    // Armónico: the note's frequency now (Hz), how much its harmonics are raised or lowered (dB) and the width of the
+    // region (octaves). Called after set(), once per block of up to rampLength samples.
+    void setHarmonic (float f0, float gainDb, float regionOct) noexcept
+    {
+        if (type != P::Harmonic)
+            return;
+        const float sr = (float) sampleRate;
+        const float limit = std::min (0.45f * sr, 20000.0f);
+        f0 = juce::jlimit (8.0f, limit, f0);
+        const float half = std::max (0.25f, regionOct * 0.5f);
+        const float centre = juce::jlimit (20.0f, limit, harmCentre);
+
+        int lo = std::max (1, (int) std::ceil (centre * std::exp2 (-half) / f0));
+        int hi = std::min ((int) std::floor (centre * std::exp2 (half) / f0), (int) std::floor (limit / f0));
+        bool cutLow = false, cutHigh = false;
+        if (hi - lo + 1 > maxHarmonics)
+        {
+            // More harmonics than resonances: the 32 nearest the centre, faded at the sides they were cut on.
+            const int kc = juce::jlimit (lo, hi, juce::roundToInt (centre / f0));
+            int first = std::max (lo, kc - maxHarmonics / 2);
+            first = std::min (first, hi - maxHarmonics + 1);
+            cutLow = first > lo;
+            cutHigh = first + maxHarmonics - 1 < hi;
+            lo = first;
+            hi = first + maxHarmonics - 1;
+        }
+        const int count = hi >= lo ? hi - lo + 1 : 0;
+
+        // The resonances keep their harmonic when the window moves (a glide, the region swept).
+        if (count > 0 && harmCount > 0 && lo != harmFirst)
+        {
+            const int d = lo - harmFirst;
+            std::array<float, maxHarmonics> kept {};
+            float i1[2][maxHarmonics] {}, i2[2][maxHarmonics] {};
+            for (int j = 0; j < maxHarmonics; ++j)
+            {
+                const int from = j + d;
+                if (from >= 0 && from < harmCount)
+                {
+                    kept[(size_t) j] = harmGain[(size_t) from];
+                    for (int ch = 0; ch < 2; ++ch)
+                    {
+                        i1[ch][j] = harmIc1[ch][from];
+                        i2[ch][j] = harmIc2[ch][from];
+                    }
+                }
+            }
+            for (int j = 0; j < maxHarmonics; ++j)
+            {
+                harmGain[(size_t) j] = kept[(size_t) j];
+                for (int ch = 0; ch < 2; ++ch)
+                {
+                    harmIc1[ch][j] = i1[ch][j];
+                    harmIc2[ch][j] = i2[ch][j];
+                }
+            }
+        }
+        for (int j = count; j < maxHarmonics; ++j)
+        {
+            harmGain[(size_t) j] = 0.0f;
+            for (int ch = 0; ch < 2; ++ch)
+                harmIc1[ch][j] = harmIc2[ch][j] = 0.0f;
+        }
+        harmFirst = lo;
+        harmCount = count;
+        harmPadded = (count + 3) & ~3;
+
+        const float oddWeight = std::min (1.0f, 2.0f * (1.0f - morph)), evenWeight = std::min (1.0f, 2.0f * morph);
+        const float width = f0 * (0.5f - 0.46f * harmRes);       // Hz, the same for every harmonic
+        constexpr int fadeSlots = 4;
+        for (int j = 0; j < maxHarmonics; ++j)
+        {
+            float target = 0.0f;
+            if (j < count)
+            {
+                const int h = lo + j;
+                const float fk = f0 * (float) h;
+                const float dist = std::abs (std::log2 (fk / centre)) / half;      // 0 at the centre, 1 at the edge
+                float w = dist < 1.0f ? juce::square (std::cos (0.5f * pi * dist)) : 0.0f;
+                w *= (h % 2 == 1) ? oddWeight : evenWeight;
+                w *= juce::jlimit (0.0f, 1.0f, (limit - fk) / (0.1f * limit));       // nothing sudden at the top
+                if (cutLow && j < fadeSlots)
+                    w *= juce::square (std::sin (0.5f * pi * (float) (j + 1) / (float) (fadeSlots + 1)));
+                if (cutHigh && j >= count - fadeSlots)
+                    w *= juce::square (std::sin (0.5f * pi * (float) (count - j) / (float) (fadeSlots + 1)));
+                float db = gainDb * w;
+                if (h == 1 && db < 0.0f)
+                    db = 0.0f;              // the fundamental is never taken away
+                target = dbToGain (db) - 1.0f;
+
+                float gg, kk, b1, b2, b3;
+                computeSvf (fk, fk / std::max (1.0f, width), gg, kk, b1, b2, b3);
+                harmA1[j] = b1;
+                harmA2[j] = b2;
+                harmA3[j] = b3;
+                harmK[j] = kk;
+            }
+            else
+            {
+                harmA1[j] = 1.0f;
+                harmA2[j] = harmA3[j] = harmK[j] = 0.0f;
+            }
+            harmStep[(size_t) j] = (target - harmGain[(size_t) j]) / (float) rampLength;
+        }
+        harmRamp = rampLength;
+
+        // The level kept: the output's power brought to the input's, at most 12 dB down or 3 dB up.
+        if (compensateLevel && powerIn > 1.0e-10f)
+            harmCompTarget = juce::jlimit (0.25f, 1.41f, std::sqrt ((powerIn + 1.0e-12f) / (powerOut + 1.0e-12f)));
+    }
+
     // At four times the rate the two channels go through the half-band stages together.
     void process (float& l, float& r) noexcept
     {
+        if (type == P::Harmonic)
+        {
+            processHarmonic (l, r);
+            return;
+        }
 #if HALFBAND_SSE
         if (pairPath && factor == 1)
             corePair (l, r);
@@ -221,7 +360,72 @@ public:
         }
     }
 
+    // The response drawn on the panel: without the level kept (an impulse has no level to keep).
+    bool compensateLevel = true;
+
 private:
+    static constexpr int maxHarmonics = 32, rampLength = 32;
+
+    void processHarmonic (float& l, float& r) noexcept
+    {
+        const float in[2] = { l, r };
+        float out[2];
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            const float x = in[ch];
+            float sum = 0.0f;
+#if HALFBAND_SSE
+            const __m128 X = _mm_set1_ps (x), two = _mm_set1_ps (2.0f);
+            __m128 acc = _mm_setzero_ps();
+            for (int j = 0; j < harmPadded; j += 4)
+            {
+                const __m128 ic1 = _mm_load_ps (&harmIc1[ch][j]), ic2 = _mm_load_ps (&harmIc2[ch][j]);
+                const __m128 A1 = _mm_load_ps (&harmA1[j]), A2 = _mm_load_ps (&harmA2[j]), A3 = _mm_load_ps (&harmA3[j]);
+                const __m128 v3 = _mm_sub_ps (X, ic2);
+                const __m128 v1 = _mm_add_ps (_mm_mul_ps (A1, ic1), _mm_mul_ps (A2, v3));
+                const __m128 v2 = _mm_add_ps (_mm_add_ps (ic2, _mm_mul_ps (A2, ic1)), _mm_mul_ps (A3, v3));
+                _mm_store_ps (&harmIc1[ch][j], _mm_sub_ps (_mm_mul_ps (two, v1), ic1));
+                _mm_store_ps (&harmIc2[ch][j], _mm_sub_ps (_mm_mul_ps (two, v2), ic2));
+                const __m128 G = _mm_mul_ps (_mm_load_ps (harmGain.data() + j), _mm_load_ps (&harmK[j]));
+                acc = _mm_add_ps (acc, _mm_mul_ps (G, v1));
+            }
+            alignas (16) float lanes[4];
+            _mm_store_ps (lanes, acc);
+            sum = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+#else
+            for (int j = 0; j < harmPadded; ++j)
+            {
+                const float ic1 = harmIc1[ch][j], ic2 = harmIc2[ch][j];
+                const float v3 = x - ic2;
+                const float v1 = harmA1[j] * ic1 + harmA2[j] * v3;
+                const float v2 = ic2 + harmA2[j] * ic1 + harmA3[j] * v3;
+                harmIc1[ch][j] = 2.0f * v1 - ic1;
+                harmIc2[ch][j] = 2.0f * v2 - ic2;
+                sum += harmGain[(size_t) j] * harmK[j] * v1;
+            }
+#endif
+            out[ch] = x + sum;
+        }
+
+        if (harmRamp > 0)
+        {
+            for (int j = 0; j < harmPadded; ++j)
+                harmGain[(size_t) j] += harmStep[(size_t) j];
+            --harmRamp;
+        }
+
+        if (compensateLevel)
+        {
+            powerIn += (0.5f * (in[0] * in[0] + in[1] * in[1]) - powerIn) * powerCoef;
+            powerOut += (0.5f * (out[0] * out[0] + out[1] * out[1]) - powerOut) * powerCoef;
+            harmComp += (harmCompTarget - harmComp) * compCoef;
+            out[0] *= harmComp;
+            out[1] *= harmComp;
+        }
+        l = in[0] + (out[0] - in[0]) * mix;
+        r = in[1] + (out[1] - in[1]) * mix;
+    }
+
     struct SvfState { float ic1 = 0, ic2 = 0; };
 
     void computeSvf (float fc, float q, float& gOut, float& kOut, float& a1Out, float& a2Out, float& a3Out) const noexcept
@@ -474,4 +678,13 @@ private:
 
     float vk[3] {}, va1[3] {}, va2[3] {}, va3[3] {}, vgain[3] {};
     std::array<std::array<SvfState, 3>, 2> vowelState {};
+
+    // Armónico: resonance j is harmonic harmFirst + j; harmGain is its gain minus 1, moving to its target by harmStep.
+    alignas (16) float harmIc1[2][maxHarmonics] {}, harmIc2[2][maxHarmonics] {};
+    alignas (16) float harmA1[maxHarmonics] {}, harmA2[maxHarmonics] {}, harmA3[maxHarmonics] {}, harmK[maxHarmonics] {};
+    alignas (16) std::array<float, maxHarmonics> harmGain {};
+    alignas (16) std::array<float, maxHarmonics> harmStep {};
+    int harmFirst = 1, harmCount = 0, harmPadded = 0, harmRamp = 0;
+    float harmCentre = 1000.0f, harmRes = 0.2f;
+    float powerIn = 0.0f, powerOut = 0.0f, powerCoef = 1.0e-4f, compCoef = 1.0e-3f, harmComp = 1.0f, harmCompTarget = 1.0f;
 };

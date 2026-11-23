@@ -10,9 +10,13 @@
 #include "Mechanism.h"
 #include "Filters.h"
 #include "Stretch.h"
+#include "KeyDetect.h"
+#include "FxRack.h"
+#include <functional>
 #include <juce_dsp/juce_dsp.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <cstdio>
+#include <map>
 
 namespace
 {
@@ -54,11 +58,12 @@ juce::AudioBuffer<float> play (std::shared_ptr<const SampleData> s, const ParamS
     const int totalSamples = (int) (total * sr), heldSamples = (int) (held * sr);
     juce::AudioBuffer<float> out (2, totalSamples);
     out.clear();
-    juce::AudioBuffer<float> buf (2, 512);
+    static const int blockSize = std::getenv ("BATCH_BLOCK") != nullptr ? juce::jlimit (16, 8192, std::atoi (std::getenv ("BATCH_BLOCK"))) : 512;
+    juce::AudioBuffer<float> buf (2, blockSize);
 
-    for (int pos = 0; pos < totalSamples; pos += 512)
+    for (int pos = 0; pos < totalSamples; pos += blockSize)
     {
-        const int n = std::min (512, totalSamples - pos);
+        const int n = std::min (blockSize, totalSamples - pos);
         buf.setSize (2, n, false, false, true);
         juce::MidiBuffer midi;
         if (pos == 0)
@@ -743,6 +748,1466 @@ int main (int argc, char* argv[])
         return 0;
     }
 
+    if (juce::String (argv[1]) == "tonalidad" && argc > 3)
+    {
+        // tonalidad <folder | list.txt> <out.csv> [every N]: for each file with its key in the name, the key its audio
+        // gives and how sure, against the name: exact, relative (same notes), same root other mode, a fifth, wrong.
+        std::FILE* csv = nullptr;
+        if (fopen_s (&csv, argv[3], "w") != 0)
+            return 1;
+        std::fprintf (csv, "file,name_key,audio_key,confidence,verdict,seconds\n");
+        const int every = argc > 4 ? std::max (1, juce::String (argv[4]).getIntValue()) : 1;
+        int i = 0;
+        struct Bin { int all = 0, exact = 0, relative = 0, mode = 0, fifth = 0; };
+        std::array<Bin, 5> bins {};      // confidence 0-20, 20-40, 40-60, 60-80, 80-100 %
+        for (const auto& f : filesIn (juce::File (juce::String::fromUTF8 (argv[2]))))
+        {
+            const auto named = KeyDetect::fromName (f.getFileName());
+            if (named.root < 0 || i++ % every != 0)
+                continue;
+            juce::AudioBuffer<float> audio;
+            double rate = 0.0;
+            if (! SampleAnalysis::loadFile (f, audio, rate))
+                continue;
+            const auto got = KeyDetect::fromAudio (audio, rate);
+            if (std::getenv ("TONO_DIAG") != nullptr)
+            {
+                std::printf ("%s rate %.0f ch %d n %d:", f.getFileName().toRawUTF8(), rate, audio.getNumChannels(), audio.getNumSamples());
+                for (const float c : got.chroma)
+                    std::printf (" %.2f", c);
+                std::printf ("\n");
+            }
+            const int relativeRoot = named.minor ? (named.root + 3) % 12 : (named.root + 9) % 12;
+            const char* verdict = got.root < 0 ? "none"
+                                : got.root == named.root && got.minor == named.minor ? "exact"
+                                : got.root == relativeRoot && got.minor != named.minor ? "relative"
+                                : got.root == named.root ? "mode"
+                                : (got.root == (named.root + 7) % 12 || got.root == (named.root + 5) % 12) ? "fifth" : "wrong";
+            auto& bin = bins[(size_t) juce::jlimit (0, 4, (int) (got.confidence * 5.0f))];
+            ++bin.all;
+            bin.exact += juce::String (verdict) == "exact";
+            bin.relative += juce::String (verdict) == "relative";
+            bin.mode += juce::String (verdict) == "mode";
+            bin.fifth += juce::String (verdict) == "fifth";
+            std::fprintf (csv, "\"%s\",%s,%s,%.2f,%s,%.2f\n", f.getFileName().replace ("\"", "'").toRawUTF8(), named.text().toRawUTF8(), got.text().toRawUTF8(),
+                          got.confidence, verdict, audio.getNumSamples() / rate);
+            std::fflush (csv);
+        }
+        std::fclose (csv);
+        std::printf ("confianza | archivos | exacta | relativa | misma tonica | quinta | resto\n");
+        for (size_t k = 0; k < bins.size(); ++k)
+        {
+            const auto& bn = bins[k];
+            const auto pct = [&bn] (int x) { return bn.all > 0 ? 100.0 * x / bn.all : 0.0; };
+            std::printf ("%3d-%3d %% | %5d | %5.1f %% | %5.1f %% | %5.1f %% | %5.1f %% | %5.1f %%\n", (int) k * 20, (int) k * 20 + 20, bn.all, pct (bn.exact), pct (bn.relative),
+                         pct (bn.mode), pct (bn.fifth), pct (bn.all - bn.exact - bn.relative - bn.mode - bn.fifth));
+        }
+        return 0;
+    }
+    if (juce::String (argv[1]) == "motores_sinteticos" && argc > 2)
+    {
+        // motores_sinteticos <out.csv> [rate] [engines]: sounds whose ideal result is known at any transposition, so that what
+        // an engine adds can be told from what it is meant to do. Each at the root, +5, +12, -7, -12, held 3 s with its
+        // detected envelope:
+        //   tono 220: 10 harmonics at 1/h, steady; bajo 55: the same at 55 Hz; pulsado 330: decaying 0.8 s, 2 ms rise;
+        //   tono con aliento: the 220 tone with noise 30 dB under it (to keep); pad ancho: 220 and 220.8 Hz sets, one
+        //   per side (a wide, slowly beating stereo).
+        // Measured in the held part (0.4 s to 2.6 s; the pluck from 0.05 s to 0.6 s):
+        //   harmErrDb: RMS of the harmonics 2..10 against the fundamental, against the source's own (timbre);
+        //   noiseDb: energy between the harmonics against the harmonics (the source's: ~-90 dB; with breath, -30);
+        //   flutterDb: how much the level moves from 5 ms to 5 ms (the source's ~0; the pluck, its own decay taken out);
+        //   cents, wobble: pitch against the note and its spread; monoDb: what summing to mono loses.
+        std::FILE* csv = nullptr;
+        if (fopen_s (&csv, argv[2], "w") != 0)
+            return 1;
+        const double rate = argc > 3 ? juce::String (argv[3]).getDoubleValue() : 48000.0;
+        const juce::String engines = argc > 4 ? juce::String (argv[4]) : juce::String ("ABCDEF");
+        std::fprintf (csv, "sound,engine,case,levelDb,harmErrDb,noiseDb,noiseSourceDb,flutterDb,cents,wobble,monoDb,msPerS\n");
+        struct Sound { const char* name; double f0; bool pluck, breath, wide; };
+        const Sound sounds[] = { { "tono 220", 220.0, false, false, false }, { "bajo 55", 55.0, false, false, false },
+                                 { "pulsado 330", 330.0, true, false, false }, { "tono con aliento", 220.0, false, true, false },
+                                 { "pad ancho", 220.0, false, false, true } };
+        constexpr int N = 16384;
+        juce::dsp::FFT fftBig (14);
+        std::vector<float> wbig ((size_t) N), big ((size_t) N * 2);
+        for (int i = 0; i < N; ++i)
+            wbig[(size_t) i] = 0.5f - 0.5f * std::cos (juce::MathConstants<float>::twoPi * i / (float) N);
+        // the spectrum of the held part (averaged power), mono
+        const auto spectrum = [&] (const juce::AudioBuffer<float>& y, double from, double to)
+        {
+            std::vector<double> p ((size_t) N / 2, 0.0);
+            int frames = 0;
+            for (int start = (int) (from * rate); start + N <= (int) (to * rate) && start + N <= y.getNumSamples(); start += N / 4, ++frames)
+            {
+                std::fill (big.begin(), big.end(), 0.0f);
+                for (int i = 0; i < N; ++i)
+                    big[(size_t) i] = 0.5f * (y.getSample (0, start + i) + y.getSample (1, start + i)) * wbig[(size_t) i];
+                fftBig.performFrequencyOnlyForwardTransform (big.data(), true);
+                for (int k = 0; k < N / 2; ++k)
+                    p[(size_t) k] += (double) big[(size_t) k] * big[(size_t) k];
+            }
+            return p;
+        };
+        const auto harmonics = [&] (const std::vector<double>& p, double f0, std::array<double, 10>& h, double& noise)
+        {
+            h.fill (1.0e-20);
+            noise = 1.0e-20;
+            double harm = 0.0;
+            for (int k = 1; k < N / 2; ++k)
+            {
+                const double hz = k * rate / N;
+                if (hz < 30.0 || hz > std::min (16000.0, 10.5 * f0))
+                    continue;
+                const double x = hz / f0, n = std::round (x);
+                if (n >= 1.0 && n <= 10.0 && std::abs (x - n) * f0 <= std::max (4.0 * rate / N, 0.02 * f0))
+                {
+                    h[(size_t) n - 1] += p[(size_t) k];
+                    harm += p[(size_t) k];
+                }
+                else if (std::abs (x - n) > 0.2)
+                    noise += p[(size_t) k];
+            }
+            noise = 10.0 * std::log10 (noise / (harm + 1.0e-20));
+        };
+        for (const auto& snd : sounds)
+        {
+            const int n = (int) (3.0 * rate);
+            juce::AudioBuffer<float> src (2, n);
+            src.clear();
+            juce::Random rng (5);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < n; ++i)
+                {
+                    const double t = i / rate;
+                    const double f = snd.wide && ch == 1 ? snd.f0 * (220.8 / 220.0) : snd.f0;
+                    double v = 0.0;
+                    for (int h = 1; h <= 10; ++h)
+                        v += std::sin (2.0 * juce::MathConstants<double>::pi * f * h * t + (snd.wide ? ch * 0.7 * h : 0.0)) / h;
+                    const double env = snd.pluck ? std::min (1.0, t / 0.002) * std::exp (-t / 0.8) : std::min (1.0, t / 0.01);
+                    double x = (snd.breath && std::getenv ("SINT_SOLO_RUIDO") != nullptr ? 0.0 : 0.2) * v * env;
+                    if (snd.breath)
+                        x += 0.2 * 0.0316 * (rng.nextFloat() * 2.0 - 1.0) * 1.7 * env;
+                    src.setSample (ch, i, (float) x);
+                }
+            const auto s = SampleAnalysis::analyse (src, rate, juce::String (snd.name) + " C3", false, true);
+            const double from = snd.pluck ? 0.05 : 0.4, to = snd.pluck ? 0.6 : 2.6;
+            std::array<double, 10> hs;
+            double noiseSource;
+            harmonics (spectrum (src, from, to), snd.f0, hs, noiseSource);
+            for (int engine = 0; engine <= P::EngineDrone; ++engine)
+            {
+                if (! engines.containsChar ((juce::juce_wchar) ('A' + engine)))
+                    continue;
+                for (const int shift : { 0, 5, 12, -7, -12 })
+                {
+                    auto q = defaultsFor (*s);
+                    q[P::Engine] = (float) engine;
+                    q[P::SnapC] = 0.0f;
+                    if (std::getenv ("SINT_COHERENTE") != nullptr)
+                        q[P::GrainCoherent] = 1.0f;
+                    const double t0 = juce::Time::getMillisecondCounterHiRes();
+                    if (const char* nl = std::getenv ("SINT_RUIDO"))
+                        q[P::NoiseLevel] = (float) std::atof (nl);
+                    const auto y = play (s, q, SynthEngine::rootKey + shift, 3.0, 3.0, rate);       // C3 plays the sample as it is
+                    if (const char* dir = std::getenv ("SINT_WAV"))
+                    {
+                        const auto out = juce::File (juce::String::fromUTF8 (dir)).getChildFile (juce::String (snd.name) + " " + juce::String::charToString ((juce::juce_wchar) ('A' + engine))
+                                                                                                  + " " + juce::String (shift) + ".wav");
+                        out.deleteFile();
+                        std::unique_ptr<juce::OutputStream> st = std::make_unique<juce::FileOutputStream> (out);
+                        juce::WavAudioFormat wav;
+                        if (auto w = wav.createWriterFor (st, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (32)))
+                            w->writeFromAudioSampleBuffer (y, 0, y.getNumSamples());
+                    }
+                    const double ms = juce::Time::getMillisecondCounterHiRes() - t0;
+                    const double fOut = snd.f0 * std::exp2 (shift / 12.0);
+                    std::array<double, 10> ho;
+                    double noise;
+                    harmonics (spectrum (y, from, to), fOut, ho, noise);
+                    double err = 0.0;
+                    for (int h = 1; h < 10; ++h)
+                    {
+                        const double want = 10.0 * std::log10 (hs[(size_t) h] / hs[0]), got = 10.0 * std::log10 (ho[(size_t) h] / ho[0]);
+                        err += (got - want) * (got - want);
+                    }
+                    // flutter: 5 ms levels, against a 50 ms moving average (the decay taken out)
+                    std::vector<double> lv;
+                    const double step = std::max (0.005, 1.5 / fOut);       // a window of at least a period and a half
+                    for (double t = from; t + step <= to; t += step)
+                        lv.push_back (rmsDb (y, t, t + step, rate));
+                    double flutter = 0.0;
+                    int cnt = 0;
+                    for (size_t k = 5; k + 5 < lv.size(); ++k)
+                    {
+                        double m = 0.0;
+                        for (size_t j = k - 5; j <= k + 5; ++j)
+                            m += lv[j];
+                        m /= 11.0;
+                        flutter += (lv[k] - m) * (lv[k] - m);
+                        ++cnt;
+                    }
+                    flutter = cnt > 0 ? std::sqrt (flutter / cnt) : 0.0;
+                    // pitch: the strongest peak near the fundamental, every 46 ms
+                    std::vector<double> cents;
+                    for (double t = from; t + 0.09 <= to; t += 0.046)
+                    {
+                        const auto p = spectrum (y, t, t + N / rate + 0.001);
+                        if (p.empty())
+                            break;
+                        int best = -1;
+                        for (int k = (int) (fOut * 0.9 * N / rate); k <= (int) (fOut * 1.1 * N / rate); ++k)
+                            if (k > 0 && k + 1 < N / 2 && (best < 0 || p[(size_t) k] > p[(size_t) best]))
+                                best = k;
+                        if (best < 1)
+                            continue;
+                        const double a = std::log (p[(size_t) best - 1] + 1e-30), b = std::log (p[(size_t) best] + 1e-30), c = std::log (p[(size_t) best + 1] + 1e-30);
+                        const double off = (a - 2 * b + c) != 0.0 ? 0.5 * (a - c) / (a - 2 * b + c) : 0.0;
+                        cents.push_back (1200.0 * std::log2 ((best + off) * rate / N / fOut));
+                    }
+                    double med = 0.0, wob = 0.0;
+                    if (! cents.empty())
+                    {
+                        std::sort (cents.begin(), cents.end());
+                        med = cents[cents.size() / 2];
+                        wob = cents.back() - cents.front();
+                    }
+                    double mid = 0.0, sides = 0.0;
+                    for (int i = (int) (from * rate); i < (int) (to * rate) && i < y.getNumSamples(); ++i)
+                    {
+                        const double l = y.getSample (0, i), r = y.getSample (1, i);
+                        mid += 0.25 * (l + r) * (l + r);
+                        sides += 0.5 * (l * l + r * r);
+                    }
+                    std::fprintf (csv, "%s,%c,%+d,%.2f,%.2f,%.1f,%.1f,%.2f,%.1f,%.1f,%.2f,%.1f\n", snd.name, (char) ('A' + engine), shift,
+                                  rmsDb (y, from, to, rate), std::sqrt (err / 9.0), noise, noiseSource, flutter, med, wob,
+                                  10.0 * std::log10 ((mid + 1e-20) / (sides + 1e-20)), ms / 3.0);
+                    std::fflush (csv);
+                }
+            }
+        }
+        std::fclose (csv);
+        return 0;
+    }
+    if (juce::String (argv[1]) == "motores_tonal" && argc > 3)
+    {
+        // motores_tonal <list.txt> <out.csv> [engines]: the engine audit on tonal samples. Each engine at the root,
+        // +5, +12, -7 and -12, the note held for the sample's length (4 s at most) with the detected envelope, against
+        // engine A in the same case (A untouched is the file; transposed, the file resampled, as a classic sampler):
+        //  - hnrDb: harmonics over the noise between them (sustain, 0.15 s on), the output's minus A's: below 0 is
+        //    noise or inharmonic energy the engine adds (or harmonics it loses);
+        //  - centsErr: the median pitch against the expected note; wobbleCents: how much it moves (IQR), output's
+        //    minus A's;
+        //  - bandErrDb: 24-band spectrum against A, level-matched, every 20 ms (timbre);
+        //  - envErrDb: median of the 20 ms level against A, level-matched; worstDipDb: its worst fall;
+        //  - attackMs and attackA: 10-90 % rise; crestDb vs crestA: peak over RMS of the first 30 ms (the transient);
+        //  - monoDb: what summing to mono loses, minus A's; msPerS: render time per second of sound (CPU).
+        std::FILE* csv = nullptr;
+        if (fopen_s (&csv, argv[3], "w") != 0)
+            return 1;
+        const juce::String engines = argc > 4 ? juce::String (argv[4]) : juce::String ("ABCDEF");
+        std::fprintf (csv, "file,root,engine,case,levelDb,hnrDb,hnrA,centsErr,wobbleCents,bandErrDb,envErrDb,worstDipDb,attackMs,attackA,crestDb,crestA,monoDb,msPerS\n");
+        constexpr int N = 8192;
+        juce::dsp::FFT fftBig (13);
+        std::vector<float> wbig ((size_t) N), big ((size_t) N * 2);
+        for (int i = 0; i < N; ++i)
+            wbig[(size_t) i] = 0.5f - 0.5f * std::cos (juce::MathConstants<float>::twoPi * i / (float) N);
+        const auto monoAt = [] (const juce::AudioBuffer<float>& y, int i) { return 0.5f * (y.getSample (0, i) + y.getSample (1, i)); };
+        // harmonics-to-noise over the held part: energy within 3 % of each harmonic (to 8 kHz) against the rest of 60 Hz-8 kHz
+        const auto hnr = [&] (const juce::AudioBuffer<float>& y, double f0, double from, double to, double rate)
+        {
+            double harm = 0.0, noise = 0.0;
+            for (int start = (int) (from * rate); start + N <= (int) (to * rate) && start + N <= y.getNumSamples(); start += N / 2)
+            {
+                std::fill (big.begin(), big.end(), 0.0f);
+                for (int i = 0; i < N; ++i)
+                    big[(size_t) i] = monoAt (y, start + i) * wbig[(size_t) i];
+                fftBig.performFrequencyOnlyForwardTransform (big.data(), true);
+                for (int k = 1; k < N / 2; ++k)
+                {
+                    const double hz = k * rate / N;
+                    if (hz < 60.0 || hz > 8000.0)
+                        continue;
+                    const double h = hz / f0, nearest = std::round (h);
+                    const double p = (double) big[(size_t) k] * big[(size_t) k];
+                    if (nearest >= 1.0 && std::abs (h - nearest) * f0 <= std::max (0.03 * nearest * f0, 1.5 * rate / N))
+                        harm += p;
+                    else if (std::abs (h - nearest) > 0.25)
+                        noise += p;
+                }
+            }
+            return 10.0 * std::log10 ((harm + 1.0e-20) / (noise + 1.0e-20));
+        };
+        // pitch every 40 ms (autocorrelation, within 3 semitones of the expected note): cents against it, median and IQR
+        const auto pitch = [&] (const juce::AudioBuffer<float>& y, double f0, double from, double to, double rate, double& median, double& iqr)
+        {
+            std::vector<double> cents;
+            const int w = (int) std::max (0.04 * rate, 3.0 * rate / f0);       // 40 ms, or 3 periods of a low note
+            const int lagLo = (int) (rate / (f0 * std::exp2 (3.0 / 12.0))), lagHi = (int) (rate / (f0 * std::exp2 (-3.0 / 12.0))) + 1;
+            for (int s0 = (int) (from * rate); s0 + w + lagHi < std::min ((int) (to * rate), y.getNumSamples()); s0 += w)
+            {
+                double e0 = 0.0;
+                for (int i = 0; i < w; ++i)
+                    e0 += (double) monoAt (y, s0 + i) * monoAt (y, s0 + i);
+                if (e0 < 1.0e-8)
+                    continue;
+                int best = -1;
+                double bestR = 0.0;
+                std::vector<double> r ((size_t) (lagHi + 2), 0.0);
+                for (int lag = std::max (2, lagLo - 1); lag <= lagHi + 1; ++lag)
+                {
+                    double num = 0.0, e1 = 0.0;
+                    for (int i = 0; i < w; ++i)
+                    {
+                        const double a = monoAt (y, s0 + i), b = monoAt (y, s0 + i + lag);
+                        num += a * b;
+                        e1 += b * b;
+                    }
+                    r[(size_t) lag] = num / std::sqrt (e0 * e1 + 1.0e-20);
+                }
+                for (int lag = std::max (3, lagLo); lag <= lagHi; ++lag)
+                    if (r[(size_t) lag] > bestR && r[(size_t) lag] >= r[(size_t) lag - 1] && r[(size_t) lag] >= r[(size_t) lag + 1])
+                    {
+                        bestR = r[(size_t) lag];
+                        best = lag;
+                    }
+                if (best < 0 || bestR < 0.5)
+                    continue;
+                const double a = r[(size_t) best - 1], b = r[(size_t) best], c = r[(size_t) best + 1];
+                const double den = a - 2.0 * b + c;
+                const double lag = best + (std::abs (den) > 1.0e-12 ? 0.5 * (a - c) / den : 0.0);
+                cents.push_back (1200.0 * std::log2 ((rate / lag) / f0));
+            }
+            if (cents.size() < 3)
+            {
+                median = iqr = std::numeric_limits<double>::quiet_NaN();
+                return;
+            }
+            std::sort (cents.begin(), cents.end());
+            median = cents[cents.size() / 2];
+            iqr = cents[cents.size() * 3 / 4] - cents[cents.size() / 4];
+        };
+        const auto levels = [] (const juce::AudioBuffer<float>& y, double seconds, double rate)
+        {
+            std::vector<double> e;
+            for (double t = 0.0; t + 0.02 <= seconds; t += 0.02)
+                e.push_back (rmsDb (y, t, t + 0.02, rate));
+            return e;
+        };
+        const auto crest = [&] (const juce::AudioBuffer<float>& y, double rate)
+        {
+            const int n = std::min (y.getNumSamples(), (int) (0.03 * rate));
+            double peak = 0.0, e = 0.0;
+            for (int i = 0; i < n; ++i)
+            {
+                const double v = monoAt (y, i);
+                peak = std::max (peak, std::abs (v));
+                e += v * v;
+            }
+            return 20.0 * std::log10 ((peak + 1.0e-12) / std::sqrt (e / std::max (1, n) + 1.0e-24));
+        };
+        const auto rise = [] (const juce::AudioBuffer<float>& y, double rate)
+        {
+            const int w = std::max (1, (int) (0.001 * rate)), n = std::min (y.getNumSamples(), (int) rate);
+            std::vector<double> env;
+            for (int i = 0; i + w <= n; i += w)
+            {
+                double e = 0.0;
+                for (int j = i; j < i + w; ++j)
+                    e = std::max (e, (double) std::abs (y.getSample (0, j)) + std::abs (y.getSample (1, j)));
+                env.push_back (e);
+            }
+            if (env.empty())
+                return 0.0;
+            const double top = *std::max_element (env.begin(), env.end());
+            int a = -1, b = -1;
+            for (int k = 0; k < (int) env.size(); ++k)
+            {
+                if (a < 0 && env[(size_t) k] >= 0.1 * top)
+                    a = k;
+                if (env[(size_t) k] >= 0.9 * top)
+                {
+                    b = k;
+                    break;
+                }
+            }
+            return a >= 0 && b >= a ? (b - a) * 1000.0 * w / rate : 0.0;
+        };
+        const auto monoLoss = [] (const juce::AudioBuffer<float>& y, int to)
+        {
+            double mid = 0.0, sides = 0.0;
+            for (int i = 0; i < std::min (to, y.getNumSamples()); ++i)
+            {
+                const double l = y.getSample (0, i), r = y.getSample (1, i);
+                mid += 0.25 * (l + r) * (l + r);
+                sides += 0.5 * (l * l + r * r);
+            }
+            return 10.0 * std::log10 ((mid + 1.0e-20) / (sides + 1.0e-20));
+        };
+        constexpr int bands = 24;
+        juce::dsp::FFT fft (11);
+        std::vector<float> win (2048), fbuf (4096);
+        for (int i = 0; i < 2048; ++i)
+            win[(size_t) i] = 0.5f - 0.5f * std::cos (juce::MathConstants<float>::twoPi * i / 2048.0f);
+        const auto bandsAt = [&] (const juce::AudioBuffer<float>& x, int centre, double rate, std::array<double, bands>& band)
+        {
+            std::fill (fbuf.begin(), fbuf.end(), 0.0f);
+            for (int i = 0; i < 2048; ++i)
+                if (const int t = centre - 1024 + i; t >= 0 && t < x.getNumSamples())
+                    fbuf[(size_t) i] = monoAt (x, t) * win[(size_t) i];
+            fft.performFrequencyOnlyForwardTransform (fbuf.data(), true);
+            band.fill (1.0e-12);
+            for (int k = 2; k < 1024; ++k)
+                if (const double hz = k * rate / 2048.0; hz >= 40.0 && hz <= 16000.0)
+                    band[(size_t) juce::jlimit (0, bands - 1, (int) (bands * std::log (hz / 40.0) / std::log (16000.0 / 40.0)))] += (double) fbuf[(size_t) k] * fbuf[(size_t) k];
+        };
+        for (const auto& f : filesIn (juce::File (juce::String::fromUTF8 (argv[2]))))
+        {
+            juce::AudioBuffer<float> raw;
+            double rate = 0.0;
+            if (! SampleAnalysis::loadFile (f, raw, rate))
+                continue;
+            const auto s = SampleAnalysis::analyse (raw, rate, f.getFileNameWithoutExtension(), false, true);
+            if (! s->pitched)
+                continue;
+            const double held = juce::jlimit (0.3, 4.0, (s->length - s->onset) / rate), total = held + 0.3;
+            const double rootHz = 440.0 * std::exp2 ((s->rootMidi - 69.0) / 12.0);
+            const auto name = f.getFileName().replace (",", "_");
+            for (const int shift : { 0, 5, 12, -7, -12 })
+            {
+                auto q = defaultsFor (*s);
+                q[P::Engine] = (float) P::EngineRebuild;
+                const int note = SynthEngine::rootKey + shift;
+                const auto a = play (s, q, note, held, total, rate);
+                const double f0 = rootHz * std::exp2 (shift / 12.0);
+                const auto envA = levels (a, held, rate);
+                double peakA = -200.0;
+                for (const double v : envA)
+                    peakA = std::max (peakA, v);
+                const double hnrA = hnr (a, f0, 0.15, held, rate);
+                double medA, iqrA;
+                pitch (a, f0, 0.1, held, rate, medA, iqrA);
+                const double attackA = rise (a, rate), crestA = crest (a, rate), monoA = monoLoss (a, (int) (held * rate));
+                for (int engine = 0; engine <= P::EngineDrone; ++engine)
+                {
+                    if (! engines.containsChar ((juce::juce_wchar) ('A' + engine)))
+                        continue;
+                    q[P::Engine] = (float) engine;
+                    const double t0 = juce::Time::getMillisecondCounterHiRes();
+                    const auto y = engine == 0 ? a : play (s, q, note, held, total, rate);
+                    const double ms = engine == 0 ? 0.0 : juce::Time::getMillisecondCounterHiRes() - t0;
+                    const auto env = levels (y, held, rate);
+                    std::vector<double> diffs;
+                    for (size_t k = 0; k < env.size() && k < envA.size(); ++k)
+                        if (envA[k] > peakA - 40.0)
+                            diffs.push_back (env[k] - envA[k]);
+                    double gain = 0.0, envErr = 0.0, dip = 0.0, bandErr = 0.0, weight = 0.0;
+                    if (! diffs.empty())
+                    {
+                        auto sorted = diffs;
+                        std::sort (sorted.begin(), sorted.end());
+                        gain = sorted[sorted.size() / 2];
+                        std::vector<double> errs;
+                        for (const double d : diffs)
+                        {
+                            errs.push_back (std::abs (d - gain));
+                            dip = std::min (dip, d - gain);
+                        }
+                        std::sort (errs.begin(), errs.end());
+                        envErr = errs[errs.size() / 2];
+                        for (size_t k = 0; k < env.size() && k < envA.size(); ++k)
+                        {
+                            if (envA[k] <= peakA - 40.0)
+                                continue;
+                            std::array<double, bands> ba, by;
+                            const int centre = (int) ((k * 0.02 + 0.01) * rate);
+                            bandsAt (a, centre, rate, ba);
+                            bandsAt (y, centre, rate, by);
+                            double totalA = 0.0;
+                            for (const double v : ba)
+                                totalA += v;
+                            const double wt = std::pow (10.0, (envA[k] - peakA) / 20.0);
+                            for (int bb = 0; bb < bands; ++bb)
+                                if (const double share = ba[(size_t) bb] / totalA; share >= 1.0e-4)
+                                {
+                                    bandErr += wt * share * std::abs (10.0 * std::log10 (by[(size_t) bb] / ba[(size_t) bb]) - gain);
+                                    weight += wt * share;
+                                }
+                        }
+                    }
+                    double med, iqr;
+                    pitch (y, f0, 0.1, held, rate, med, iqr);
+                    std::fprintf (csv, "\"%s\",%.2f,%c,%+d,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%.1f\n", name.toRawUTF8(),
+                                  s->rootMidi, (char) ('A' + engine), shift, rmsDb (y, 0.0, held, rate), hnr (y, f0, 0.15, held, rate) - hnrA, hnrA,
+                                  med, std::isfinite (iqr) && std::isfinite (iqrA) ? iqr - iqrA : std::numeric_limits<double>::quiet_NaN(),
+                                  weight > 0.0 ? bandErr / weight : -1.0, envErr, dip, rise (y, rate), attackA, crest (y, rate), crestA,
+                                  monoLoss (y, (int) (held * rate)) - monoA, ms / total);
+                }
+            }
+            std::fflush (csv);
+        }
+        std::fclose (csv);
+        return 0;
+    }
+    if (juce::String (argv[1]) == "colorplay" && argc > 3)
+    {
+        // colorplay <list.txt> <out.csv> [wavdir]: the four functions taken from the Color Play research
+        // (docs/investigacion_colorplay_2026-11-23.md), each against the same note without it, on every engine.
+        // SIDE=<wav>: the sidechain for Impronta and the Sidechain source (a drum loop; read round).
+        // Cases: off; deriva (LFO 1 Deriva 0.4 Hz, Suavidad 0.5, on Tono fino at 15 cents); armonico+ / armonico-
+        // (filter Armónico, Keytrack 100 %, 2 kHz, Realce +9 / -12 dB); impronta (Impronta Color in Main 1); sc_fuente
+        // (Lowpass 800 Hz opened by the Sidechain source); and in B and D, Sostenido held 6 s with Movimiento 0 and 1.
+        // Per render: rmsDb (the held part), peakDb, clicks, centroidHz, tonalDb (energy on the harmonics of the note
+        // against between them, 1 s from 0.3 s), ms per second of sound, and for Movimiento: handDipDb (the worst 50 ms
+        // fall within 0.4 s of the hand-over to the sustain against the level before it), holdSlopeDb (from 0.5 s after
+        // the hand-over to the end of the hold) and followCorr (how the centroid follows the sample's own over the
+        // sample's length after the hand-over; empty when the sample is too short to tell).
+        const auto list = juce::File (juce::String::fromUTF8 (argv[2]));
+        juce::StringArray lines;
+        list.readLines (lines);
+        const juce::File wavDir = argc > 4 ? juce::File (juce::String::fromUTF8 (argv[4])) : juce::File();
+        if (wavDir != juce::File())
+            wavDir.createDirectory();
+
+        juce::AudioBuffer<float> side;
+        double sideRate = 0.0;
+        if (const char* path = std::getenv ("SIDE"))
+            SampleAnalysis::loadFile (juce::File (juce::String::fromUTF8 (path)), side, sideRate);
+
+        auto* csv = std::fopen (argv[3], "w");
+        if (csv == nullptr)
+            return 1;
+        std::fprintf (csv, "file,engine,case,rmsDb,peakDb,clicks,centroidHz,tonalDb,msPerSec,handDipDb,holdSlopeDb,followCorr\n");
+
+        constexpr double rate = 48000.0;
+        const auto centroid = [] (const juce::AudioBuffer<float>& a, int from, int length, double sr)
+        {
+            constexpr int order = 12, size = 1 << order;
+            juce::dsp::FFT fft (order);
+            std::vector<float> w ((size_t) size * 2);
+            double num = 0.0, den = 0.0;
+            for (int at = from; at + size <= std::min (a.getNumSamples(), from + length); at += size / 2)
+            {
+                std::fill (w.begin(), w.end(), 0.0f);
+                for (int i = 0; i < size; ++i)
+                    w[(size_t) i] = 0.5f * (a.getSample (0, at + i) + a.getSample (1, at + i))
+                                  * (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi * (float) i / size));
+                fft.performFrequencyOnlyForwardTransform (w.data());
+                for (int k = 1; k < size / 2; ++k)
+                {
+                    const double pw = (double) w[(size_t) k] * w[(size_t) k];
+                    num += pw * k * sr / size;
+                    den += pw;
+                }
+            }
+            return den > 0.0 ? num / den : 0.0;
+        };
+        // Energy within a quarter of the note's frequency of its harmonics, against the rest (up to 8 kHz).
+        const auto tonal = [] (const juce::AudioBuffer<float>& a, int from, double f0, double sr)
+        {
+            constexpr int order = 15, size = 1 << order;
+            if (from + size > a.getNumSamples() || f0 <= 0.0)
+                return 0.0;
+            juce::dsp::FFT fft (order);
+            std::vector<float> w ((size_t) size * 2, 0.0f);
+            for (int i = 0; i < size; ++i)
+                w[(size_t) i] = 0.5f * (a.getSample (0, from + i) + a.getSample (1, from + i))
+                              * (0.5f - 0.5f * std::cos (2.0f * juce::MathConstants<float>::pi * (float) i / size));
+            fft.performFrequencyOnlyForwardTransform (w.data());
+            double on = 1.0e-20, off = 1.0e-20;
+            for (int k = 1; k < size / 2; ++k)
+            {
+                const double hz = k * sr / size;
+                if (hz > 8000.0 || hz < 0.75 * f0)
+                    continue;
+                const double h = hz / f0;
+                const double pw = (double) w[(size_t) k] * w[(size_t) k];
+                (std::abs (h - std::round (h)) < 0.25 ? on : off) += pw;
+            }
+            return 10.0 * std::log10 (on / off);
+        };
+        const auto writeWav = [&wavDir] (const juce::AudioBuffer<float>& a, const juce::String& name, double sr, double matchDb)
+        {
+            if (wavDir == juce::File())
+                return;
+            juce::AudioBuffer<float> b (a);
+            b.applyGain ((float) std::pow (10.0, matchDb / 20.0));
+            const float peak = b.getMagnitude (0, b.getNumSamples());
+            if (peak > 0.97f)
+                b.applyGain (0.97f / peak);
+            auto file = wavDir.getChildFile (juce::File::createLegalFileName (name) + ".wav");
+            file.deleteFile();
+            std::unique_ptr<juce::OutputStream> stream (file.createOutputStream().release());
+            juce::WavAudioFormat wav;
+            if (auto writer = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (sr).withNumChannels (2).withBitsPerSample (24)))
+                writer->writeFromAudioSampleBuffer (b, 0, b.getNumSamples());
+        };
+
+        for (const auto& line : lines)
+        {
+            const juce::File f (line.trim());
+            if (! f.existsAsFile())
+                continue;
+            juce::AudioBuffer<float> raw;
+            double sr = 0.0;
+            if (! SampleAnalysis::loadFile (f, raw, sr))
+                continue;
+            if (std::getenv ("CPDEBUG") != nullptr)
+            {
+                std::printf ("analysing %s\n", f.getFileName().toRawUTF8());
+                std::fflush (stdout);
+            }
+            const auto s = SampleAnalysis::analyse (raw, sr, f.getFileNameWithoutExtension(), false, true);
+            const double len = s->length / sr;
+            const double held = juce::jlimit (1.0, 4.0, len);
+            if (std::getenv ("CPDEBUG") != nullptr)
+            {
+                std::printf ("analysed\n");
+                std::fflush (stdout);
+            }
+            const double f0 = s->pitched ? 440.0 * std::pow (2.0, (s->rootMidi - 69.0) / 12.0) : 0.0;
+            const auto name = f.getFileNameWithoutExtension();
+
+            struct Case { const char* name; int engine; std::function<void (ParamSnapshot&)> set; double hold; };
+            std::vector<Case> cases;
+            for (int e = 0; e < 6; ++e)
+            {
+                cases.push_back ({ "off", e, [] (ParamSnapshot&) {}, held });
+                cases.push_back ({ "deriva", e, [] (ParamSnapshot& q)
+                {
+                    q[P::Lfo1Shape] = (float) P::Drift; q[P::Lfo1Rate] = 0.4f; q[P::Lfo1Smooth] = 0.5f;
+                    q[P::M1Src] = (float) P::SrcLfo1; q[P::M1Dst] = (float) P::DstFine; q[P::M1Amt] = 0.15f;
+                }, held });
+                const auto harmonic = [] (float gain) { return [gain] (ParamSnapshot& q)
+                {
+                    q[P::FltOn] = 1.0f; q[P::FltType] = (float) P::Harmonic; q[P::FltFreq] = 1000.0f; q[P::FltKey] = 1.0f;
+                    q[P::FltHarmGain] = gain; q[P::FltRes] = 0.5f;
+                }; };
+                cases.push_back ({ "armonico+", e, harmonic (9.0f), held });
+                cases.push_back ({ "armonico-", e, harmonic (-12.0f), held });
+                if (side.getNumSamples() > 0)
+                {
+                    cases.push_back ({ "impronta", e, [] (ParamSnapshot& q)
+                    {
+                        q[(size_t) P::fxType (0)] = (float) Fx::Impronta;
+                        q[(size_t) P::fxOn (0)] = 1.0f;
+                        q[(size_t) P::fxMix (0)] = 1.0f;
+                        for (int k = 0; k < P::fxParamsPerSlot && k < (int) Fx::spec (Fx::Impronta).params.size(); ++k)
+                            q[(size_t) P::fxParam (0, k)] = Fx::toNorm (Fx::spec (Fx::Impronta).params[(size_t) k], Fx::spec (Fx::Impronta).params[(size_t) k].def);
+                    }, held });
+                    cases.push_back ({ "sc_fuente", e, [] (ParamSnapshot& q)
+                    {
+                        q[P::FltOn] = 1.0f; q[P::FltType] = (float) P::LP; q[P::FltFreq] = 800.0f;
+                        q[P::M1Src] = (float) P::SrcSidechain; q[P::M1Dst] = (float) P::DstCutoff; q[P::M1Amt] = 0.5f;
+                    }, held });
+                }
+                if (e == P::EngineReenvelope || e == P::EngineHybrid)
+                    for (const float m : { 0.0f, 1.0f })
+                        cases.push_back ({ m > 0.0f ? "mov1" : "mov0", e, [m] (ParamSnapshot& q)
+                        {
+                            q[P::SustainType] = (float) P::SustainHold; q[P::AmpS] = 1.0f; q[P::SustainMotion] = m;
+                        }, 6.0 });
+            }
+
+            double offRms[6] {};
+            for (const auto& c : cases)
+            {
+                auto q = defaultsFor (*s);
+                q[P::Engine] = (float) c.engine;
+                c.set (q);
+                const double total = c.hold + 0.6;
+                if (std::getenv ("CPDEBUG") != nullptr)
+                {
+                    std::printf ("  %c %s\n", 'A' + c.engine, c.name);
+                    std::fflush (stdout);
+                }
+
+                // The note, with the sidechain fed block by block (the loop read round).
+                SynthEngine e;
+                e.prepare (rate);
+                e.setSample (s);
+                e.prepareFx (q);
+                const int totalSamples = (int) (total * rate), heldSamples = (int) (c.hold * rate);
+                juce::AudioBuffer<float> out (2, totalSamples), buf (2, 512), sc (2, 512);
+                out.clear();
+                const double t0 = juce::Time::getMillisecondCounterHiRes();
+                for (int pos = 0; pos < totalSamples; pos += 512)
+                {
+                    const int n = std::min (512, totalSamples - pos);
+                    buf.setSize (2, n, false, false, true);
+                    juce::MidiBuffer midi;
+                    if (pos == 0)
+                        midi.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+                    if (pos <= heldSamples && heldSamples < pos + n)
+                        midi.addEvent (juce::MidiMessage::noteOff (1, 60), heldSamples - pos);
+                    if (side.getNumSamples() > 0)
+                    {
+                        for (int ch = 0; ch < 2; ++ch)
+                            for (int i = 0; i < n; ++i)
+                            {
+                                const int at = (int) (std::fmod ((pos + i) * sideRate / rate, (double) side.getNumSamples()));
+                                sc.setSample (ch, i, side.getSample (std::min (ch, side.getNumChannels() - 1), at));
+                            }
+                        e.setSidechain (sc.getReadPointer (0), sc.getReadPointer (1), n);
+                    }
+                    e.process (buf, midi, q, 120.0);
+                    for (int ch = 0; ch < 2; ++ch)
+                        out.copyFrom (ch, pos, buf, ch, 0, n);
+                }
+                const double ms = juce::Time::getMillisecondCounterHiRes() - t0;
+                if (std::getenv ("CPDEBUG") != nullptr)
+                {
+                    std::puts ("    rendered");
+                    std::fflush (stdout);
+                }
+
+                const double level = rmsDb (out, 0.0, c.hold, rate);
+                if (juce::String (c.name) == "off")
+                    offRms[c.engine] = level;
+                const double peak = 20.0 * std::log10 (std::max (1.0e-9f, out.getMagnitude (0, out.getNumSamples())));
+                const int clicks = countClicks (out, rate);
+                const double cen = centroid (out, 0, heldSamples, rate);
+                const double ton = tonal (out, (int) (0.3 * rate), f0, rate);
+
+                double dip = 0.0, slope = 0.0, follow = 0.0;
+                bool followKnown = false;
+                if (juce::String (c.name).startsWith ("mov") && s->early.loop.getNumSamples() > 0)
+                {
+                    // The hand-over: where the original reaches the sustain point (at the root, one sample a sample).
+                    const double hand = (s->early.start - s->onset) / sr;
+                    // The worst 50 ms within 0.4 s after it against the steady level that follows (0.5 to 1 s after it):
+                    // a hole where the sample hands over to its sustain.
+                    const double steady = rmsDb (out, hand + 0.5, hand + 1.0, rate);
+                    double worst = 0.0;
+                    for (double t = std::max (0.0, hand); t < hand + 0.4; t += 0.01)
+                        worst = std::min (worst, rmsDb (out, t, t + 0.05, rate) - steady);
+                    dip = worst;
+                    slope = rmsDb (out, c.hold - 0.6, c.hold - 0.1, rate) - rmsDb (out, hand + 0.5, hand + 1.0, rate);
+                    // The centroid of the render and of the sample, every 100 ms over what the sample lasts after it.
+                    std::vector<double> a, b;
+                    for (double t = hand + 0.2; t + 0.1 < std::min (c.hold, len - s->onset / sr); t += 0.1)
+                    {
+                        a.push_back (centroid (out, (int) (t * rate), (int) (0.1 * rate) + 4096, rate));
+                        b.push_back (centroid (s->audio, (int) ((t + s->onset / sr) * sr), (int) (0.1 * sr) + 4096, sr));
+                    }
+                    if (a.size() >= 8)
+                    {
+                        double ma = 0, mb = 0;
+                        for (size_t i = 0; i < a.size(); ++i) { ma += a[i]; mb += b[i]; }
+                        ma /= (double) a.size(); mb /= (double) b.size();
+                        double ab = 0, aa = 1.0e-12, bb = 1.0e-12;
+                        for (size_t i = 0; i < a.size(); ++i) { ab += (a[i] - ma) * (b[i] - mb); aa += juce::square (a[i] - ma); bb += juce::square (b[i] - mb); }
+                        follow = ab / std::sqrt (aa * bb);
+                        followKnown = true;
+                    }
+                }
+
+                std::fprintf (csv, "\"%s\",%c,%s,%.2f,%.2f,%d,%.0f,%.2f,%.2f,%.2f,%.2f,%s\n", name.toRawUTF8(), 'A' + c.engine, c.name, level, peak,
+                              clicks, cen, ton, ms / total, dip, slope, followKnown ? juce::String (follow, 3).toRawUTF8() : "");
+                // WAVCASES="A:off,A:deriva,B:mov1": only those renders written (all of them without it).
+                const auto key = juce::String::charToString ((juce::juce_wchar) ('A' + c.engine)) + ":" + c.name;
+                const char* wanted = std::getenv ("WAVCASES");
+                if (wanted == nullptr || juce::StringArray::fromTokens (juce::String (wanted), ",", "").contains (key))
+                    writeWav (out, name + "_" + key.replace (":", "_"), rate, offRms[c.engine] - level);
+            }
+            std::fflush (csv);
+            std::printf ("%s\n", name.toRawUTF8());
+        }
+        std::fclose (csv);
+        return 0;
+    }
+    if (juce::String (argv[1]) == "calidad" && argc > 3)
+    {
+        // calidad <list.txt> <out.csv> [engines e.g. ABCDEF]: the reference library's sound check, per file, engine and
+        // case (root; +7 and -12 semitones; soft, velocity 0.3; a chord of root, +4, +7), the note held for the sample's
+        // length (at most 4 s) with the detected envelope:
+        //  - fidelityDb: at the root, the mean error of 24 bands every 20 ms against the sample itself (engine A
+        //    untouched), level-matched;
+        //  - worstDipDb / worstBumpDb: the worst fall and rise of the 20 ms level against the sample's own at the root
+        //    (elsewhere against a 100 ms median of itself);
+        //  - monoDb: what summing to mono loses (0 = nothing; -3 = uncorrelated; much lower = out of phase), and
+        //    monoVsSampleDb: that against the sample's own;
+        //  - corr: left/right correlation; attackMs: 10-90 % rise; sampleAttackMs: the sample's;
+        //  - onsetClickDb, releaseClickDb: the slope at the start and at the release against around them;
+        //  - tailDb: what is left 0.3 s after the release ends, against the held level (noise, hum, leftovers);
+        //  - clicks / clicksRef: discontinuities (a sample-to-sample bend 10 times over the 5 ms around it, and over
+        //    -54 dBFS), in the engine's output and in engine A's in the same case (the file, or the file resampled):
+        //    more than A is the engine's own;
+        //  - dcDb: the mean of the held part against its RMS; overPeakDb: the output's peak against A's in the same case;
+        //  - hitSpreadDb / hitSpreadRefDb (case "repetida": the note struck 4 times, 150 ms apart): how much the four
+        //    hits' peaks differ (standard deviation), and A's.
+        std::FILE* csv = nullptr;
+        if (fopen_s (&csv, argv[3], "w") != 0)
+            return 1;
+        const juce::String engines = argc > 4 ? juce::String (argv[4]) : juce::String ("ABCDEF");
+        std::fprintf (csv, "file,engine,case,finite,peakDb,levelDb,fidelityDb,worstDipDb,worstBumpDb,monoDb,monoVsSampleDb,corr,attackMs,sampleAttackMs,"
+                           "onsetClickDb,releaseClickDb,tailDb,clicks,clicksRef,dcDb,overPeakDb,hitSpreadDb,hitSpreadRefDb\n");
+        const auto monoLoss = [] (const juce::AudioBuffer<float>& y, int from, int to)
+        {
+            double mid = 0.0, sides = 0.0;
+            for (int i = std::max (0, from); i < std::min (to, y.getNumSamples()); ++i)
+            {
+                const double l = y.getSample (0, i), r = y.getSample (1, i);
+                mid += 0.25 * (l + r) * (l + r);
+                sides += 0.5 * (l * l + r * r);
+            }
+            return 10.0 * std::log10 ((mid + 1.0e-20) / (sides + 1.0e-20));
+        };
+        const auto correlation = [] (const juce::AudioBuffer<float>& y, int from, int to)
+        {
+            double lr = 0.0, ll = 0.0, rr = 0.0;
+            for (int i = std::max (0, from); i < std::min (to, y.getNumSamples()); ++i)
+            {
+                const double l = y.getSample (0, i), r = y.getSample (1, i);
+                lr += l * r;
+                ll += l * l;
+                rr += r * r;
+            }
+            return lr / std::sqrt (ll * rr + 1.0e-30);
+        };
+        const auto riseMs = [] (const juce::AudioBuffer<float>& y, double rate)
+        {
+            // the 1 ms level: from 10 % to 90 % of its peak, in the first second
+            const int w = std::max (1, (int) (0.001 * rate)), n = std::min (y.getNumSamples(), (int) rate);
+            std::vector<double> env;
+            for (int i = 0; i + w <= n; i += w)
+            {
+                double e = 0.0;
+                for (int j = i; j < i + w; ++j)
+                    e = std::max (e, (double) std::abs (y.getSample (0, j)) + std::abs (y.getSample (1, j)));
+                env.push_back (e);
+            }
+            if (env.empty())
+                return 0.0;
+            const double top = *std::max_element (env.begin(), env.end());
+            int a = -1, b = -1;
+            for (int k = 0; k < (int) env.size(); ++k)
+            {
+                if (a < 0 && env[(size_t) k] >= 0.1 * top)
+                    a = k;
+                if (env[(size_t) k] >= 0.9 * top)
+                {
+                    b = k;
+                    break;
+                }
+            }
+            return a >= 0 && b >= a ? (b - a) * 1000.0 * w / rate : 0.0;
+        };
+        const auto envelope = [] (const juce::AudioBuffer<float>& y, double seconds, double rate)
+        {
+            std::vector<double> e;
+            for (double t = 0.0; t + 0.02 <= seconds; t += 0.02)
+                e.push_back (rmsDb (y, t, t + 0.02, rate));
+            return e;
+        };
+        const auto clicksIn = [] (const juce::AudioBuffer<float>& y, int from, int to, double rate)
+        {
+            const int w = std::max (8, (int) (0.005 * rate));
+            from = std::max (2 + w, from);
+            to = std::min (y.getNumSamples() - w - 1, to);
+            int count = 0;
+            if (to <= from)
+                return 0;
+            std::vector<double> d2 ((size_t) y.getNumSamples(), 0.0), sum ((size_t) y.getNumSamples() + 1, 0.0);
+            std::vector<int> at;
+            for (int ch = 0; ch < y.getNumChannels(); ++ch)
+            {
+                const float* x = y.getReadPointer (ch);
+                for (int i = 2; i < y.getNumSamples(); ++i)
+                    d2[(size_t) i] = (double) x[i] - 2.0 * x[i - 1] + x[i - 2];
+                for (int i = 0; i < y.getNumSamples(); ++i)
+                    sum[(size_t) i + 1] = sum[(size_t) i] + d2[(size_t) i] * d2[(size_t) i];
+                int last = -1000000;
+                for (int i = from; i < to; ++i)
+                {
+                    const double v = std::abs (d2[(size_t) i]);
+                    if (v < 2.0e-3)
+                        continue;
+                    const double around = (sum[(size_t) i + w] - sum[(size_t) i - w] - v * v) / (2.0 * w - 1.0);
+                    if (v > 10.0 * std::sqrt (std::max (around, 1.0e-30)) && i - last > w)
+                    {
+                        last = i;
+                        at.push_back (i);
+                    }
+                }
+            }
+            // the same click on both sides counts once
+            std::sort (at.begin(), at.end());
+            int prev = -1000000;
+            for (const int i : at)
+                if (i - prev > w)
+                {
+                    ++count;
+                    prev = i;
+                }
+            return count;
+        };
+        const auto hitSpread = [] (const juce::AudioBuffer<float>& y, double rate)
+        {
+            std::vector<double> peaks;
+            for (int h = 0; h < 4; ++h)
+            {
+                const int a = (int) (h * 0.15 * rate), b = std::min (y.getNumSamples(), (int) ((h * 0.15 + 0.15) * rate));
+                float peak = 0.0f;
+                for (int ch = 0; ch < 2; ++ch)
+                    for (int i = a; i < b; ++i)
+                        peak = std::max (peak, std::abs (y.getSample (ch, i)));
+                peaks.push_back (20.0 * std::log10 (peak + 1.0e-9));
+            }
+            double m = 0.0, v = 0.0;
+            for (const double x : peaks)
+                m += x / 4.0;
+            for (const double x : peaks)
+                v += (x - m) * (x - m) / 4.0;
+            return std::sqrt (v);
+        };
+        constexpr int bands = 24;
+        juce::dsp::FFT fft (11);
+        std::vector<float> win (2048), fbuf (4096);
+        for (int i = 0; i < 2048; ++i)
+            win[(size_t) i] = 0.5f - 0.5f * std::cos (juce::MathConstants<float>::twoPi * i / 2048.0f);
+        // CAL_CANAL=1: the fidelity of each side against the same side of the sample (their mean), not of the sum to
+        // mono (which suits a model made of the sum, and counts how two sides add as timbre)
+        const bool perSide = std::getenv ("CAL_CANAL") != nullptr;
+        int bandChannel = -1;
+        const auto bandsAt = [&] (const juce::AudioBuffer<float>& x, int centre, double rate, std::array<double, bands>& band)
+        {
+            std::fill (fbuf.begin(), fbuf.end(), 0.0f);
+            for (int i = 0; i < 2048; ++i)
+                if (const int t = centre - 1024 + i; t >= 0 && t < x.getNumSamples())
+                    fbuf[(size_t) i] = (bandChannel < 0 ? 0.5f * (x.getSample (0, t) + x.getSample (1, t)) : x.getSample (bandChannel, t)) * win[(size_t) i];
+            fft.performFrequencyOnlyForwardTransform (fbuf.data(), true);
+            band.fill (1.0e-12);
+            for (int k = 2; k < 1024; ++k)
+                if (const double hz = k * rate / 2048.0; hz >= 40.0 && hz <= 16000.0)
+                    band[(size_t) juce::jlimit (0, bands - 1, (int) (bands * std::log (hz / 40.0) / std::log (16000.0 / 40.0)))] += (double) fbuf[(size_t) k] * fbuf[(size_t) k];
+        };
+        for (const auto& f : filesIn (juce::File (juce::String::fromUTF8 (argv[2]))))
+        {
+            juce::AudioBuffer<float> raw;
+            double rate = 0.0;
+            if (! SampleAnalysis::loadFile (f, raw, rate))
+                continue;
+            const auto s = SampleAnalysis::analyse (raw, rate, f.getFileNameWithoutExtension(), false, true);
+            const double held = juce::jlimit (0.3, 4.0, (s->length - s->onset) / rate), total = held + 0.8;
+            auto base = defaultsFor (*s);
+            base[P::Engine] = (float) P::EngineRebuild;
+            const auto reference = play (s, base, SynthEngine::rootKey, held, total, rate);     // the sample itself
+            const auto refEnv = envelope (reference, held, rate);
+            double refPeak = -200.0;
+            for (const double v : refEnv)
+                refPeak = std::max (refPeak, v);
+            const double refMono = monoLoss (reference, 0, (int) (held * rate));
+            const double refRise = riseMs (reference, rate);
+            const auto name = f.getFileName().replace (",", "_");
+            std::array<juce::AudioBuffer<float>, 6> refCase;       // engine A in each case (when A is among the engines)
+            for (int engine = 0; engine <= P::EngineDrone; ++engine)
+            {
+                if (! engines.containsChar ((juce::juce_wchar) ('A' + engine)))
+                    continue;
+                for (int c = 0; c < 6; ++c)
+                {
+                    static const char* cases[] = { "raiz", "+7", "-12", "suave", "acorde", "repetida" };
+                    auto q = base;
+                    q[P::Engine] = (float) engine;
+                    juce::AudioBuffer<float> y;
+                    if (c == 5)
+                    {
+                        // repeated: the root struck 4 times, 150 ms apart, each held 120 ms (velocity 0.9)
+                        SynthEngine e;
+                        e.prepare (rate);
+                        e.setSample (s);
+                        e.prepareFx (q);
+                        const int totalSamples = (int) (1.0 * rate);
+                        y.setSize (2, totalSamples);
+                        y.clear();
+                        juce::AudioBuffer<float> b (2, 256);
+                        for (int pos = 0; pos < totalSamples; pos += 256)
+                        {
+                            const int n = std::min (256, totalSamples - pos);
+                            b.setSize (2, n, false, false, true);
+                            juce::MidiBuffer m;
+                            for (int h = 0; h < 4; ++h)
+                            {
+                                const int on = (int) (h * 0.15 * rate), offAt = on + (int) (0.12 * rate);
+                                if (on >= pos && on < pos + n)
+                                    m.addEvent (juce::MidiMessage::noteOn (1, SynthEngine::rootKey, 0.9f), on - pos);
+                                if (offAt >= pos && offAt < pos + n)
+                                    m.addEvent (juce::MidiMessage::noteOff (1, SynthEngine::rootKey), offAt - pos);
+                            }
+                            e.process (b, m, q, 120.0);
+                            for (int ch = 0; ch < 2; ++ch)
+                                y.copyFrom (ch, pos, b, ch, 0, n);
+                        }
+                    }
+                    else if (c == 4)
+                    {
+                        // a chord: three notes started together, each rendered and added (the engine plays one voice each)
+                        y.setSize (2, (int) (total * rate));
+                        y.clear();
+                        for (const int k : { 0, 4, 7 })
+                        {
+                            const auto v = play (s, q, SynthEngine::rootKey + k, held, total, rate);
+                            for (int ch = 0; ch < 2; ++ch)
+                                y.addFrom (ch, 0, v, ch, 0, std::min (v.getNumSamples(), y.getNumSamples()));
+                        }
+                    }
+                    else
+                    {
+                        const int note = SynthEngine::rootKey + (c == 1 ? 7 : c == 2 ? -12 : 0);
+                        if (c == 3)
+                        {
+                            // soft: velocity 0.3 (the engine's play() strikes at 1.0: a lower velocity through its own MIDI)
+                            SynthEngine e;
+                            e.prepare (rate);
+                            e.setSample (s);
+                            e.prepareFx (q);
+                            const int totalSamples = (int) (total * rate), heldSamples = (int) (held * rate);
+                            y.setSize (2, totalSamples);
+                            y.clear();
+                            juce::AudioBuffer<float> b (2, 512);
+                            for (int pos = 0; pos < totalSamples; pos += 512)
+                            {
+                                const int n = std::min (512, totalSamples - pos);
+                                b.setSize (2, n, false, false, true);
+                                juce::MidiBuffer m;
+                                if (pos == 0)
+                                    m.addEvent (juce::MidiMessage::noteOn (1, note, 0.3f), 0);
+                                if (pos <= heldSamples && heldSamples < pos + n)
+                                    m.addEvent (juce::MidiMessage::noteOff (1, note), heldSamples - pos);
+                                e.process (b, m, q, 120.0);
+                                for (int ch = 0; ch < 2; ++ch)
+                                    y.copyFrom (ch, pos, b, ch, 0, n);
+                            }
+                        }
+                        else
+                            y = play (s, q, note, held, total, rate);
+                    }
+                    if (engine == 0)
+                        refCase[(size_t) c] = y;
+                    if (const char* dir = std::getenv ("CAL_WAV"))
+                    {
+                        const auto out = juce::File (juce::String::fromUTF8 (dir)).getChildFile (f.getFileNameWithoutExtension() + " " + juce::String::charToString ((juce::juce_wchar) ('A' + engine)) + " " + cases[c] + ".wav");
+                        out.deleteFile();
+                        std::unique_ptr<juce::OutputStream> st = std::make_unique<juce::FileOutputStream> (out);
+                        juce::WavAudioFormat wav;
+                        if (auto w = wav.createWriterFor (st, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (32)))
+                            w->writeFromAudioSampleBuffer (y, 0, y.getNumSamples());
+                    }
+                    const auto& ref = refCase[(size_t) c];
+                    const bool hasRef = ref.getNumSamples() > 0;
+                    const int clicks = clicksIn (y, (int) (0.005 * rate), y.getNumSamples(), rate);
+                    const int clicksRef = hasRef ? clicksIn (ref, (int) (0.005 * rate), ref.getNumSamples(), rate) : -1;
+                    double dc = 0.0;
+                    {
+                        const int to = std::min (y.getNumSamples(), (int) (std::min (held, c == 5 ? 0.9 : held) * rate));
+                        double sum = 0.0;
+                        for (int i = 0; i < to; ++i)
+                            sum += 0.5 * ((double) y.getSample (0, i) + y.getSample (1, i));
+                        dc = 20.0 * std::log10 (std::abs (sum / std::max (1, to)) + 1.0e-12) - rmsDb (y, 0.0, to / rate, rate);
+                    }
+                    const double overPeak = hasRef ? juce::Decibels::gainToDecibels (y.getMagnitude (0, y.getNumSamples()))
+                                                       - juce::Decibels::gainToDecibels (ref.getMagnitude (0, ref.getNumSamples())) : 0.0;
+                    const double spread = c == 5 ? hitSpread (y, rate) : -1.0, spreadRef = c == 5 && hasRef ? hitSpread (ref, rate) : -1.0;
+                    const auto env = envelope (y, c == 5 ? 0.9 : held, rate);
+                    double fidelity = -1.0, dip = 0.0, bump = 0.0;
+                    if (c == 0)
+                    {
+                        // against the sample: level-matched (the median difference), in the frames within 40 dB of its peak
+                        std::vector<double> diffs;
+                        for (size_t k = 0; k < env.size() && k < refEnv.size(); ++k)
+                            if (refEnv[k] > refPeak - 40.0)
+                                diffs.push_back (env[k] - refEnv[k]);
+                        if (! diffs.empty())
+                        {
+                            auto sorted = diffs;
+                            std::sort (sorted.begin(), sorted.end());
+                            const double gain = sorted[sorted.size() / 2];
+                            for (const double d : diffs)
+                            {
+                                dip = std::min (dip, d - gain);
+                                bump = std::max (bump, d - gain);
+                            }
+                            double err = 0.0, weight = 0.0;
+                            for (const int side : perSide ? std::vector<int> { 0, 1 } : std::vector<int> { -1 })
+                            for (size_t k = 0; k < env.size() && k < refEnv.size(); ++k)
+                            {
+                                bandChannel = side;
+                                if (refEnv[k] <= refPeak - 40.0)
+                                    continue;
+                                std::array<double, bands> a, b;
+                                const int centre = (int) ((k * 0.02 + 0.01) * rate);
+                                bandsAt (reference, centre, rate, a);
+                                bandsAt (y, centre, rate, b);
+                                double totalA = 0.0;
+                                for (const double v : a)
+                                    totalA += v;
+                                const double wt = std::pow (10.0, (refEnv[k] - refPeak) / 20.0);
+                                for (int bb = 0; bb < bands; ++bb)
+                                    if (const double share = a[(size_t) bb] / totalA; share >= 1.0e-4)
+                                    {
+                                        err += wt * share * std::abs (10.0 * std::log10 (b[(size_t) bb] / a[(size_t) bb]) - gain);
+                                        weight += wt * share;
+                                    }
+                            }
+                            fidelity = weight > 0.0 ? err / weight : -1.0;
+                        }
+                    }
+                    else
+                    {
+                        // against itself: the 20 ms level against the median of the 100 ms around it
+                        double peak = -200.0;
+                        for (const double v : env)
+                            peak = std::max (peak, v);
+                        for (size_t k = 2; k + 2 < env.size(); ++k)
+                        {
+                            if (env[k] < peak - 40.0)
+                                continue;
+                            std::array<double, 5> around { env[k - 2], env[k - 1], env[k], env[k + 1], env[k + 2] };
+                            std::sort (around.begin(), around.end());
+                            dip = std::min (dip, env[k] - around[2]);
+                            bump = std::max (bump, env[k] - around[2]);
+                        }
+                    }
+                    const int off = (int) (held * rate);
+                    const double heldDb = rmsDb (y, 0.0, held, rate);
+                    std::fprintf (csv, "\"%s\",%c,%s,%d,%.2f,%.2f,%.2f,%.1f,%.1f,%.2f,%.2f,%.3f,%.1f,%.1f,%.1f,%.1f,%.1f,%d,%d,%.1f,%.2f,%.2f,%.2f\n", name.toRawUTF8(),
+                                  (char) ('A' + engine), cases[c], allFinite (y) ? 1 : 0, juce::Decibels::gainToDecibels (y.getMagnitude (0, y.getNumSamples())),
+                                  heldDb, fidelity, dip, bump, monoLoss (y, 0, off), monoLoss (y, 0, off) - refMono, correlation (y, 0, off),
+                                  riseMs (y, rate), refRise,
+                                  edgeDb (y, 0, (int) (0.003 * rate)) - edgeDb (y, (int) (0.003 * rate), (int) (0.05 * rate)),
+                                  edgeDb (y, off, off + (int) (0.005 * rate)) - edgeDb (y, off - (int) (0.05 * rate), off),
+                                  rmsDb (y, total - 0.15, total, rate) - heldDb, clicks, clicksRef, dc, overPeak, spread, spreadRef);
+                }
+            }
+            std::fflush (csv);
+        }
+        std::fclose (csv);
+        return 0;
+    }
+    if (juce::String (argv[1]) == "acordes" && argc > 2)
+    {
+        // acordes <list.txt>: the chord one-shots (chord or stab in the name, a key in it: "..._chord_Cm9.wav", the
+        // chord's root and whether it is minor) against the chord their sound gives, by how sure it was.
+        struct Bin { int all = 0, right = 0, rootOnly = 0; };
+        std::array<Bin, 5> bins {};
+        int total = 0, right = 0;
+        for (const auto& f : filesIn (juce::File (juce::String::fromUTF8 (argv[2]))))
+        {
+            const auto lower = f.getFileName().toLowerCase();
+            if (! lower.contains ("chord") && ! lower.contains ("stab"))
+                continue;
+            // one chord only: no loop, no tempo in the name (a loop of chords carries the key, not a chord)
+            bool tempo = false;
+            for (const auto& token : juce::StringArray::fromTokens (lower, "_- .", ""))
+                tempo = tempo || (token.containsOnly ("0123456789") && token.length() >= 2 && token.getIntValue() >= 60 && token.getIntValue() <= 200)
+                              || token.startsWith ("bpm") || token.endsWith ("bpm");
+            if (lower.contains ("loop") || tempo)
+                continue;
+            const auto named = KeyDetect::fromName (f.getFileName());
+            if (named.root < 0)
+                continue;
+            juce::AudioBuffer<float> audio;
+            double rate = 0.0;
+            if (! SampleAnalysis::loadFile (f, audio, rate))
+                continue;
+            const auto chroma = KeyDetect::fromAudio (audio, rate).chroma;
+            const auto c = KeyDetect::chordFromChroma (chroma);
+            const bool minor = c.root >= 0 && KeyDetect::chordKinds()[(size_t) c.kind].minorish;
+            const bool ok = c.root == named.root && minor == named.minor;
+            auto& b = bins[(size_t) juce::jlimit (0, 4, (int) (c.confidence * 5.0f))];
+            ++b.all;
+            b.right += ok;
+            b.rootOnly += c.root == named.root;
+            ++total;
+            right += ok;
+            if (std::getenv ("ACORDES_LISTA") != nullptr)
+                std::printf ("%s -> %s %.2f %s\n", f.getFileName().toRawUTF8(), c.name().toRawUTF8(), c.confidence, ok ? "bien" : "MAL");
+        }
+        std::printf ("%d acordes, bien (tónica y mayor/menor) %.0f %%\n", total, total > 0 ? 100.0 * right / total : 0.0);
+        for (int k = 0; k < 5; ++k)
+            std::printf ("  confianza %3d-%3d %%: %4d, bien %5.1f %%, tónica bien %5.1f %%\n", k * 20, k * 20 + 20, bins[(size_t) k].all,
+                         bins[(size_t) k].all > 0 ? 100.0 * bins[(size_t) k].right / bins[(size_t) k].all : 0.0,
+                         bins[(size_t) k].all > 0 ? 100.0 * bins[(size_t) k].rootOnly / bins[(size_t) k].all : 0.0);
+        return 0;
+    }
+    if (juce::String (argv[1]) == "resin_debug" && argc > 2)
+    {
+        // resin_debug <file>: the first 150 ms of engine C (5 ms steps) as it is, with Warp off, with a short transient
+        juce::AudioBuffer<float> raw;
+        double rate = 0.0;
+        const juce::File f (juce::String::fromUTF8 (argv[2]));
+        if (! SampleAnalysis::loadFile (f, raw, rate))
+            return 1;
+        const auto s = SampleAnalysis::analyse (raw, rate, f.getFileNameWithoutExtension(), false, true);
+        std::printf ("onset %d peak %d transientMs %.1f pitched %d partials %d warp default %.0f\n", s->onset, s->peak, s->transientMs, (int) s->pitched,
+                     s->partials.numPartials, P::defs()[(size_t) P::WarpMode].def);
+        std::printf ("attack %.3f decay %.3f sustain %.2f curve %.2f fade %.1f\n", s->detected.attack, s->detected.decay, s->detected.sustain,
+                     s->detected.curve, s->detected.fadeDbPerSec);
+        const double step = std::getenv ("STEP") != nullptr ? std::atof (std::getenv ("STEP")) : 0.02;
+        const int frames = 40;
+        std::printf ("%-12s", "sample");
+        for (int k = 0; k < frames; ++k)
+            std::printf (" %4.0f", rmsDb (s->audio, s->onset / rate + k * step, s->onset / rate + (k + 1) * step, s->sampleRate));
+        std::printf ("\n");
+        const char* names[] = { "A", "C", "C sin ruido", "C sin parc", "C trans 5", "B", "D" };
+        for (int variant = 0; variant < 7; ++variant)
+        {
+            auto q = defaultsFor (*s);
+            q[P::Engine] = (float) (variant == 0 ? P::EngineRebuild : variant == 5 ? P::EngineReenvelope : variant == 6 ? P::EngineHybrid : P::EngineResynth);
+            if (variant == 2)
+                q[P::NoiseLevel] = 0.0f;
+            if (variant == 3)
+                q[P::Partials] = 4.0f;
+            if (variant == 4)
+                q[P::TransientMs] = 5.0f;
+            const auto y = play (s, q, SynthEngine::rootKey, frames * step, frames * step, rate);
+            std::printf ("%-12s", names[variant]);
+            for (int k = 0; k < frames; ++k)
+                std::printf (" %4.0f", rmsDb (y, k * step, (k + 1) * step, rate));
+            std::printf ("\n");
+        }
+        return 0;
+    }
+    if (juce::String (argv[1]) == "resintesis" && argc > 3)
+    {
+        // resintesis <list.txt> <out.csv> [wav folder]: each one-shot played at its own pitch for its length by
+        // engine A (the sample itself) and engine C (partials + noise), compared every 20 ms where A is within
+        // 40 dB of its peak: the level (worst dip, median error), the spectrum (24 bands, mean error weighted by
+        // level), how noisy (spectral flatness, C against A) and the attack (the first 30 ms).
+        std::FILE* csv = nullptr;
+        if (fopen_s (&csv, argv[3], "w") != 0)
+            return 1;
+        const juce::File wavDir = argc > 4 ? juce::File (juce::String::fromUTF8 (argv[4])) : juce::File();
+        if (wavDir != juce::File())
+            wavDir.createDirectory();
+        std::fprintf (csv, "file,seconds,pitched,partials,gainDb,worstDipDb,worstBumpDb,medianErrDb,bandErrDb,flatnessDb,attackDb,lowDb,highDb\n");
+        constexpr int bands = 24;
+        for (const auto& f : filesIn (juce::File (juce::String::fromUTF8 (argv[2]))))
+        {
+            juce::AudioBuffer<float> raw;
+            double rate = 0.0;
+            if (! SampleAnalysis::loadFile (f, raw, rate))
+                continue;
+            const auto s = SampleAnalysis::analyse (raw, rate, f.getFileNameWithoutExtension(), false, true);
+            const double seconds = std::min (6.0, s->length / rate);
+            // the detected envelope (engine A then plays the sample untouched), held for the sample's length
+            auto q = defaultsFor (*s);
+            q[P::Engine] = (float) P::EngineRebuild;
+            const int note = SynthEngine::rootKey + (std::getenv ("RESIN_NOTA") != nullptr ? std::atoi (std::getenv ("RESIN_NOTA")) : 0);
+            const auto a = play (s, q, note, seconds, seconds + 0.1, rate);
+            q[P::Engine] = (float) P::EngineResynth;
+            if (const char* engine = std::getenv ("RESIN_MOTOR"))          // B, D...: that engine instead of C
+                q[P::Engine] = (float) juce::jlimit (0, (int) P::EngineDrone, engine[0] - 'A');
+            if (std::getenv ("RESIN_COHERENTE") != nullptr)
+                q[P::GrainCoherent] = 1.0f;
+            if (const char* level = std::getenv ("RESIN_RUIDO"))
+                q[P::NoiseLevel] = (float) std::atof (level);
+            const auto c = play (s, q, note, seconds, seconds + 0.1, rate);
+            if (wavDir != juce::File())
+                for (const auto& [buf, tag] : { std::pair<const juce::AudioBuffer<float>*, const char*> { &a, "A" }, { &c, "C" } })
+                {
+                    const auto out = wavDir.getChildFile (f.getFileNameWithoutExtension() + " " + tag + ".wav");
+                    out.deleteFile();
+                    std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (out);
+                    juce::WavAudioFormat wav;
+                    if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+                        w->writeFromAudioSampleBuffer (*buf, 0, buf->getNumSamples());
+                }
+            // frames of 20 ms: level and 24 log bands (FFT 2048 around each frame's centre)
+            const int frame = (int) (0.02 * rate), n = (int) (seconds * rate);
+            juce::dsp::FFT fft (11);
+            std::vector<float> win (2048), buf (4096);
+            for (int i = 0; i < 2048; ++i)
+                win[(size_t) i] = 0.5f - 0.5f * std::cos (juce::MathConstants<float>::twoPi * i / 2048.0f);
+            const auto analyseAt = [&] (const juce::AudioBuffer<float>& x, int centre, std::array<double, bands>& band, double& flat)
+            {
+                std::fill (buf.begin(), buf.end(), 0.0f);
+                for (int i = 0; i < 2048; ++i)
+                {
+                    const int t = centre - 1024 + i;
+                    if (t >= 0 && t < x.getNumSamples())
+                        buf[(size_t) i] = 0.5f * (x.getSample (0, t) + x.getSample (1, t)) * win[(size_t) i];
+                }
+                fft.performFrequencyOnlyForwardTransform (buf.data(), true);
+                band.fill (1.0e-12);
+                double logSum = 0.0, linSum = 0.0;
+                int used = 0;
+                for (int k = 2; k < 1024; ++k)
+                {
+                    const double hz = k * rate / 2048.0;
+                    if (hz < 40.0 || hz > 16000.0)
+                        continue;
+                    const double p = (double) buf[(size_t) k] * buf[(size_t) k] + 1.0e-14;
+                    const int b = juce::jlimit (0, bands - 1, (int) (bands * std::log (hz / 40.0) / std::log (16000.0 / 40.0)));
+                    band[(size_t) b] += p;
+                    logSum += std::log (p);
+                    linSum += p;
+                    ++used;
+                }
+                flat = 10.0 * (logSum / used - std::log (linSum / used)) / std::log (10.0);     // dB, 0 = white noise
+            };
+            std::vector<double> levelA, levelC;
+            for (int t = 0; t + frame <= n; t += frame)
+            {
+                levelA.push_back (rmsDb (a, t / rate, (t + frame) / rate, rate));
+                levelC.push_back (rmsDb (c, t / rate, (t + frame) / rate, rate));
+            }
+            double peakA = -200.0;
+            for (const double v : levelA)
+                peakA = std::max (peakA, v);
+            std::vector<double> diffs;
+            for (size_t i = 0; i < levelA.size(); ++i)
+                if (levelA[i] > peakA - 40.0)
+                    diffs.push_back (levelC[i] - levelA[i]);
+            if (diffs.empty())
+                continue;
+            auto sorted = diffs;
+            std::sort (sorted.begin(), sorted.end());
+            const double gain = sorted[sorted.size() / 2];
+            double worstDip = 0.0, worstBump = 0.0;
+            std::vector<double> errs;
+            for (const double d : diffs)
+            {
+                worstDip = std::min (worstDip, d - gain);
+                worstBump = std::max (worstBump, d - gain);
+                errs.push_back (std::abs (d - gain));
+            }
+            std::sort (errs.begin(), errs.end());
+            double bandErr = 0.0, bandWeight = 0.0, flatA = 0.0, flatC = 0.0, low = 0.0, high = 0.0, lowW = 0.0, highW = 0.0;
+            int flatCount = 0;
+            for (size_t i = 0; i < levelA.size(); ++i)
+            {
+                if (levelA[i] <= peakA - 40.0)
+                    continue;
+                std::array<double, bands> ba, bc;
+                double fa, fc;
+                const int centre = (int) i * frame + frame / 2;
+                analyseAt (a, centre, ba, fa);
+                analyseAt (c, centre, bc, fc);
+                double totalA = 0.0;
+                for (const double v : ba)
+                    totalA += v;
+                const double weight = std::pow (10.0, (levelA[i] - peakA) / 20.0);
+                for (int b = 0; b < bands; ++b)
+                {
+                    const double share = ba[(size_t) b] / totalA;
+                    if (share < 1.0e-4)
+                        continue;
+                    const double d = 10.0 * std::log10 (bc[(size_t) b] / ba[(size_t) b]) - gain;
+                    bandErr += weight * share * std::abs (d);
+                    bandWeight += weight * share;
+                    if (b < 8)
+                    {
+                        low += weight * share * d;
+                        lowW += weight * share;
+                    }
+                    else if (b >= 16)
+                    {
+                        high += weight * share * d;
+                        highW += weight * share;
+                    }
+                }
+                flatA += fa;
+                flatC += fc;
+                ++flatCount;
+            }
+            // the attack: from the onset, 30 ms
+            const double onset = s->onset / rate;
+            const double attack = rmsDb (c, onset, onset + 0.03, rate) - rmsDb (a, onset, onset + 0.03, rate) - gain;
+            std::fprintf (csv, "\"%s\",%.2f,%d,%d,%.1f,%.1f,%.1f,%.2f,%.2f,%.2f,%.1f,%.2f,%.2f\n", f.getFileName().replace ("\"", "'").toRawUTF8(), seconds,
+                          (int) s->pitched, s->partials.numPartials, gain, worstDip, worstBump, errs[errs.size() / 2], bandWeight > 0.0 ? bandErr / bandWeight : 0.0,
+                          flatCount > 0 ? (flatC - flatA) / flatCount : 0.0, attack, lowW > 0.0 ? low / lowW : 0.0, highW > 0.0 ? high / highW : 0.0);
+            std::fflush (csv);
+        }
+        std::fclose (csv);
+        return 0;
+    }
+    if (juce::String (argv[1]) == "tonalidad_flujo" && argc > 2)
+    {
+        // tonalidad_flujo <list.txt> [groups]: a stand-in for a track coming in through the sidechain: samples whose
+        // name says the same key, one after the other (each up to 8 s), fed by blocks of 512 to the key's stream;
+        // the estimate after 10, 20 and 40 s against that key.
+        std::map<int, std::vector<juce::File>> byKey;
+        for (const auto& f : filesIn (juce::File (juce::String::fromUTF8 (argv[2]))))
+        {
+            const auto named = KeyDetect::fromName (f.getFileName());
+            if (named.root >= 0)
+                byKey[named.root + (named.minor ? 12 : 0)].push_back (f);
+        }
+        const int groups = argc > 3 ? juce::String (argv[3]).getIntValue() : 60;
+        juce::Random rng (7);
+        const double checks[3] = { 10.0, 20.0, 40.0 };
+        struct Bin { int all = 0, right = 0; };
+        std::array<std::array<Bin, 5>, 3> bins {};
+        std::array<int, 3> sureAll {}, sureRight {}, total {}, right {};
+        std::vector<int> keys;
+        for (const auto& [k, files] : byKey)
+            if (files.size() >= 6)
+                keys.push_back (k);
+        for (int g = 0; g < groups && ! keys.empty(); ++g)
+        {
+            const int key = keys[(size_t) (g % (int) keys.size())];
+            auto& files = byKey[key];
+            double rate = 0.0;      // the first file's; the others at the same rate only (no resampling here)
+            KeyDetect::AudioStream stream;
+            double fed = 0.0;
+            int check = 0;
+            std::vector<float> mono;
+            for (int tries = 0; check < 3 && tries < 300; ++tries)
+            {
+                const auto& f = files[(size_t) rng.nextInt ((int) files.size())];
+                juce::AudioBuffer<float> audio;
+                double fileRate = 0.0;
+                if (! SampleAnalysis::loadFile (f, audio, fileRate) || (rate > 0.0 && std::abs (fileRate - rate) > 1.0))
+                    continue;
+                if (rate <= 0.0)
+                {
+                    rate = fileRate;
+                    stream.reset (rate);
+                }
+                const int n = std::min (audio.getNumSamples(), (int) (8.0 * rate));
+                mono.assign ((size_t) n, 0.0f);
+                for (int c = 0; c < audio.getNumChannels(); ++c)
+                    for (int i = 0; i < n; ++i)
+                        mono[(size_t) i] += audio.getSample (c, i);
+                for (int i = 0; i < n && check < 3; i += 512)
+                {
+                    const int len = std::min (512, n - i);
+                    stream.push (mono.data() + i, len);
+                    fed += len / rate;
+                    if (fed >= checks[check])
+                    {
+                        const auto e = stream.estimate();
+                        const int root = key % 12;
+                        const bool minor = key >= 12;
+                        const int relativeRoot = minor ? (root + 3) % 12 : (root + 9) % 12;
+                        const bool ok = (e.root == root && e.minor == minor) || (e.root == relativeRoot && e.minor != minor);
+                        auto& bn = bins[(size_t) check][(size_t) juce::jlimit (0, 4, (int) (e.confidence * 5.0f))];
+                        ++bn.all;
+                        bn.right += ok;
+                        ++total[(size_t) check];
+                        right[(size_t) check] += ok;
+                        if (e.confidence >= 0.6f)
+                        {
+                            ++sureAll[(size_t) check];
+                            sureRight[(size_t) check] += ok;
+                        }
+                        ++check;
+                    }
+                }
+            }
+        }
+        for (int c = 0; c < 3; ++c)
+        {
+            std::printf ("tras %2.0f s: %d pistas, tonalidad o relativa %.0f %%; seguras (>=60 %%) %d, de ellas bien %.0f %%\n", checks[c], total[(size_t) c],
+                         total[(size_t) c] > 0 ? 100.0 * right[(size_t) c] / total[(size_t) c] : 0.0, sureAll[(size_t) c],
+                         sureAll[(size_t) c] > 0 ? 100.0 * sureRight[(size_t) c] / sureAll[(size_t) c] : 0.0);
+            for (int b = 0; b < 5; ++b)
+                std::printf ("   confianza %3d-%3d %%: %3d, bien %5.1f %%\n", b * 20, b * 20 + 20, bins[(size_t) c][(size_t) b].all,
+                             bins[(size_t) c][(size_t) b].all > 0 ? 100.0 * bins[(size_t) c][(size_t) b].right / bins[(size_t) c][(size_t) b].all : 0.0);
+        }
+        return 0;
+    }
     if (juce::String (argv[1]) == "motores")
         return argc > 3 ? engines (filesIn (juce::File (juce::String::fromUTF8 (argv[2]))), argv[3], argc > 4 ? juce::String (argv[4]).getIntValue() : 1) : 1;
     if (juce::String (argv[1]) == "loops" && argc > 3)

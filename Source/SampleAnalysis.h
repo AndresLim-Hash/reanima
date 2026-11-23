@@ -33,6 +33,15 @@ struct SampleData
 
     // Landmarks, in samples.
     double onset = 0, peak = 0, knee = 0, sustainPos = 0, usableEnd = 0;
+    // How fast the sound falls as it ends inside the file (dB/s, from 50 ms before it is 60 dB under its loudest
+    // to then); 0 when the file is cut while it still sounds. Engines B, C and D, held past a sound that has
+    // ended, fall at this rate (they went on for a second where the file and engine A are silent).
+    float endFallDbPerSec = 0.0f;
+    double soundEnd = 0;        // where that is: the first moment 60 dB under the loudest, when endFallDbPerSec > 0
+    // The level of the part that sounds (power mean, from the onset to the usable end), against its loudest: the
+    // level engine F holds a note at with the envelope as detected (a drone at the loudest moment's level was 5 dB
+    // over a kick's peak).
+    float meanLevel = 1.0f;
 
     AdsrShape detected;
     // What versions up to 0.9.5 detected, when it was different: they ended the attack of a note that keeps
@@ -55,6 +64,7 @@ struct SampleData
         float attackMs = 5.0f;          // the detected attack
         float transientDb = 0.0f;       // first 15 ms against 60 to 250 ms after the onset
         float sustain = 0.0f;           // 0 dies away, 1 holds: the level 400 ms after the peak
+        float lowShare = 0.0f;          // the share of its energy under 120 Hz (a kick 0.9 and more, a clap under 0.01)
         float noisiness = 0.0f;         // spectral flatness of the body, 0 a pure tone, 1 noise
         float tonal = 0.0f;             // share of the body's energy on the harmonics of its note
         float centroidHz = 1000.0f;     // brightness of the attack
@@ -99,12 +109,33 @@ struct SampleData
         int hop = 256;                  // samples between frames; frame f is centred at f * hop
         int numFrames = 0, numPartials = 0;
         int lastFrame = 0;              // last frame with audible energy
+        int holdFrame = 0;              // the last frame whose window lies wholly inside the file (<= lastFrame): a
+                                        // note held past the end goes on from it (the window of the very last frames
+                                        // hangs over the end: their partials read low and their residual high)
         float refFreq = 100.0f;         // lowest strong partial, reference for brightness
         std::vector<float> amp, freq, phase;    // [frame * numPartials + k]; phase in cycles
         std::vector<float> pan;                 // per partial, -1 (L) .. 1 (R)
         std::vector<float> decayDbPerSec;       // per partial, natural decay of its tail
         std::array<float, numBands + 1> bandEdges {};
         std::vector<float> noise;               // [frame * numBands + b], per-bin RMS magnitude
+
+        // A sound whose two sides differ (two detuned voices, a wide pad, a stereo recording): the partials of each
+        // side measured apart and played on it alone (pan -1 left, +1 right), the noise their mean. One model for
+        // both sides put two voices a little apart on one partial, which beat (noise 48 dB under the harmonics
+        // where the sample has it 77 dB under) and played them in the middle (the width lost).
+        bool split = false;
+        void gains (int k, float& left, float& right) const noexcept
+        {
+            if (split)
+            {
+                left = pan[(size_t) k] < 0.0f ? 1.0f : 0.0f;
+                right = 1.0f - left;
+                return;
+            }
+            const float angle = (pan[(size_t) k] + 1.0f) * 0.7853982f;      // the equal-power law of Dsp::panGains
+            left = std::cos (angle) * 1.4142136f;
+            right = std::sin (angle) * 1.4142136f;
+        }
 
         bool valid() const noexcept { return numPartials > 0 && numFrames > 1; }
     };
@@ -124,6 +155,22 @@ struct SampleData
     };
 
     SustainSource early, late;
+
+    // The colour of the sound as it goes, for Movimiento in engines B and D: its power in octave bands, frame by
+    // frame, and the colour of each sustain source (all in dB). A sustain source is one moment of the sound held;
+    // the difference between the two tells how the held note should change colour to follow the sample.
+    struct Colour
+    {
+        static constexpr int numBands = 10;
+        static constexpr float lowestHz = 31.25f;   // band b centred on lowestHz * 2^b: 31 Hz to 16 kHz
+        int hop = 1024;                 // frame f is centred at f * hop
+        int numFrames = 0;
+        int lastGood = 0;               // the last frame within 50 dB of the loudest: later ones hold its colour
+        std::vector<float> db;          // [frame * numBands + b]
+        std::array<float, numBands> early {}, late {};
+        bool valid() const noexcept { return numFrames > 0; }
+    };
+    Colour colour;
 
     // Engine A: long seamless reconstructions of the sound (see Reconstruct.h).
     struct Bed
@@ -200,6 +247,24 @@ struct SampleData
     {
         const double end = std::max (onset + 1.0, usableEnd);
         return onset + juce::jlimit (0.0, 1.0, fraction) * (end - onset);
+    }
+
+    // Where engines E and F read for a Posicion: that point, or, when it is silent (40 dB under the loudest: a
+    // gap in a loop or a stem), the next point that sounds (the one before, when nothing after it does). At
+    // 30 % a kick loop read its pause, and engine E was silent on 600 of the library's samples.
+    double readingPosition (double fraction) const noexcept
+    {
+        const double pos = soundingPosition (fraction);
+        if (env.empty() || envHop <= 0 || envAt (pos) >= 0.01f)
+            return pos;
+        const size_t at = std::min (env.size() - 1, (size_t) std::max (0.0, pos / envHop));
+        for (size_t i = at; i < env.size(); ++i)
+            if (env[i] >= 0.01f)
+                return std::min ((double) i * envHop, std::max (onset, usableEnd));
+        for (size_t i = at; i-- > 0;)
+            if (env[i] >= 0.01f)
+                return std::max (onset, (double) i * envHop);
+        return pos;
     }
 };
 

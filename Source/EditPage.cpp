@@ -1,4 +1,5 @@
 #include "EditPage.h"
+#include "HitEdits.h"
 
 namespace
 {
@@ -50,6 +51,115 @@ double EditView::zeroCrossingNear (double fraction) const
     return fraction;
 }
 
+bool EditView::snapsToGrid() const
+{
+    return (bool) proc.apvts.state.getProperty ("editSnap", false);
+}
+
+void EditView::setSnapsToGrid (bool on)
+{
+    proc.apvts.state.setProperty ("editSnap", on, nullptr);
+    repaint();
+}
+
+int EditView::gridChoice() const
+{
+    return juce::jlimit (0, (int) gridChoices().size(), (int) proc.apvts.state.getProperty ("editGrid", 0));
+}
+
+void EditView::setGridChoice (int choice)
+{
+    proc.apvts.state.setProperty ("editGrid", juce::jlimit (0, (int) gridChoices().size(), choice), nullptr);
+    repaint();
+}
+
+const std::vector<EditView::GridChoice>& EditView::gridChoices()
+{
+    static const std::vector<GridChoice> choices {
+        { "4 compases", 16.0 }, { "2 compases", 8.0 }, { "1 compás", 4.0 }, { "1/2", 2.0 }, { "1/4", 1.0 }, { "1/8", 0.5 },
+        { "1/16", 0.25 }, { "1/32", 0.125 }, { "1/64", 0.0625 }, { "1/4T", 2.0 / 3.0 }, { "1/8T", 1.0 / 3.0 }, { "1/16T", 1.0 / 6.0 } };
+    return choices;
+}
+
+// A loop's own beats (LOOP, or a sample the analysis is sure is a loop), else the host's tempo, else none.
+double EditView::beatSamples() const
+{
+    if (sample == nullptr)
+        return 0.0;
+    const bool loopish = (int) value (P::PlayMode) == P::PlayLoop || sample->loopInfo.likely;
+    const double beats = loopish ? proc.loopBeatsNow() : 0.0;
+    const int length = sample->loopInfo.length > 0 ? std::min (sample->loopInfo.length, sample->length) : sample->length;
+    if (beats > 0.0 && length > 0)
+        return length / beats;
+    const double bpm = proc.getHostBpm();
+    return bpm > 0.0 ? sample->sampleRate * 60.0 / bpm : 0.0;
+}
+
+EditView::Grid EditView::grid() const
+{
+    Grid gr;
+    if (sample == nullptr)
+        return gr;
+    const double len = std::max (1, sample->length);
+    const double pixelsPerSample = area().getWidth() / (shown * len);
+    constexpr double minPixels = 40.0;          // Auto: as fine as leaves this much room between lines (14 px was a line every 1/64 of a 2 s loop)
+    gr.beat = beatSamples();
+    if (gr.beat > 0.0)
+    {
+        gr.musical = true;
+        const int choice = gridChoice();
+        if (choice > 0)
+        {
+            const auto& c = gridChoices()[(size_t) choice - 1];
+            gr.step = c.beats * gr.beat;
+            gr.name = c.name;
+        }
+        else
+        {
+            gr.step = 16.0 * gr.beat;
+            gr.name = "4 compases";
+            for (const auto& c : gridChoices())
+                if (c.beats >= 0.0625 && std::abs (std::log2 (c.beats) - std::round (std::log2 (c.beats))) < 1.0e-9    // the straight ones
+                    && c.beats * gr.beat * pixelsPerSample >= minPixels && c.beats * gr.beat < gr.step)
+                {
+                    gr.step = c.beats * gr.beat;
+                    gr.name = c.name;
+                }
+            gr.name = "Auto (" + gr.name + ")";
+        }
+        return gr;
+    }
+    // Without a tempo: time, as fine as the zoom leaves room for (down to 1 ms; a sample at the finest zoom).
+    const double steps[] = { 60, 30, 10, 5, 1, 0.5, 0.1, 0.05, 0.01, 0.005, 0.001 };
+    gr.step = 60.0 * sample->sampleRate;
+    gr.name = "60 s";
+    for (const double st : steps)
+        if (st * sample->sampleRate * pixelsPerSample >= minPixels)
+        {
+            gr.step = st * sample->sampleRate;
+            gr.name = st >= 1.0 ? juce::String ((int) st) + " s" : juce::String (juce::roundToInt (st * 1000.0)) + " ms";
+        }
+    return gr;
+}
+
+double EditView::snapped (double fraction) const
+{
+    if (sample == nullptr)
+        return fraction;
+    const auto gr = grid();
+    if (gr.step <= 0.0)
+        return fraction;
+    const double len = std::max (1, sample->length);
+    const double at = fraction * len;
+    const double line = gr.origin + std::round ((at - gr.origin) / gr.step) * gr.step;
+    return juce::jlimit (0.0, 1.0, std::round (line) / len);      // on a sample: a cut is a whole sample
+}
+
+double EditView::place (double fraction, const juce::MouseEvent& e) const
+{
+    return snapsToGrid() && ! e.mods.isAltDown() ? snapped (fraction) : fraction;
+}
+
 void EditView::selectAll()
 {
     selectionStart = 0.0;
@@ -88,6 +198,7 @@ bool EditView::keyPressed (const juce::KeyPress& key)
     if (command && c == 'z') { proc.undo(); return true; }
     if (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey) { runEdit (E::Delete); return true; }
     if (key == juce::KeyPress::escapeKey) { selectionStart = selectionEnd = 0.0; repaint(); return true; }
+    if (! command && c == 'g') { setSnapsToGrid (! snapsToGrid()); if (onMagnetChanged) onMagnetChanged(); return true; }
     return false;
 }
 
@@ -126,17 +237,65 @@ double EditView::markerFraction (int m) const
     }
 }
 
+juce::Rectangle<float> EditView::hitStrip() const
+{
+    const auto a = area();
+    return a.withTop (a.getBottom() - 22.0f);
+}
+
+int EditView::hitAt (juce::Point<float> p, bool& isCut) const
+{
+    isCut = false;
+    if (sample == nullptr || ! proc.hitsEditable() || ! hitStrip().contains (p))
+        return -1;
+    const double len = std::max (1, sample->length);
+    int best = -1;
+    float nearest = grab + 1.0f;
+    for (const int c : proc.getLoopCuts())
+        if (const float d = std::abs (xFor (c / len) - p.x); c > 0 && d < nearest)
+        {
+            nearest = d;
+            best = c;
+            isCut = true;
+        }
+    const int length = sample->loopInfo.length > 0 ? std::min (sample->loopInfo.length, sample->length) : sample->length;
+    for (const int c : proc.getHitEdits().off)
+        if (const float d = std::abs (xFor (c / len) - p.x); c < length && d < nearest)
+        {
+            nearest = d;
+            best = c;
+            isCut = false;
+        }
+    return best;
+}
+
 int EditView::markerAt (const juce::MouseEvent& e) const
 {
     if (sample == nullptr)
         return None;
     const auto p = e.position;
 
+    // LOOP: a cut (or a hit turned off) in the strip along the bottom.
+    {
+        bool isCut = false;
+        auto* self = const_cast<EditView*> (this);
+        self->hoverHit = hitAt (p, isCut);
+        self->hoverHitIsCut = isCut;
+        if (hoverHit >= 0)
+            return Hit;
+    }
+
     const auto a = area();
     // The fade handles sit at the top; the lines run the whole height.
     for (const int m : { FadeInEnd, FadeOutStart })
         if (juce::Point<float> (xFor (markerFraction (m)), a.getY() + handleSize * 0.5f).getDistanceFrom (p) < handleSize)
             return m;
+
+    // The edges of the selection: they move (to the grid with the magnet).
+    if (hasSelection() && a.contains (p))
+        for (const int m : { SelStart, SelEnd })
+            if (std::abs (p.x - xFor (m == SelStart ? selectionStart : selectionEnd)) < grab)
+                return m;
 
     const bool loop = value (P::LoopOn) > 0.5f;
     for (const int m : { Start, End, LoopStart, LoopEnd })
@@ -157,6 +316,7 @@ void EditView::setHover (int m)
     {
         hover = m;
         setMouseCursor (m == Pan ? juce::MouseCursor::DraggingHandCursor
+                      : m == Hit ? juce::MouseCursor::PointingHandCursor
                       : m == Select ? juce::MouseCursor::IBeamCursor
                       : m != None ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
         repaint();
@@ -175,7 +335,12 @@ juce::String EditView::getTooltip()
         case FadeOutStart: return Help::forParam (P::FadeOut);
         case Pan:          return P::u8 ("Arrastra para desplazarte. Rueda: zoom.");
         case Select:       return P::u8 ("Arrastra para seleccionar; un clic marca dónde se pega. Ctrl+C, Ctrl+X, Ctrl+V, Supr, Ctrl+Z. "
-                                         "Rueda: zoom; Mayús + arrastrar: desplazarte.");
+                                         "Rueda: zoom; Mayús + arrastrar: desplazarte. Imán (G): los bordes van a la rejilla; con Alt, libres.");
+        case SelStart:
+        case SelEnd:       return P::u8 ("Borde de la selección: arrástralo para ajustarla (con Imán, a la rejilla; con Alt, libre).");
+        case Hit:          return hoverHitIsCut ? P::u8 ("Golpe que corta el loop: clic lo apaga (deja de cortar y de reiniciar las envolventes con "
+                                                         "Por golpe). Doble clic en un hueco de esta franja añade uno. Lo mismo que en SAMPLE.")
+                                                : P::u8 ("Golpe apagado: clic lo vuelve a encender.");
         default:           return sample != nullptr ? P::u8 ("Rueda: zoom. Arrastra las líneas para el inicio, el fin, los fundidos y el bucle.") : juce::String();
     }
 }
@@ -198,13 +363,18 @@ void EditView::setFraction (int m, double fraction)
         case LoopEnd:      setValue (value (P::LoopStart) <= value (P::LoopEnd) ? P::LoopEnd : P::LoopStart, f); break;
         case FadeInEnd:    setValue (P::FadeIn, (float) std::max (0.0, (fraction - markerFraction (Start)) * len / rate * 1000.0)); break;
         case FadeOutStart: setValue (P::FadeOut, (float) std::max (0.0, (markerFraction (End) - fraction) * len / rate * 1000.0)); break;
+        case SelStart:     selectionStart = juce::jlimit (0.0, selectionEnd, fraction); repaint(); break;
+        case SelEnd:       selectionEnd = juce::jlimit (selectionStart, 1.0, fraction); repaint(); break;
         default:           break;
     }
 }
 
 void EditView::mouseMove (const juce::MouseEvent& e)
 {
+    const int hitBefore = hoverHit;
     setHover (markerAt (e));
+    if (hoverHit != hitBefore)
+        repaint();          // from one cut to the next: the highlight moves
 }
 
 void EditView::mouseDown (const juce::MouseEvent& e)
@@ -212,9 +382,11 @@ void EditView::mouseDown (const juce::MouseEvent& e)
     grabKeyboardFocus();
     dragging = markerAt (e);
     panFrom = first;
+    if (dragging == Hit)
+        return;
     if (dragging == Select)
     {
-        anchor = juce::jlimit (0.0, 1.0, fractionFor (e.position.x));
+        anchor = place (juce::jlimit (0.0, 1.0, fractionFor (e.position.x)), e);
         selectionStart = selectionEnd = anchor;
         repaint();
     }
@@ -233,32 +405,48 @@ void EditView::mouseDrag (const juce::MouseEvent& e)
     }
     else if (dragging == Select)
     {
-        const double at = juce::jlimit (0.0, 1.0, fractionFor (e.position.x));
+        const double at = place (juce::jlimit (0.0, 1.0, fractionFor (e.position.x)), e);
         selectionStart = std::min (anchor, at);
         selectionEnd = std::max (anchor, at);
         repaint();
     }
     else if (dragging != None)
     {
-        setFraction (dragging, fractionFor (e.position.x));
+        setFraction (dragging, place (fractionFor (e.position.x), e));
     }
 }
 
 void EditView::mouseUp (const juce::MouseEvent& e)
 {
+    if (dragging == Hit)
+    {
+        if (std::abs (e.getDistanceFromDragStartX()) < 4 && hoverHit > 0)
+            proc.toggleHit (hoverHit, hoverHitIsCut);
+        dragging = None;
+        repaint();
+        return;
+    }
     if (dragging == Select)
     {
-        // A click is not a selection: it marks where Pegar inserts.
+        // A click is not a selection: it marks where Pegar inserts. With the magnet the edges stay on the grid
+        // (exactly: no move to a zero crossing); without it, Cruces por cero as before.
+        const bool onGrid = snapsToGrid() && ! e.mods.isAltDown();
         if (std::abs (e.getDistanceFromDragStartX()) < 3)
         {
             selectionStart = selectionEnd = 0.0;
-            insertAt = zeroCrossingNear (anchor);
+            insertAt = onGrid ? anchor : zeroCrossingNear (anchor);
         }
-        else
+        else if (! onGrid)
         {
             selectionStart = zeroCrossingNear (selectionStart);
             selectionEnd = zeroCrossingNear (selectionEnd);
         }
+        repaint();
+    }
+    else if ((dragging == SelStart || dragging == SelEnd) && ! (snapsToGrid() && ! e.mods.isAltDown()))
+    {
+        selectionStart = zeroCrossingNear (selectionStart);
+        selectionEnd = zeroCrossingNear (selectionEnd);
         repaint();
     }
 
@@ -267,6 +455,34 @@ void EditView::mouseUp (const juce::MouseEvent& e)
         if (auto* param = proc.apvts.getParameter (P::defs()[(size_t) ids[dragging]].id))
             param->endChangeGesture();
     dragging = None;
+}
+
+// LOOP: a double click in the strip of cuts, away from one, adds a hit: on the grid with the magnet, else on the
+// nearest hit the analysis found within a few pixels (with Mayús, where the mouse is).
+void EditView::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    bool isCut = false;
+    if (sample == nullptr || ! proc.hitsEditable() || ! hitStrip().contains (e.position) || hitAt (e.position, isCut) >= 0)
+        return;
+    const double len = std::max (1, sample->length);
+    double fraction = juce::jlimit (0.0, 1.0, fractionFor (e.position.x));
+    if (snapsToGrid() && ! e.mods.isAltDown())
+        fraction = snapped (fraction);
+    int at = (int) std::lround (fraction * len);
+    if (! snapsToGrid() && ! e.mods.isShiftDown())
+    {
+        float nearest = grab * 2.0f;
+        for (const auto& h : sample->loopInfo.hits)
+            if (const float d = std::abs (xFor (h.first / len) - e.position.x); d < nearest)
+            {
+                nearest = d;
+                at = h.first;
+            }
+    }
+    const int length = sample->loopInfo.length > 0 ? std::min (sample->loopInfo.length, sample->length) : sample->length;
+    if (at > 0 && at < length)
+        proc.addHit (at);
+    repaint();
 }
 
 void EditView::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel)
@@ -336,7 +552,36 @@ void EditView::paint (juce::Graphics& g)
     g.saveState();
     g.reduceClipRegion (a.withBottom (a.getBottom() + 18.0f).expanded (1.0f, 0.0f).toNearestInt());
 
-    // Time grid.
+    // Grid: with the magnet, the one the edges go to (bars brightest, then beats, then the rest, labelled bar.beat);
+    // without it, time (seconds), as before.
+    const auto gr = grid();
+    if (snapsToGrid() && gr.step > 0.0)
+    {
+        const double len = std::max (1, sample->length);
+        const double from = std::ceil ((first * len - gr.origin) / gr.step), to = ((first + shown) * len - gr.origin) / gr.step;
+        g.setFont (Theme::font (10.0f));
+        float lastLabel = -1000.0f;
+        for (double k = from; k <= to && k - from < 4000.0; k += 1.0)
+        {
+            const double at = gr.origin + k * gr.step;
+            const float x = xFor (at / len);
+            const double beats = gr.musical ? at / gr.beat : 0.0;
+            const bool bar = gr.musical && std::abs (beats / 4.0 - std::round (beats / 4.0)) < 1.0e-6;
+            const bool beat = gr.musical && std::abs (beats - std::round (beats)) < 1.0e-6;
+            g.setColour (Theme::accent.withAlpha (bar ? 0.55f : beat ? 0.32f : 0.16f));
+            g.drawVerticalLine ((int) x, a.getY(), a.getBottom());
+            if ((bar || beat || ! gr.musical) && x - lastLabel > 34.0f)
+            {
+                g.setColour (Theme::dim);
+                const juce::String label = gr.musical ? juce::String ((int) std::floor (beats / 4.0 + 1.0e-6) + 1) + "." + juce::String ((int) std::round (beats) % 4 + 1)
+                                                      : (gr.step < sample->sampleRate ? juce::String (juce::roundToInt (at / sample->sampleRate * 1000.0)) + " ms"
+                                                                                      : juce::String (at / sample->sampleRate, 1) + " s");
+                g.drawText (label, (int) x + 2, (int) a.getBottom() + 2, 60, 14, juce::Justification::centredLeft);
+                lastLabel = x;
+            }
+        }
+    }
+    else
     {
         const double steps[] = { 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60 };
         double step = 60;
@@ -423,15 +668,57 @@ void EditView::paint (juce::Graphics& g)
     marker (Start, xStart, Theme::accent, true);
     marker (End, xEnd, Theme::accent2, true);
 
+    // LOOP: its cuts along the bottom (as in SAMPLE): the one under the mouse full height, the added ones with a
+    // dot, the ones turned off grey and dashed with a cross.
+    if (proc.hitsEditable())
+    {
+        const double len = std::max (1, sample->length);
+        const auto strip = hitStrip();
+        const auto edits = proc.getHitEdits();
+        const int tol = HitEdits::tolerance (sample->sampleRate);
+        g.setColour (Theme::accent2.withAlpha (0.06f));
+        g.fillRect (strip);
+        for (const int cut : proc.getLoopCuts())
+        {
+            const bool hot = (hover == Hit || dragging == Hit) && hoverHitIsCut && std::abs (cut - hoverHit) <= tol;
+            const float x = xFor (cut / len), tall = hot ? a.getHeight() : 14.0f;
+            g.setColour (Theme::accent2.withAlpha (hot ? 1.0f : 0.85f));
+            g.fillRect (x - (hot ? 1.0f : 0.5f), a.getBottom() - tall, hot ? 2.0f : 1.0f, tall);
+            if (HitEdits::near (edits.on, cut, tol))
+                g.fillEllipse (x - 2.5f, a.getBottom() - 21.0f, 5.0f, 5.0f);
+        }
+        const int length = sample->loopInfo.length > 0 ? std::min (sample->loopInfo.length, sample->length) : sample->length;
+        for (const int off : edits.off)
+        {
+            if (off >= length)
+                continue;
+            const bool hot = (hover == Hit || dragging == Hit) && ! hoverHitIsCut && std::abs (off - hoverHit) <= tol;
+            const float x = xFor (off / len);
+            const float top = hot ? a.getY() : a.getBottom() - 14.0f;
+            g.setColour (Theme::text.withAlpha (hot ? 0.9f : 0.45f));
+            for (float y = a.getBottom() - 3.0f; y > top; y -= 5.0f)
+                g.fillRect (x - 0.5f, std::max (top, y - 3.0f), 1.0f, std::min (3.0f, y - top));
+            g.drawLine (x - 3.0f, a.getBottom() - 21.0f, x + 3.0f, a.getBottom() - 15.0f, 1.2f);
+            g.drawLine (x - 3.0f, a.getBottom() - 15.0f, x + 3.0f, a.getBottom() - 21.0f, 1.2f);
+        }
+    }
+
     // The selection, and the point where Pegar inserts.
     if (hasSelection())
     {
         const float x0 = xFor (selectionStart), x1 = xFor (selectionEnd);
         g.setColour (Theme::text.withAlpha (0.13f));
         g.fillRect (x0, a.getY(), std::max (1.0f, x1 - x0), a.getHeight());
-        g.setColour (Theme::text.withAlpha (0.8f));
-        g.drawVerticalLine ((int) x0, a.getY(), a.getBottom());
-        g.drawVerticalLine ((int) x1, a.getY(), a.getBottom());
+        // The edges: wider when under the mouse; on the grid, in the magnet's colour.
+        const bool onGrid = snapsToGrid() && gr.step > 0.0;
+        for (const auto [x, m] : { std::pair<float, int> { x0, SelStart }, { x1, SelEnd } })
+        {
+            const bool hot = hover == m || dragging == m;
+            g.setColour (onGrid ? Theme::accent : Theme::text.withAlpha (0.8f));
+            g.fillRect (x - (hot ? 1.0f : 0.5f), a.getY(), hot ? 2.0f : 1.0f, a.getHeight());
+            g.fillRect (x - 3.0f, a.getY(), 6.0f, 3.0f);
+            g.fillRect (x - 3.0f, a.getBottom() - 3.0f, 6.0f, 3.0f);
+        }
     }
     else if (insertAt >= 0.0)
     {
@@ -448,7 +735,13 @@ void EditView::paint (juce::Graphics& g)
     const double len = (markerFraction (End) - markerFraction (Start)) * seconds;
     juce::String text = juce::String (len, 3) + P::u8 (" s entre INICIO y FIN");
     if (hasSelection())
+    {
         text << P::u8 ("   ·   selección ") << juce::String ((selectionEnd - selectionStart) * seconds * 1000.0, 1) << " ms";
+        if (gr.musical)
+            text << " (" << juce::String ((selectionEnd - selectionStart) * sample->length / gr.beat, 2) << " tiempos)";
+    }
+    if (snapsToGrid() && gr.step > 0.0)
+        text << P::u8 ("   ·   imán: ") << gr.name << (gr.musical ? "" : P::u8 (" (sin tempo)"));
     if (shown < 1.0)
         text << juce::String::formatted ("   ·   x%.1f", 1.0 / shown);
     if (proc.isEdited())
@@ -489,6 +782,31 @@ EditToolbar::EditToolbar (ReanimaProcessor& p, EditView& v) : proc (p), view (v)
                  [this] { view.snapsToZero = zero->getToggleState(); }, 1.45f);
     zero->setClickingTogglesState (true);
     zero->setToggleState (view.snapsToZero, juce::dontSendNotification);
+    magnet = &add (P::u8 ("Imán"), "Ajuste a la rejilla (tecla G): los bordes de la selección y las líneas van a la rejilla al arrastrarlos, "
+                   "con precisión de una muestra. Con tempo, la rejilla son los tiempos del loop (o el tempo del proyecto); sin tempo, "
+                   "segundos y milisegundos. Con Alt, libres. Con el imán no se mueven al cruce por cero.",
+                   [this] { view.setSnapsToGrid (magnet->getToggleState()); refresh(); }, 0.9f);
+    magnet->setClickingTogglesState (true);
+    magnet->setToggleState (view.snapsToGrid(), juce::dontSendNotification);
+    gridMenu = &add (P::u8 ("Auto ▾"), "Rejilla del imán. La resolución de la rejilla: Auto (según el zoom) o fija, de 4 compases a 1/64 y tresillos.", [this]
+    {
+        juce::PopupMenu menu;
+        const bool musical = view.grid().musical;
+        menu.addItem (1, "Auto (según el zoom)", true, view.gridChoice() == 0);
+        menu.addSeparator();
+        const auto& choices = EditView::gridChoices();
+        for (int i = 0; i < (int) choices.size(); ++i)
+            menu.addItem (i + 2, P::u8 (choices[(size_t) i].name), musical, view.gridChoice() == i + 1);
+        if (! musical)
+            menu.addSectionHeader (P::u8 ("Sin tempo: rejilla de tiempo según el zoom"));
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (gridMenu), [this] (int r)
+        {
+            if (r > 0)
+                view.setGridChoice (r - 1);
+            refresh();
+        });
+    }, 1.0f);
+    view.onMagnetChanged = [this] { refresh(); };
     refresh();
 }
 
@@ -528,6 +846,10 @@ void EditToolbar::refresh()
         b->setEnabled (selected);
     paste->setEnabled (loaded && proc.hasClipboard());
     seamless->setEnabled (loaded && proc.paramValue (P::LoopOn) > 0.5f && proc.paramValue (P::LoopXfade) > 0.0f);
+    magnet->setToggleState (view.snapsToGrid(), juce::dontSendNotification);
+    gridMenu->setEnabled (loaded);
+    const int choice = view.gridChoice();
+    gridMenu->setButtonText ((choice == 0 ? juce::String ("Auto") : P::u8 (EditView::gridChoices()[(size_t) choice - 1].name)) + P::u8 (" ▾"));
 }
 
 //==============================================================================

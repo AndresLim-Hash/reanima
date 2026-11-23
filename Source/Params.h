@@ -40,10 +40,11 @@ enum Id : int
     // Envelope 2
     E2A, E2D, E2S, E2R,
 
-    // LFOs (5 params each)
-    Lfo1Rate, Lfo1Sync, Lfo1Div, Lfo1Shape, Lfo1Retrig,
-    Lfo2Rate, Lfo2Sync, Lfo2Div, Lfo2Shape, Lfo2Retrig,
-    Lfo3Rate, Lfo3Sync, Lfo3Div, Lfo3Shape, Lfo3Retrig,
+    // LFOs (6 params each). Suavidad: how gently the LFO moves (a glide over its steps; with Deriva, how little
+    // quick wobble it has); 0 leaves every shape as it was before it existed.
+    Lfo1Rate, Lfo1Sync, Lfo1Div, Lfo1Shape, Lfo1Retrig, Lfo1Smooth,
+    Lfo2Rate, Lfo2Sync, Lfo2Div, Lfo2Shape, Lfo2Retrig, Lfo2Smooth,
+    Lfo3Rate, Lfo3Sync, Lfo3Div, Lfo3Shape, Lfo3Retrig, Lfo3Smooth,
 
     Macro1, Macro2, Macro3, Macro4,
 
@@ -69,6 +70,26 @@ enum Id : int
     // LOOP: Envolvente and the filter's envelope start again at each hit (Normal) or follow each slice with its
     // own release (Slice).
     LoopHitEnv,
+    // Por golpe: Mecanismo strikes again at each hit as well (TIMBRE).
+    MechPerHit,
+    // LOOP Normal: the part of the loop that plays (Ventana, in beats; Completo: all of it) and where it starts
+    // (Posición, in beats from the loop's start).
+    LoopWinLen, LoopWinPos,
+    // The key of the music (the arpeggiator and sequencer follow it): where it comes from (set by hand, estimated
+    // from the sample, or from the notes played) and, by hand, its tonic and scale.
+    KeySource, KeyRoot, KeyScale,
+    // ARP · SEQ: the step engine (StepSeq.h): on, mode, the arpeggio's order and the sequence's direction, the
+    // step's length, octaves, swing, gate, latch, the DAW's tempo or its own, and how full Generar makes it.
+    ArpOn, ArpMode, ArpStyle, SeqDir, ArpRate, ArpOctaves, ArpSwing, ArpGate, ArpLatch, ArpSync, ArpBpm, ArpDensity,
+    // Engine E: grains placed a whole number of the note's periods apart (Coherente), so that they add up in phase.
+    GrainCoherent,
+    // Filter type Armónico: how much the harmonics of the note in its region are raised (+) or lowered (-), and how
+    // wide that region is (octaves around Frecuencia). Morph/DJ is then the balance of odd and even harmonics.
+    FltHarmGain, FltHarmRegion,
+    // Engines B and D: the sustain takes on the colour the sample itself had at that moment (0: as before, still).
+    SustainMotion,
+    // The sidechain as a source of the matrix: how much it is raised, how its level is followed, and what of it.
+    ScSens, ScAttack, ScRelease, ScResponse,
 
     // FX slots follow: type, on, mix and fxParamsPerSlot generic values each.
     FxSlotBase
@@ -104,22 +125,26 @@ enum SliceById { SliceTransients, SliceGrid, SliceManual };
 // Loop length choices (LoopBeats), in beats; 0 = as detected.
 constexpr int maxSlices = 128;
 constexpr int loopBeatChoices[] = { 0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64 };
+// Ventana: its length in beats for each choice (0: Completo, the whole loop).
+constexpr double loopWindowBeats[] = { 0.0, 16.0, 8.0, 4.0, 2.0, 1.5, 1.0, 2.0 / 3.0, 0.75, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125 };
 enum PolyModeId { Poly, Mono, Legato };
-enum FilterType { LP, HP, BP, Notch, Morph, DJ, Comb, Vowel };
+enum FilterType { LP, HP, BP, Notch, Morph, DJ, Comb, Vowel, Harmonic };
 enum FilterCircuit { Clean, OSR, MS2, SMP, PRD };
-enum LfoShape { Sine, Triangle, SawUp, SawDown, Square, SampleHold };
+enum LfoShape { Sine, Triangle, SawUp, SawDown, Square, SampleHold, Drift };
+// What the sidechain source follows: its level, the level of its lows, mids or highs, or its brightness.
+enum ScResponseId { ScLevel, ScLows, ScMids, ScHighs, ScBright };
 
 enum ModSource
 {
     SrcNone, SrcLfo1, SrcLfo2, SrcLfo3, SrcEnv2, SrcAmpEnv, SrcVelocity, SrcNote,
-    SrcModWheel, SrcAftertouch, SrcMacro1, SrcMacro2, SrcMacro3, SrcMacro4, SrcRandom,
+    SrcModWheel, SrcAftertouch, SrcMacro1, SrcMacro2, SrcMacro3, SrcMacro4, SrcRandom, SrcSidechain,
     NumSources
 };
 
 enum ModDest
 {
     DstNone, DstPitch, DstVolume, DstPan, DstCutoff, DstRes, DstDrive, DstMorph,
-    DstStart, DstSpray, DstGrain, DstDetune, DstLfo1Rate, DstLfo2Rate, DstTransient, DstBow, DstBreath,
+    DstStart, DstSpray, DstGrain, DstDetune, DstLfo1Rate, DstLfo2Rate, DstTransient, DstBow, DstBreath, DstFine,
     NumDests
 };
 

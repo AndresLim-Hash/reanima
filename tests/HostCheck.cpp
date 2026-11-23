@@ -736,8 +736,12 @@ int main (int argc, char* argv[])
         p->prepareToPlay (48000.0, 512);
         check (p->getLatencySamples() == 38, "latencia declarada (la etapa de salida, 0,8 ms a 48 kHz)", juce::String (p->getLatencySamples()) + " muestras");
         p->releaseResources();
-        check (p->getTotalNumInputChannels() == 0 && p->getTotalNumOutputChannels() == 2, "sin entradas, salida estéreo",
-               juce::String (p->getTotalNumOutputChannels()) + " salidas");
+        // one input: the sidechain (the key of another track), auxiliary for the host
+        const auto* in = p->getBus (true, 0);
+        check (p->getBusCount (true) == 1 && in != nullptr && in->getName() == "Sidechain" && p->getTotalNumOutputChannels() == 2,
+               "una entrada lateral (Sidechain), salida estéreo",
+               juce::String (p->getBusCount (true)) + " entradas (" + (in != nullptr ? in->getName() : juce::String ("-")) + ", "
+                   + juce::String (p->getTotalNumInputChannels()) + " canales), " + juce::String (p->getTotalNumOutputChannels()) + " salidas");
         check (p->acceptsMidi(), "acepta MIDI");
 
         // Besides its own, JUCE adds 16 x 130 hidden ones: how VST3 passes pitch bend and CCs.

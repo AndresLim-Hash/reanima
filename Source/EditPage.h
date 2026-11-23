@@ -20,6 +20,7 @@ public:
     void mouseDrag (const juce::MouseEvent& e) override;
     void mouseUp (const juce::MouseEvent& e) override;
     void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override;
+    void mouseDoubleClick (const juce::MouseEvent& e) override;
     void mouseExit (const juce::MouseEvent&) override { setHover (None); }
     bool keyPressed (const juce::KeyPress& key) override;
 
@@ -30,8 +31,37 @@ public:
     void selectAll();
     bool snapsToZero = true;
 
+    // Imán: the edges (selection, lines) go to the grid while dragging; Alt lets them free. The grid is the
+    // sample's beats (a loop's own, or the host's tempo from the file's start), or seconds without a tempo.
+    // Saved with the project (a view setting).
+    bool snapsToGrid() const;
+    void setSnapsToGrid (bool on);
+    // Resolution: 0 Auto (as fine as the zoom leaves room for), else one of gridChoices() (in beats).
+    int gridChoice() const;
+    void setGridChoice (int choice);
+    struct GridChoice { const char* name; double beats; };
+    static const std::vector<GridChoice>& gridChoices();
+    // The grid now: its step (in samples, > 0), where it starts, whether it counts beats, a name ("1/16", "10 ms").
+    struct Grid { double step = 0.0, origin = 0.0, beat = 0.0; bool musical = false; juce::String name; };
+    Grid grid() const;
+    // A position (fraction of the file) put on the nearest grid line (exactly on a sample).
+    double snapped (double fraction) const;
+    // For the tests: the view's zoom and its width as the grid sees them.
+    void setViewForTests (double firstFraction, double shownFraction) { first = firstFraction; shown = shownFraction; }
+    double selectionStartForTests() const { return selectionStart; }
+    double selectionEndForTests() const { return selectionEnd; }
+    std::function<void()> onMagnetChanged;      // the toolbar's button follows the G key
+
 private:
-    enum Marker { None = -1, Start, End, LoopStart, LoopEnd, FadeInEnd, FadeOutStart, Pan, Select, NumMarkers };
+    enum Marker { None = -1, Start, End, LoopStart, LoopEnd, FadeInEnd, FadeOutStart, Pan, Select, SelStart, SelEnd, Hit, NumMarkers };
+    // LOOP: the cuts along the bottom of the waveform (the strip), as in SAMPLE: a click turns one off or on, a
+    // double click in the strip adds one.
+    juce::Rectangle<float> hitStrip() const;
+    int hitAt (juce::Point<float> p, bool& isCut) const;
+    int hoverHit = -1;
+    bool hoverHitIsCut = false;
+    double beatSamples() const;         // samples per beat, 0 without a tempo
+    double place (double fraction, const juce::MouseEvent& e) const;    // snapped unless Alt (or the magnet is off)
 
     juce::Rectangle<float> area() const;
     float xFor (double fraction) const;
@@ -71,7 +101,7 @@ private:
     std::vector<std::pair<std::unique_ptr<juce::TextButton>, float>> buttons;
     juce::TextButton *trim = nullptr, *remove = nullptr, *silence = nullptr, *copyButton = nullptr, *cut = nullptr, *paste = nullptr,
                      *reverse = nullptr, *fadeIn = nullptr, *fadeOut = nullptr, *normalize = nullptr, *gain = nullptr,
-                     *seamless = nullptr, *zero = nullptr;
+                     *seamless = nullptr, *zero = nullptr, *magnet = nullptr, *gridMenu = nullptr;
 };
 
 // Pitch envelope as a curve: where the note starts and how it comes back.

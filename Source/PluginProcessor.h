@@ -5,6 +5,9 @@
 #include "SampleAnalysis.h"
 #include "MasterStage.h"
 #include "SynthEngine.h"
+#include "HitEdits.h"
+#include "KeyDetect.h"
+#include "StepSeq.h"
 #include "DspUtil.h"
 #include "FactoryPresets.h"
 
@@ -140,6 +143,53 @@ public:
     // EXPORTAR AUDIO: what the plug-in plays, rendered offline (format 0 WAV, 1 AIFF, 2 FLAC; bits 16/24/32).
     bool renderExport (const juce::File& out, int format, double rate, int bits, juce::String& error) const;
     void setSliceMarks (std::vector<int> marks);
+
+    // The sample browser's preview: a file heard as it is (its first 15 s, at -6 dB), mixed into the output
+    // after the instrument, without touching the loaded sample. Message thread; nothing allocated or freed on the
+    // audio thread (the clip goes in through a mailbox, the one it replaces comes back through another).
+    bool previewFile (const juce::File& file);
+    void stopPreview() noexcept { previewStop.store (true, std::memory_order_release); }
+    bool isPreviewing() const noexcept { return previewOn.load (std::memory_order_acquire); }
+
+    // The key (message thread). What the sample says (its name, else its sound: worked out in the background
+    // after each load), what the notes played say, and the one in use: by hand, or the estimate of the chosen
+    // source when it is sure enough (60 %), else the last one that was (a doubtful one is shown, not applied).
+    KeyDetect::Estimate sampleKey() const;
+    KeyDetect::Estimate midiKey() const { return midiHistogram.estimate(); }
+    KeyDetect::Estimate externalKey() const { return sideStream.estimate(); }      // the sidechain's
+    // The chord: of the keys down now, of the sidechain's sound now, and the last ones played or heard (up to 8).
+    KeyDetect::Chord midiChord() const;
+    KeyDetect::Chord externalChord() const { return sideStream.chord(); }
+    std::vector<KeyDetect::Chord> chordProgression() const { return progression; }
+    static constexpr float chordHeardSure = 0.2f;      // the sound's chord: shown and kept from here (7 times in 10)
+    void clearProgression() { progression.clear(); }
+    double externalSeconds() const { return sideStream.secondsHeard(); }       // pitched seconds heard (fading)
+    bool hasSidechain() const { return getBusCount (true) > 0; }
+    juce::VST3ClientExtensions* getVST3ClientExtensions() override { return &vst3Extensions; }
+    struct KeyInUse { int root = 0; bool minor = false; bool doubtful = false; KeyDetect::Estimate estimate; };
+    KeyInUse keyInUse();
+    void fixKey (const KeyDetect::Estimate& e);       // the estimate set by hand (Tonalidad de: A mano)
+    static constexpr float keySure = 0.6f;
+    // ARP · SEQ: the pattern (message thread; saved with the project and the preset), the player's steps for
+    // the grid, the MIDI clip of the pattern (as the DAW would play it: `bars` bars at its tempo, or 120).
+    StepSeq::Pattern seqPattern() const { return StepSeq::Pattern::fromString (apvts.state.getProperty ("seqPattern").toString()); }
+    void setSeqPattern (const StepSeq::Pattern& p);
+    const StepSeq::Player& seqPlayer() const noexcept { return arp; }
+    juce::File writeSeqMidi (int bars = 0) const;          // 0: as long as the lanes take to meet again (up to 8 bars)
+    static juce::File patternFolder();
+    // LOOP: the hits the user turned off or added (saved with the project and the preset, kept when the sample is
+    // analysed again; a new sample starts without). They apply to SLICE's Transitorios, Por golpe and Beats.
+    void setHitEdits (const HitEdits& edits);
+    HitEdits getHitEdits() const;
+    // Beats's cuts as they play with those corrections (empty: none, the analysis's own).
+    std::vector<int> getBeatCuts() const { return beatPoints; }
+    // The cuts of the loop as they play now (SLICE's slices, Por golpe's hits, or Beats's cuts), and whether a
+    // click may turn them off or on (LOOP Normal, or SLICE by Transitorios). Shared by SAMPLE and EDICIÓN.
+    std::vector<int> getLoopCuts() const;
+    bool hitsEditable() const;
+    // A click on a cut (isCut) or on a hit turned off: off, or back on. A new hit at `at`. Message thread.
+    void toggleHit (int at, bool isCut);
+    void addHit (int at);
     // The loop's length in beats as LOOP plays it (BPM original, Tiempos, or what was detected); 0 unknown.
     double loopBeatsNow() const;
 
@@ -289,7 +339,55 @@ private:
     juce::String saved;
     int knownPlayMode = 0;
     juce::String sliceSignature;
-    std::vector<int> slicePoints, sliceOrder;
+    std::vector<int> slicePoints, sliceOrder, beatPoints;
+    // The key: the sample's estimate (made on the analysis pool), the notes played (from the audio thread through a
+    // ring of note-ons), the last key that was sure.
+    mutable juce::CriticalSection keyLock;
+    KeyDetect::Estimate sampleKeyEstimate;
+    const SampleData* keyEstimatedFor = nullptr;
+    KeyDetect::MidiHistogram midiHistogram;
+    std::array<std::atomic<int>, 256> noteRing {};
+    std::atomic<unsigned> noteRingWrite { 0 };
+    unsigned noteRingRead = 0;
+    double keyClock = 0.0;
+    int lastSureRoot = 0;
+    bool lastSureMinor = false;
+    void serviceKey();
+    StepSeq::Player arp;
+    StepSeq::SharedPattern arpPattern;
+    StepSeq::Pattern arpPatternAudio;
+    juce::String arpPatternText;
+    juce::MidiBuffer arpMidi;
+    std::atomic<int> keyRootNow { 0 };
+    std::array<std::atomic<std::uint64_t>, 2> keysDown {};
+    KeyDetect::Chord chordCandidate;
+    int chordTicks = 0;
+    std::vector<KeyDetect::Chord> progression;
+    std::atomic<bool> keyMinorNow { false };
+    StepSeq::Settings seqSettings (const ParamSnapshot& p) const noexcept;
+    // the sidechain: mono, from the audio thread through a ring (some 2.7 s at 48 kHz) to the key's stream
+    // The sidechain of the block, copied before the engine writes its output over the same channels (the input and
+    // the output share them): the matrix's Sidechain source and the Impronta effect read it.
+    juce::AudioBuffer<float> sideCopy;
+    juce::AbstractFifo sideFifo { 1 << 17 };
+    std::vector<float> sideRing = std::vector<float> (1 << 17);
+    std::atomic<double> sideRate { 0.0 };
+    double sideStreamRate = 0.0, lastSideFade = 0.0;
+    KeyDetect::AudioStream sideStream;
+    static BusesProperties buses();
+    // VST3: the input is an auxiliary one (a sidechain), not the main input of an effect: Live shows it in the
+    // device's Sidechain panel.
+    struct Vst3Extensions : juce::VST3ClientExtensions
+    {
+        bool getPluginHasMainInput() const override { return false; }
+    } vst3Extensions;
+    struct PreviewClip { juce::AudioBuffer<float> audio; double rate = 44100.0; };
+    std::atomic<PreviewClip*> previewMail { nullptr }, previewTrash { nullptr };
+    PreviewClip* previewPlaying = nullptr;      // audio thread
+    double previewPos = 0.0;
+    float previewGain = 0.0f;
+    std::atomic<bool> previewStop { false }, previewOn { false };
+    void mixPreview (juce::AudioBuffer<float>& buffer) noexcept;
     void updateSlices();
     int knownEnvMode = P::EnvReshape;   // to tell a switch of the ADSR mode from a restored state
 
@@ -314,5 +412,6 @@ private:
     juce::CriticalSection finishedLock;
     std::unique_ptr<Load> finished;
 
+    JUCE_DECLARE_WEAK_REFERENCEABLE (ReanimaProcessor)
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ReanimaProcessor)
 };

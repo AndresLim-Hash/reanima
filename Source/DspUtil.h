@@ -12,6 +12,7 @@ constexpr float pi = juce::MathConstants<float>::pi;
 constexpr float twoPi = juce::MathConstants<float>::twoPi;
 
 inline float dbToGain (float db) noexcept { return std::pow (10.0f, db * 0.05f); }
+inline float gainToDb (float gain) noexcept { return 20.0f * std::log10 (std::max (1.0e-12f, gain)); }
 
 // Constant power: both sides at unity in the centre, the far side at zero when panned fully.
 inline void panGains (float pan, float& left, float& right) noexcept

@@ -50,7 +50,7 @@ public:
     void zoomAround (double seconds, float newZoom);
 
 private:
-    enum Handle { HAttack, HDecay, HFade, HRelease, NumHandles, HStart = NumHandles, HPan, HSlice };
+    enum Handle { HAttack, HDecay, HFade, HRelease, NumHandles, HStart = NumHandles, HPan, HSlice, HHit, HWindow };
 
     struct Geometry
     {
@@ -97,6 +97,22 @@ private:
     int snapToHit (int at, const Geometry& g) const;
     int hoverSlice = -1, dragSlice = -1;
     std::vector<int> dragMarks;
+    bool sliceMoved = false;            // a marker dragged further than a click: it moves (Cortes "A mano")
+
+    // LOOP: the hits that cut it (and the ones the user turned off), a click turns one off or on (HitEdits).
+    bool editsHits() const;                     // LOOP Normal, or SLICE by Transitorios
+    std::vector<int> cutsShown() const;         // the cuts as they play now
+    int loopLength() const;
+    int hitAt (juce::Point<float> p, bool& isCut) const;    // position of the cut or turned-off hit near p, or -1
+    int hoverHit = -1;
+    bool hoverHitIsCut = false;
+    juce::Point<float> downAt;
+
+    // LOOP's Ventana: the part that plays, dragged by its body (to sixteenths of a beat; Alt: free).
+    SynthEngine::LoopWindow window() const;
+    double beatSamples() const;          // samples of the file a beat, 0 without a tempo
+    bool overWindow (juce::Point<float> p) const;
+    float windowFrom = 0.0f;
 
     float zoom = 1.0f;
     double viewFirst = 0.0;

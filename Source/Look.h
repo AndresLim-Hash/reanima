@@ -100,7 +100,31 @@ public:
         const bool bipolar = slider.getMinimum() < 0.0 && slider.getMaximum() > 0.0;
         const float from = bipolar ? (startAngle + endAngle) * 0.5f : startAngle;
         const auto colour = slider.findColour (Slider::trackColourId);
-        if (std::abs (angle - from) > 0.01f)
+        // Modulated (a macro, an LFO, an envelope... through the matrix): the value set, an inner ring; where the
+        // modulation takes it, an outer one in the macros' colour, from the value to there, with a dot at its end.
+        const auto modProp = slider.getProperties()["modPos"];
+        const float modPos = modProp.isVoid() ? -1.0f : (float) modProp;
+        const bool modulatedNow = modPos >= 0.0f && std::abs (modPos - pos) > 0.004f;
+        if (modulatedNow)
+        {
+            const float innerRadius = arcRadius - track * 1.35f;
+            if (std::abs (angle - from) > 0.01f)
+            {
+                Path value;
+                value.addCentredArc (centre.x, centre.y, innerRadius, innerRadius, 0.0f, std::min (from, angle), std::max (from, angle), true);
+                g.setColour (colour);
+                g.strokePath (value, stroke (track * 0.8f));
+            }
+            const float modAngle = startAngle + modPos * (endAngle - startAngle);
+            Path moved;
+            moved.addCentredArc (centre.x, centre.y, arcRadius, arcRadius, 0.0f, std::min (angle, modAngle), std::max (angle, modAngle), true);
+            g.setColour (Theme::good.withAlpha (0.18f));
+            g.strokePath (moved, stroke (track * 2.4f));
+            g.setColour (Theme::good);
+            g.strokePath (moved, stroke (track));
+            g.fillEllipse (Rectangle<float> (track * 1.6f, track * 1.6f).withCentre (centre.getPointOnCircumference (arcRadius, modAngle)));
+        }
+        else if (std::abs (angle - from) > 0.01f)
         {
             Path value;
             value.addCentredArc (centre.x, centre.y, arcRadius, arcRadius, 0.0f,
@@ -384,6 +408,19 @@ public:
     }
 
     void setAccent (juce::Colour c) { slider.setColour (juce::Slider::trackColourId, c); }
+
+    // Where the modulation takes the value now (0..1 of the knob's travel), or -1: none. Only drawn: the value
+    // itself, its automation and its MIDI Learn stay as they are.
+    void setModulation (float position)
+    {
+        const auto old = slider.getProperties()["modPos"];
+        const float before = old.isVoid() ? -1.0f : (float) old;
+        if (std::abs (before - position) < 0.002f)
+            return;
+        slider.getProperties().set ("modPos", position);
+        slider.repaint();
+    }
+    int parameterIndex() const noexcept { return getComponentID().fromFirstOccurrenceOf ("p:", false, false).getIntValue(); }
 
     void resized() override
     {

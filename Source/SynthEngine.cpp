@@ -52,7 +52,7 @@ namespace
 constexpr int subBlock = 32;
 constexpr int controlBlock = 8;         // envelopes are exact every 8 samples, linear in between
 constexpr float punchTime = 0.012f;     // seconds for the generated hit to fall by 8.7 dB
-constexpr int maxPartials = 128;
+constexpr int maxPartials = 256;          // 128 a side when engine C plays the two sides apart (PartialModel::split)
 constexpr float limiterCeiling = 4.0f;  // +12 dBFS: only catches runaways (the output stage saturates the 0 to +6 dB of the meter)
 constexpr float maxBoost = 64.0f;       // +36 dB: how far engines B, C and D raise a quiet part to follow the ADSR
 using Dsp::pi;
@@ -416,6 +416,163 @@ double lfoRateHz (const ParamSnapshot& p, int lfo, double bpm)
     return p[(size_t) base];
 }
 
+// LFO Deriva: the slow wandering of a real player's pitch, of tape or of an old oscillator. Random points a cycle apart
+// joined by a smooth curve (Catmull-Rom: no corners, so no clicks and no steps), and two quicker layers of the
+// same (3.7 and 11.3 times as fast, so that they never line up) for the small wobble; Suavidad takes those out.
+// Each note draws its own points: notes drift apart from each other, as the voices of an analog synth do. The points
+// come from a generator of its own, seeded from the note's: drawing them from the note's generator moved every other
+// random choice of the note (Variación, the grains, engine F's phases), and a project saved before sounded different.
+struct DriftLfo
+{
+    std::array<std::array<float, 4>, 3> knots {};
+    std::array<double, 3> phase {};      // layer 0 follows the LFO's own phase (its rate, Sync and Retrig)
+    juce::Random rng;
+
+    void start (juce::int64 seed) noexcept
+    {
+        rng.setSeed (seed);
+        for (auto& k : knots)
+            for (auto& v : k)
+                v = rng.nextFloat() * 2.0f - 1.0f;
+        phase[1] = rng.nextDouble();
+        phase[2] = rng.nextDouble();
+    }
+
+    static float curve (const std::array<float, 4>& k, float t) noexcept      // between k[1] (t 0) and k[2] (t 1)
+    {
+        const float a = -0.5f * k[0] + 1.5f * k[1] - 1.5f * k[2] + 0.5f * k[3];
+        const float b = k[0] - 2.5f * k[1] + 2.0f * k[2] - 0.5f * k[3];
+        const float c = 0.5f * (k[2] - k[0]);
+        return ((a * t + b) * t + c) * t + k[1];
+    }
+
+    static void shift (std::array<float, 4>& k, juce::Random& rng) noexcept
+    {
+        k[0] = k[1];
+        k[1] = k[2];
+        k[2] = k[3];
+        k[3] = rng.nextFloat() * 2.0f - 1.0f;
+    }
+
+    float value (double lfoPhase, float smooth) const noexcept
+    {
+        const float rough = 1.0f - juce::jlimit (0.0f, 1.0f, smooth);
+        float v = curve (knots[0], (float) lfoPhase);
+        if (rough > 0.0f)
+            v += rough * (0.5f * curve (knots[1], (float) phase[1]) + 0.3f * curve (knots[2], (float) phase[2]));
+        return juce::jlimit (-1.0f, 1.0f, v / (1.0f + 0.4f * rough));
+    }
+
+    // Layer 0 moves on when the LFO's phase wraps (nextCycle); the quicker layers by the cycles of this block.
+    void advance (double cycles) noexcept
+    {
+        static constexpr double speed[3] = { 0.0, 3.7, 11.3 };
+        for (int j = 1; j < 3; ++j)
+        {
+            phase[(size_t) j] += cycles * speed[j];
+            for (int guard = 0; phase[(size_t) j] >= 1.0 && guard < 64; ++guard)
+            {
+                phase[(size_t) j] -= 1.0;
+                shift (knots[(size_t) j], rng);
+            }
+            if (phase[(size_t) j] >= 1.0)
+                phase[(size_t) j] -= std::floor (phase[(size_t) j]);
+        }
+    }
+
+    void nextCycle() noexcept { shift (knots[0], rng); }
+};
+
+// Movimiento (engines B and D): the sustain source is one moment of the sound held still. This colours it, band by
+// band (SampleData::Colour's octaves), as the sample itself was at the point the note has reached, so that a held
+// note keeps changing as the sample did (a piano darkening, a string opening up) instead of staying on one colour.
+// Only the shape moves, never the level: the bands are set against each other, their mean power kept, so the held
+// note neither fades nor swells. A bell at 0 dB passes the sound as it is: with Movimiento at 0 nothing changes.
+struct MotionEq
+{
+    static constexpr int numBands = SampleData::Colour::numBands;
+    std::array<float, numBands> coef {}, db {}, a1 {}, a2 {}, a3 {}, m1 {};
+    std::array<std::array<float, numBands>, 2> ic1 {}, ic2 {};
+    int bands = 0;                      // the bands below the host's Nyquist
+    float q = 1.4142f, scale = 1.0f;
+    // The level kept: the power of the source's part before and after the bells, followed over some 300 ms, and the
+    // gain that brings the one back to the other (bells that overlap, gains clamped at 12 dB: asking for the shape
+    // alone is not enough to keep the level exactly).
+    float powerIn = 0.0f, powerOut = 0.0f, keep = 1.0f;
+
+    void prepare (double hostRate) noexcept
+    {
+        bands = 0;
+        for (int b = 0; b < numBands; ++b)
+        {
+            const double fc = SampleData::Colour::lowestHz * std::exp2 ((double) b);
+            if (fc < 0.45 * hostRate)
+            {
+                coef[(size_t) b] = (float) std::tan (juce::MathConstants<double>::pi * fc / hostRate);
+                bands = b + 1;
+            }
+        }
+        // Neighbouring octave bells overlap: one dB asked of every band gives more than one (as in Impronta).
+        double sum = 0.0;
+        const double A = std::pow (10.0, 1.0 / 40.0);
+        for (int b = 0; b < numBands; ++b)
+        {
+            const double w = std::exp2 ((double) (numBands / 2 - b)), re = 1.0 - w * w;
+            sum += 10.0 * std::log10 ((re * re + juce::square (w * A / q)) / (re * re + juce::square (w / (A * q))));
+        }
+        scale = (float) juce::jlimit (0.25, 1.0, 1.0 / std::max (1.0, sum));
+        reset();
+    }
+
+    void reset() noexcept
+    {
+        db.fill (0.0f);
+        powerIn = powerOut = 0.0f;
+        keep = 1.0f;
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            ic1[(size_t) ch].fill (0.0f);
+            ic2[(size_t) ch].fill (0.0f);
+        }
+        for (int b = 0; b < numBands; ++b)
+            set (b, 0.0f);
+    }
+
+    bool engaged() const noexcept
+    {
+        for (int b = 0; b < bands; ++b)
+            if (db[(size_t) b] != 0.0f)
+                return true;
+        return false;
+    }
+
+    void set (int b, float gainDb) noexcept
+    {
+        const float A = std::pow (10.0f, gainDb / 40.0f), g = coef[(size_t) b];
+        const float k = 1.0f / (q * A);
+        a1[(size_t) b] = 1.0f / (1.0f + g * (g + k));
+        a2[(size_t) b] = g * a1[(size_t) b];
+        a3[(size_t) b] = g * a2[(size_t) b];
+        m1[(size_t) b] = k * (A * A - 1.0f);
+    }
+
+    float tick (int ch, float x) noexcept
+    {
+        for (int b = 0; b < bands; ++b)
+        {
+            auto& s1 = ic1[(size_t) ch][(size_t) b];
+            auto& s2 = ic2[(size_t) ch][(size_t) b];
+            const float v3 = x - s2;
+            const float v1 = a1[(size_t) b] * s1 + a2[(size_t) b] * v3;
+            const float v2 = s2 + a2[(size_t) b] * s1 + a3[(size_t) b] * v3;
+            s1 = 2.0f * v1 - s1;
+            s2 = 2.0f * v2 - s2;
+            x += m1[(size_t) b] * v1;
+        }
+        return x;
+    }
+};
+
 float lfoValue (int shape, double phase, float sampleHold) noexcept
 {
     const float ph = (float) phase;
@@ -432,6 +589,20 @@ float lfoValue (int shape, double phase, float sampleHold) noexcept
 }
 
 // Detected model, measured envelope, or a geometric blend of both ("Aplanar").
+// The model of the sample's envelope where the envelope asked for is divided by it, below -60 dB: the stored model
+// (and blendDenominator) stop at -60 dB, the envelope asked for does not, and on a slow, curved rise (a riser of 4 s,
+// a kettle coming to the boil) the ratio of the two fell to nothing: the note was silent for its first 0.3 to 0.5 s
+// (-120 dB where the sample is at -56). With nothing flattened, under the floor the model's own value is used, so that
+// the envelope the sample has divided by its own model is 1 there too. Above the floor nothing changes.
+// Only while the key is held: after it, the release's fall is in the envelope asked for, and divided by a model
+// under the floor it would come back to 1 (the tail would not fade).
+inline float modelBelowFloor (const SampleData& s, double pos, float den, float flatten, bool released) noexcept
+{
+    if (released || flatten > 0.001f || den > 1.0001e-3f)
+        return den;
+    return std::max (1.0e-9f, std::min (den, s.modelAt (pos)));
+}
+
 inline float blendDenominator (float model, float env, float flatten) noexcept
 {
     model = std::max (1.0e-3f, model);
@@ -1145,6 +1316,7 @@ struct CloudSettings
     float pitchSpread = 0.0f;       // semitones, either side
     float reverseChance = 0.0f;
     float width = 0.0f;
+    double period = 0.0;            // Coherente (engine E): the note's period in samples of the sample; 0 off
 };
 
 struct GranularCloud
@@ -1153,6 +1325,7 @@ struct GranularCloud
     std::array<Grain, 64> grains {};
     std::uint64_t live = 0;         // bit i set: grains[i] sounds (visited in slot order, the free ones skipped)
     double untilNext = 0.0;
+    double reading = -1.0;          // Coherente: a reading of the sample that never jumps; grains start in phase with it
     alignas (16) float coefs[SincTable::maxTaps] {};
 
     static int lowestBit (std::uint64_t m) noexcept
@@ -1172,6 +1345,7 @@ struct GranularCloud
             g.active = false;
         live = 0;
         untilNext = 0.0;
+        reading = -1.0;
     }
 
     void spawn (double pos, double step, int len, float pan) noexcept
@@ -1194,19 +1368,37 @@ struct GranularCloud
         const auto& win = hann();
 
         // Unrelated grains add up in power; a Hann window keeps 3/8 of it.
-        const float norm = 1.0f / std::sqrt (0.375f * (float) std::max (1.0, c.size / c.interval));
+        float norm = 1.0f / std::sqrt (0.375f * (float) std::max (1.0, c.size / c.interval));
+        // Coherente: grains a whole number of periods from a reading that never jumps, born at even intervals (a
+        // whole number of them in a grain): they add up in phase, their windows to a steady 1/2 per grain. Placed
+        // anywhere, grains of a note cancel each other by chance, and the more the lower it is: a bass of 55 Hz
+        // came out 9 dB over its own noise, and its pitch wandered by a semitone.
+        const bool coherent = c.period > 1.0;
+        double interval = c.interval;
+        if (coherent)
+        {
+            const double perGrain = std::max (2.0, std::round (c.size / c.interval));
+            interval = c.size / perGrain;
+            norm = (float) (2.0 / perGrain);
+            if (reading < 0.0)
+                reading = centre;
+        }
 
         for (int i = 0; i < num; ++i)
         {
             if ((untilNext -= 1.0) <= 0.0)
             {
-                const double pos = centre + c.spray * (rng.nextDouble() * 2.0 - 1.0);
+                double pos = centre + c.spray * (rng.nextDouble() * 2.0 - 1.0);
                 double grainStep = step * std::exp2 (c.pitchSpread * (rng.nextFloat() * 2.0f - 1.0f) / 12.0f);
                 const bool backwards = rng.nextFloat() < c.reverseChance;
+                if (coherent && ! backwards && c.pitchSpread <= 0.0f)
+                    pos = reading + std::round ((pos - reading) / c.period) * c.period;
                 spawn (backwards ? pos + grainStep * c.size : pos, backwards ? -grainStep : grainStep, c.size,
                        c.width * (rng.nextFloat() * 2.0f - 1.0f));
-                untilNext += c.interval * (0.75 + 0.5 * rng.nextDouble());
+                untilNext += coherent ? interval : interval * (0.75 + 0.5 * rng.nextDouble());
             }
+            if (coherent)
+                reading += step;
 
             float l = 0.0f, r = 0.0f;
             for (auto m = live; m != 0; m &= m - 1)
@@ -1241,6 +1433,7 @@ public:
     Voice (SynthEngine& e, int index) : engine (e), rng (0x5eed + index), noise (0xfeed + index)
     {
         mech.seed (0x3c4a + index);
+        windowCuts.reserve ((size_t) SynthEngine::maxBeatCuts + 1);
     }
 
     void prepare (double sr)
@@ -1248,9 +1441,13 @@ public:
         hostRate = sr;
         filter.prepare (sr);
         mech.prepare (sr);
+        motion.prepare (sr);
     }
 
     bool isActive() const noexcept { return active; }
+    // The modulation of this note's last block, and when it started (the newest note's is shown on the knobs).
+    float modulationOf (int dst) const noexcept { return mod[(size_t) dst]; }
+    juce::uint32 startOrder() const noexcept { return order; }
     bool isReleased() const noexcept { return released; }
     bool isFading() const noexcept { return fading; }
     int getNote() const noexcept { return note; }
@@ -1270,7 +1467,7 @@ public:
         // LOOP: where it really reads (a slice: inside its slice; Normal: the loop's time line). The sampler's
         // own reading position stays at its start there: the playhead used to sit on the first slice.
         if (looping)
-            return slicing ? (loopRead < sliceTo ? (float) loopRead : -1.0f) : (float) loopTime;
+            return slicing ? (loopRead < sliceTo ? (float) loopRead : -1.0f) : (float) (loopTime + loopWinStart);
         if (drone != nullptr)
             return (float) drone->position();
         const auto& ln = lanes[0];
@@ -1300,6 +1497,15 @@ public:
 
     void start (const SampleData& s, const ParamSnapshot& p, int newNote, float vel, float fromPitch, juce::uint32 newOrder)
     {
+        // Each note's chance (grains, noise, Drone's phases, Mecanismo) from a seed of its own: drawn from the
+        // engine's sequence (a different one for every note), or in the tests from its key alone, so that a note
+        // sounds the same alone or among others. Before, each voice went on with its own sequence from note to
+        // note: what a note got depended on what that voice had played before, and a voice disturbed by another
+        // could not be told from chance (ReanimaAudit estres).
+        const juce::int64 seed = engine.keySeeds.load (std::memory_order_relaxed) ? (juce::int64) newNote * 0x9e3779b9LL + 17 : engine.rng.nextInt64();
+        rng.setSeed (seed);
+        noise.seed (seed ^ 0x6a09e667LL);
+        mech.seed (seed ^ 0x3c6ef372LL);
         active = true;
         onPrevious = false;
         released = pedalHeld = fading = false;
@@ -1339,10 +1545,13 @@ public:
             const bool retrig = p[(size_t) (P::Lfo1Rate + l * P::lfoStride + 4)] > 0.5f;
             lfoPhase[(size_t) l] = retrig ? 0.0 : engine.globalLfoPhase[(size_t) l];
             lfoHold[(size_t) l] = retrig ? rng.nextFloat() * 2.0f - 1.0f : engine.globalSampleHold[(size_t) l];
+            drift[(size_t) l].start (rng.getSeed() * 31 + l * 7919 + 1);       // reads the seed, draws nothing
+            lfoFresh[(size_t) l] = true;
         }
 
         mod.fill (0.0f);
         filter.reset();
+        motion.reset();
         tilt.reset();
         noise.reset();
         mech.reset();
@@ -1358,7 +1567,7 @@ public:
             {
                 const float f = std::max (1.0f, pm.freq[(size_t) ref * pm.numPartials + k]);
                 brightness[(size_t) k] = juce::jlimit (0.0f, 5.0f, std::log2 (f / pm.refFreq));
-                Dsp::panGains (pm.pan[(size_t) k], partialPanL[(size_t) k], partialPanR[(size_t) k]);
+                pm.gains (k, partialPanL[(size_t) k], partialPanR[(size_t) k]);
             }
             for (int b = 0; b < SampleData::PartialModel::numBands; ++b)
             {
@@ -1377,7 +1586,7 @@ public:
         startFadeStep = 1.0f / (0.002f * (float) hostRate);
 
         const double bedLength = std::max (1, s.bedBright.length);
-        const bool granular = (int) p[P::Engine] == P::EngineGranular;
+        const bool granular = playingEngine (s, p) == P::EngineGranular;
 
         // Detuned lanes also start apart. In tune that would only comb-filter the sound.
         const double laneSpread = numLanes > 1 ? 0.002 * s.sampleRate * laneIndependence (p) : 0.0;
@@ -1406,7 +1615,7 @@ public:
             ln.cloud.reset();
             if (granular)
             {
-                ln.pos = juce::jlimit (0.0, (double) s.length - 1.0, s.soundingPosition (p[P::GrainPos] + mod[P::DstStart]));
+                ln.pos = juce::jlimit (0.0, (double) s.length - 1.0, s.readingPosition (p[P::GrainPos] + mod[P::DstStart]));
                 ln.levelGain = levelFor (s, ln.pos);
             }
             ln.amp.fill (0.0f);
@@ -1421,6 +1630,8 @@ public:
         // before its first frame is ready.
         releaseDrone();
         loopTime = loopRead = loopFadeRead = 0.0;
+        loopWinStart = loopWinLength = 0;
+        windowOut = 0.0f;
         stretcherPrimed = false;
         sliceFrom = sliceTo = 0.0;
         looping = (int) p[P::PlayMode] == P::PlayLoop;
@@ -1432,6 +1643,9 @@ public:
         sliceGate = p[P::LoopHitEnv] > 0.5f;
         hitT = 0.0;
         hitFrom = 0.0f;
+        hitStrength = 1.0f;
+        hitStrikePending = false;
+        perHitTimbre = false;
         lastTimeStep = 0.0;
         stretchMix = 0.0f;
         plainPos = 0.0;
@@ -1457,13 +1671,13 @@ public:
         loopSlice = -1;
         loopFadeGain = 0.0f;
         loopWarp.reset();
-        if ((int) p[P::Engine] == P::EngineDrone && (int) p[P::PlayMode] != P::PlayLoop)
+        if (playingEngine (s, p) == P::EngineDrone && (int) p[P::PlayMode] != P::PlayLoop)
         {
             drone = engine.acquireDrone();
             if (drone != nullptr)
             {
                 const auto d = droneSettings (s, p);
-                const double from = s.soundingPosition (p[P::GrainPos] + mod[P::DstStart]);
+                const double from = s.readingPosition (p[P::GrainPos] + mod[P::DstStart]);
                 drone->start (juce::jlimit (d.regionStart, d.regionEnd - 1.0, from), d.order,
                               std::max ((1 << d.order) / 4, 2 * engine.lastBlock), rng.nextInt64());
             }
@@ -1561,10 +1775,10 @@ public:
                                p[P::AmpS], hold ? 0.0f : p[P::AmpFade], std::max (1.0e-3f, p[P::AmpR] * 0.001f) };
         // LOOP: the loop player instead of the engine; the envelope is a gate (Ataque and Release its fades).
         const bool looping = (int) p[P::PlayMode] == P::PlayLoop && s.length > 0;
-        const int engineMode = (int) p[P::Engine];
+        const int engineMode = playingEngine (s, p);
         const bool rebuild = ! looping && engineMode == P::EngineRebuild && s.bedBright.length > 0;
         // Sintetizador: the sample is flattened into a steady tone and the ADSR shapes it from zero.
-        const bool synth = ! looping && (int) p[P::EnvMode] == P::EnvSynth && engineMode <= P::EngineHybrid;
+        const bool synth = ! looping && (int) p[P::EnvMode] == P::EnvSynth && (int) p[P::Engine] <= P::EngineHybrid;
         const float flatten = synth ? 1.0f : p[P::Flatten];
         const bool untouched = rebuild && ! synth && matchesSample (s, user, hold);
         const bool resynth = ! looping && engineMode == P::EngineResynth && s.partials.valid();
@@ -1577,8 +1791,12 @@ public:
         const float e2Rcoef = std::exp (-6.9f * (float) dt / std::max (1.0e-3f, p[P::E2R] * 0.001f));
         const float e2S = p[P::E2S];
         const bool perHit = looping && p[P::LoopHitEnv] > 0.5f;
+        perHitTimbre = false;
         if (! perHit)
+        {
             std::fill (hitArr.begin(), hitArr.begin() + num, false);
+            hitStrikePending = false;
+        }
 
         // A reshaped note may be sustaining what the sample never did, so it gets a real fade
         // even when the detected release is that of a short hit.
@@ -1604,7 +1822,14 @@ public:
             // Decay to Sustain as on a note. Normal: the hits are the cuts the loop's time line crosses in this
             // block; Slice: the slice is the hit, its note the envelope.
             const int cuts = slicing ? 0 : engine.sliceCount();
-            const int length = std::max (1, s.loopInfo.length > 0 ? std::min (s.loopInfo.length, s.length) : s.length);
+            // The hits of the part that plays (Ventana): its cuts, counted from its start.
+            const auto window = SynthEngine::loopWindow (s, p);
+            const int length = window.length;
+            const auto cutAt = [&] (int k)
+            {
+                const int c = engine.cutPoints[(size_t) k].load (std::memory_order_relaxed) - window.start;
+                return c > 0 && c < length ? c : -1;
+            };
             double pos = loopTime;
             double next = -1.0;
             if (cuts > 1 && lastTimeStep > 0.0)
@@ -1612,7 +1837,7 @@ public:
                 next = length;      // the next round's first cut (0)
                 for (int k = 0; k < cuts; ++k)
                 {
-                    const int c = engine.cutPoints[(size_t) k].load (std::memory_order_relaxed);
+                    const int c = cutAt (k);
                     if (c > pos)
                     {
                         next = c;
@@ -1629,12 +1854,14 @@ public:
                     if (pos >= next)
                     {
                         hit = true;
+                        hitStrength = strengthOfHit (s, window.start + (next >= length ? 0 : (int) next));
+                        hitStrikePending = true;
                         if (next >= length)
                             pos -= length;
                         next = length;
                         for (int k = 0; k < cuts; ++k)
                         {
-                            const int c = engine.cutPoints[(size_t) k].load (std::memory_order_relaxed);
+                            const int c = cutAt (k);
                             if (c > pos)
                             {
                                 next = c;
@@ -1655,6 +1882,11 @@ public:
                 relArr[(size_t) i] = 1.0f;
                 envelopeLevel = level;
             }
+            // TIMBRE follows the same hits: where this hit's envelope is (rising through Ataque, or fallen towards
+            // Sustain) and how strong it was.
+            perHitTimbre = true;
+            hitAttackLevel = hitT < user.attack ? std::max (1.0e-3f, (float) (hitT / user.attack)) : 1.0f;     // how far through Ataque
+            hitFall = hitT >= user.attack && user.sustain < 0.999f ? juce::jlimit (0.0f, 1.0f, (1.0f - envelopeLevel) / (1.0f - user.sustain)) : 0.0f;
         }
         else if (looping)
         {
@@ -1667,10 +1899,20 @@ public:
         }
         else
         {
+            // Engine F with the envelope the sample was found to have: a drone holds while the key is down, at the
+            // level of the part of the sample that sounds (no lower than its sustain). A hit's own decay closed
+            // before the drone's first frame sounded (0.17 s in), and F was silent on kicks, snares and claps.
+            // Any other envelope shapes it as set.
+            AdsrShape shape = user;
+            if (engineMode == P::EngineDrone && matchesSample (s, user, hold))
+            {
+                shape.sustain = std::max (user.sustain, s.meanLevel);
+                shape.fadeDbPerSec = 0.0f;
+            }
             for (int start = 0; start < num; start += controlBlock)
             {
                 const int count = std::min (controlBlock, num - start);
-                const float next = user.heldLevel (t + (start + count - 1) * dt);
+                const float next = shape.heldLevel (t + (start + count - 1) * dt);
                 for (int i = 0; i < count; ++i)
                 {
                     uArr[(size_t) (start + i)] = envelopeLevel + (next - envelopeLevel) * (float) (i + 1) / (float) count;
@@ -1737,7 +1979,7 @@ public:
         }
         else
         {
-            alive = renderSampled (s, p, num, hold || synth, flatten, breath);
+            alive = renderSampled (s, p, num, user, hold || synth, flatten, breath);
             synthetic = lanes[0].srcMix;
         }
 
@@ -1918,7 +2160,7 @@ private:
     {
         const float detune = detuneCents (p, mod[P::DstDetune]) * offset;
         const float semis = pitch + p[P::Transpose] + (p[P::Fine] + detune + variationCents) * 0.01f
-                          + engine.pitchBend * p[P::BendRange] + mpeBend() + vibrato + pitchEnv + mod[P::DstPitch] * 24.0f - rootPitch (s, p);
+                          + engine.pitchBend * p[P::BendRange] + mpeBend() + vibrato + pitchEnv + (mod[P::DstPitch] * 24.0f + mod[P::DstFine]) - rootPitch (s, p);
         return std::exp2 (semis / 12.0) * s.sampleRate / hostRate;
     }
 
@@ -2012,6 +2254,10 @@ private:
         c.pitchSpread = p[P::GrainPitch];
         c.reverseChance = p[P::GrainReverse];
         c.width = p[P::GrainWidth];
+        // Coherente, and by itself on a low note (under 150 Hz): placed at random, grains of a sub cancel each
+        // other and it sounds rough (heard on a sub-bass loop).
+        const bool low = s.pitched && s.period > 1.0 && s.sampleRate / s.period < 150.0;
+        c.period = (p[P::GrainCoherent] > 0.5f || low) && s.pitched && s.period > 1.0 ? s.period : 0.0;
         return c;
     }
 
@@ -2025,6 +2271,20 @@ private:
         c.pitchSpread = 0.1f;
         c.width = 0.6f;
         return c;
+    }
+
+    // The engine a note plays. E and F make a texture out of the sample; out of a sound shorter than a grain (a
+    // hi-hat of 25 ms against grains of 80 ms) or a low hit with nothing held after it (a kick), what came out was
+    // silence, or, made to sound, a stutter and a smeared rumble (judged by ear on 2026-11-22). Those play the hit
+    // as engine A does.
+    static int playingEngine (const SampleData& s, const ParamSnapshot& p) noexcept
+    {
+        const int chosen = (int) p[P::Engine];
+        if (chosen != P::EngineGranular && chosen != P::EngineDrone)
+            return chosen;
+        const bool lowHit = s.excitation.sustain < 0.3f && s.excitation.lowShare > 0.5f;
+        const bool shorterThanGrain = chosen == P::EngineGranular && (s.usableEnd - s.onset) / s.sampleRate < p[P::GrainMs] * 0.001f;
+        return lowHit || shorterThanGrain ? (int) P::EngineRebuild : chosen;
     }
 
     static float levelFor (const SampleData& s, double pos) noexcept
@@ -2462,8 +2722,13 @@ private:
     //--------------------------------------------------------------------------
     // Engines B and D: the sample read by grains (stretched by the envelope), then a
     // sustain source (loop / granular / freeze) once the sustain region is reached.
-    bool renderSampled (const SampleData& s, const ParamSnapshot& p, int num, bool hold, float flatten, float breath)
+    bool renderSampled (const SampleData& s, const ParamSnapshot& p, int num, const AdsrShape& user, bool hold, float flatten, float breath)
     {
+        // With the envelope the sample was found to have (nothing flattened, nothing held): past the attack, where the
+        // fitted model has died away (under -60 dB) but the file goes on (a stem whose next hits come after the first
+        // one's decay, a tail longer than its fit), the file plays as it is. The envelope over the model was 0 over 0
+        // there, and the note fell silent after its first hit: a clap stem lost every clap but the first.
+        const bool asRecorded = flatten <= 0.001f && matchesSample (s, user, hold);
         const bool stretch = p[P::Stretch] > 0.5f;
         const float userA = std::max (1.0e-4f, p[P::AmpA] * 0.001f), userD = std::max (1.0e-3f, p[P::AmpD] * 0.001f);
         const double kA = stretch ? (double) s.detected.attack / userA : 1.0;
@@ -2486,6 +2751,14 @@ private:
         const float srcRamp = (float) (1.0 / (std::max (0.01f, p[P::GrainFade] * 0.001f) * hostRate));
         const float srcTarget = juce::jlimit (0.0f, 1.0f, p[P::GrainBlend]);
         const float granSpeed = p[P::GranSpeed];
+        // Movimiento: the source's part kept apart to be coloured (applyMotion), also while it fades back to flat.
+        const float motionAmount = juce::jlimit (0.0f, 1.0f, p[P::SustainMotion]);
+        const bool moving = hasSource && s.colour.valid() && (motionAmount > 0.0f || motion.engaged());
+        if (moving)
+        {
+            std::fill (srcL.begin(), srcL.begin() + num, 0.0f);
+            std::fill (srcR.begin(), srcR.begin() + num, 0.0f);
+        }
 
         // Sostenido enters the source at the sustain point; Natural lets the original
         // play to the end of its region and hands over during the last 150 ms.
@@ -2497,6 +2770,10 @@ private:
         const auto rawSource = warpSourceOf (s.audio, s.length, false, warpAttackEnd (s), 1.0f / (0.01f * (float) hostRate));
         const auto loopSource = warpSourceOf (src.loop, std::max (1, loopLen), true);
         const auto freezeSource = warpSourceOf (src.freeze, std::max (1, freezeLen), true);
+        // As recorded, past the end of a sound that ends inside the file: falling at the rate it ended at (the
+        // sustain source went on for a second, at -12 dB on a kick, where the file and engine A are silent). From the
+        // moment the file is 60 dB under its loudest: before that, what was there is untouched.
+        const float endFall = asRecorded ? s.endFallDbPerSec : 0.0f;
 
         for (int k = 0; k < numLanes; ++k)
         {
@@ -2525,6 +2802,7 @@ private:
             {
                 const float u = uArr[(size_t) i];
                 float l = 0.0f, r = 0.0f;
+                float ml = 0.0f, mr = 0.0f;         // the source's part, under Movimiento
                 ln.grainCoh += grainCohStep;
                 ln.srcCoh += srcCohStep;
                 const float grainCoherence = ln.grainCoh, sourceCoherence = ln.srcCoh;
@@ -2542,8 +2820,8 @@ private:
                     }
                     else
                         ln.grains.tick (s, ln.pos, ln.step, grainLen, period, wantEnv, powerCoef, bl, br, dm, de);
-                    const float den = blendDenominator (dm, de, flatten);
-                    ln.ratio = u / den;
+                    const float den = modelBelowFloor (s, ln.pos, blendDenominator (dm, de, flatten), flatten, released);
+                    ln.ratio = asRecorded && ln.seg != SegAttack && dm <= 1.0001e-3f ? relArr[(size_t) i] : u / den;
                     // Where the sample is louder than its model (a hit, a bump) it is not raised
                     // over the curve: the boost is only for what the sample lacks, as in engine A.
                     const float limit = std::max (1.0f, u / de);
@@ -2593,14 +2871,24 @@ private:
                         ln.ratio = ratio;
                     // Never above the curve: the loop's own level says how far it can be raised.
                     const float g = std::min ({ maxBoost, ratio, std::max (1.0f, u / src.level) }) * breathGain * std::sin (ln.srcMix * pi * 0.5f);
-                    l += xl * g;
-                    r += xr * g;
+                    if (moving)
+                    {
+                        ml = xl * g;
+                        mr = xr * g;
+                    }
+                    else
+                    {
+                        l += xl * g;
+                        r += xr * g;
+                    }
                 }
 
                 const float w = wTrans[(size_t) i];
                 if (w > 0.0f)
                 {
                     const float tg = w * transGain * relArr[(size_t) i];
+                    ml *= 1.0f - w;
+                    mr *= 1.0f - w;
                     if (wp.on)
                     {
                         ln.warpTrans.tick (rawSource, ln.transPos, wp.timeStep, warpRatio, wp.cycles, &s.marks, (s.pitched ? s.cycle : 0.0), wp.textureLen, wp.power, warped);
@@ -2629,15 +2917,110 @@ private:
                 if (ln.seg == SegSustain)
                     ln.srcMix += juce::jlimit (-srcRamp, srcRamp, srcTarget - ln.srcMix);
 
+                if (endFall > 0.0f && ln.pos > s.soundEnd)
+                {
+                    const float past = dbToGain (-endFall * (float) ((ln.pos - s.soundEnd) / s.sampleRate));
+                    l *= past;
+                    r *= past;
+                    ml *= past;
+                    mr *= past;
+                    if (past < 1.0e-5f)
+                        ln.done = true;
+                }
+
                 bufL[(size_t) i] += l * ln.gainL;
                 bufR[(size_t) i] += r * ln.gainR;
+                if (moving)
+                {
+                    srcL[(size_t) i] += ml * ln.gainL;
+                    srcR[(size_t) i] += mr * ln.gainR;
+                }
             }
 
             if (ln.seg != SegSustain && ln.pos > s.length + grainLen * ln.step && ln.transPos > s.length)
                 ln.done = true;
         }
 
+        if (moving)
+            applyMotion (s, p, num, hold, motionAmount);
         return anyAlive;
+    }
+
+    // Movimiento: the colour the sample had where the note is now (the first lane's place in it, which goes on moving
+    // through the sustain as if the original were still playing; held on its last clear frame past it), against the
+    // colour of the source that holds the note, as gains of MotionEq on the source's part, which is then added in.
+    void applyMotion (const SampleData& s, const ParamSnapshot& p, int num, bool hold, float amount) noexcept
+    {
+        using C = SampleData::Colour;
+        const auto& c = s.colour;
+        const auto& ln = lanes[0];
+        const auto& source = hold ? c.early : c.late;
+        const double frame = juce::jlimit (0.0, (double) c.lastGood, ln.pos / (double) c.hop);
+        const int f0 = (int) frame, f1 = std::min (c.lastGood, f0 + 1);
+        const float fr = (float) (frame - f0);
+        // In with the hand-over: nothing before the source is heard.
+        const float handover = juce::jlimit (0.0f, 1.0f, ln.srcMix / std::max (0.05f, p[P::GrainBlend]));
+
+        std::array<float, C::numBands> diff {};
+        std::array<bool, C::numBands> valid {};
+        float topOrig = -300.0f, topSource = -300.0f;
+        for (int b = 0; b < motion.bands; ++b)
+        {
+            const float o = c.db[(size_t) f0 * C::numBands + (size_t) b]
+                          + fr * (c.db[(size_t) f1 * C::numBands + (size_t) b] - c.db[(size_t) f0 * C::numBands + (size_t) b]);
+            diff[(size_t) b] = o - source[(size_t) b];
+            topOrig = std::max (topOrig, o);
+            topSource = std::max (topSource, source[(size_t) b]);
+        }
+        // Only bands both have (within 60 dB of their loudest): the rest is noise, or nothing to colour.
+        double weighted = 0.0, weights = 0.0;
+        for (int b = 0; b < motion.bands; ++b)
+        {
+            const float o = diff[(size_t) b] + source[(size_t) b];
+            valid[(size_t) b] = o > topOrig - 60.0f && source[(size_t) b] > topSource - 60.0f;
+            if (valid[(size_t) b])
+            {
+                const double w = std::pow (10.0, (source[(size_t) b] - topSource) / 10.0);
+                weights += w;
+                weighted += w * std::pow (10.0, diff[(size_t) b] / 10.0);
+            }
+        }
+        const float level = weights > 0.0 ? (float) (10.0 * std::log10 (weighted / weights)) : 0.0f;
+
+        const float follow = 1.0f - std::exp (-(float) num / (0.08f * (float) hostRate));
+        for (int b = 0; b < motion.bands; ++b)
+        {
+            const float target = valid[(size_t) b] ? juce::jlimit (-12.0f, 12.0f, diff[(size_t) b] - level) * amount * handover * motion.scale
+                                                   : 0.0f;
+            auto& d = motion.db[(size_t) b];
+            d += (target - d) * follow;
+            if (std::abs (d) < 1.0e-3f && std::abs (target) < 1.0e-3f)
+                d = 0.0f;
+            motion.set (b, d);
+        }
+        double in = 0.0, out = 0.0;
+        for (int i = 0; i < num; ++i)
+        {
+            const float l = srcL[(size_t) i], r = srcR[(size_t) i];
+            in += (double) l * l + (double) r * r;
+            srcL[(size_t) i] = motion.tick (0, l);
+            srcR[(size_t) i] = motion.tick (1, r);
+            out += (double) srcL[(size_t) i] * srcL[(size_t) i] + (double) srcR[(size_t) i] * srcR[(size_t) i];
+        }
+        const float powerCoef = 1.0f - std::exp (-(float) num / (0.3f * (float) hostRate));
+        motion.powerIn += ((float) (in / num) - motion.powerIn) * powerCoef;
+        motion.powerOut += ((float) (out / num) - motion.powerOut) * powerCoef;
+        const float target = motion.engaged() && motion.powerOut > 1.0e-14f
+                           ? juce::jlimit (0.25f, 4.0f, std::sqrt ((motion.powerIn + 1.0e-20f) / (motion.powerOut + 1.0e-20f)))
+                           : 1.0f;
+        const float from = motion.keep, step = (target - from) / (float) num;
+        for (int i = 0; i < num; ++i)
+        {
+            const float g = from + step * (float) (i + 1);
+            bufL[(size_t) i] += srcL[(size_t) i] * g;
+            bufR[(size_t) i] += srcR[(size_t) i] * g;
+        }
+        motion.keep = target;
     }
 
     //--------------------------------------------------------------------------
@@ -2647,7 +3030,8 @@ private:
                         float flatten, float bow, float breath, float relPhase)
     {
         const auto& pm = s.partials;
-        const int K = std::min ({ maxPartials, pm.numPartials, juce::roundToInt (p[P::Partials]) });
+        // (Parciales counts a side's: a model of the two sides apart has twice as many to play)
+        const int K = std::min ({ maxPartials, pm.numPartials, juce::roundToInt (p[P::Partials]) * (pm.split ? 2 : 1) });
         const bool stretch = p[P::Stretch] > 0.5f;
         const double kA = stretch ? (double) s.detected.attack / user.attack : 1.0;
         const double kD = stretch ? (double) s.detected.decay / user.decay : 1.0;
@@ -2660,6 +3044,12 @@ private:
         const float nyquistGuard = 0.45f * (float) hostRate;
         const auto wp = warpPlan (s, p);
         const auto rawSource = warpSourceOf (s.audio, s.length, false, warpAttackEnd (s), 1.0f / (0.01f * (float) hostRate));
+        const bool asRecorded = flatten <= 0.001f && matchesSample (s, user, hold);
+        // As recorded, past the end of a sound that ends inside the file, the partials and the noise also fall at the
+        // rate it ended at (they went on at their own slow decay, at -8 dB on a kick 20 ms after the file falls
+        // silent). From where the file's sound ends, not from the model's last frame: that can come first, and a
+        // bass then fell silent where the file still sounds at -33 dB.
+        const float endFall = asRecorded ? s.endFallDbPerSec : 0.0f;
 
         for (int k = 0; k < numLanes; ++k)
         {
@@ -2697,10 +3087,19 @@ private:
             const float frac = beyond ? 0.0f : (float) (fp - f0);
             const float beyondSeconds = beyond ? (float) ((ln.pos - (double) pm.lastFrame * pm.hop) / s.sampleRate) : 0.0f;
             const int fBase = beyond ? pm.lastFrame : f0;
+            const float pastEndDb = beyond && endFall > 0.0f ? endFall * (float) std::max (0.0, (ln.pos - s.soundEnd) / s.sampleRate) : 0.0f;
 
             const float measured = std::max (1.0e-3f, s.envAt (ln.pos));
             const float den = blendDenominator (s.modelFast (ln.pos), measured, flatten);
-            const float ratio = std::min ({ maxBoost, uEnd / den, std::max (1.0f, uEnd / measured) });
+            // With the envelope the sample was found to have (and nothing flattened, nothing held), the partials and
+            // the noise play at the levels they were measured at, as engine A plays the sample untouched: dividing the
+            // envelope by its own model is 1, but the model is floored at -60 dB and the envelope is not, and on a
+            // slow, curved attack (a kettle coming to the boil: 5.5 s) the note was silent for its first half second
+            // (-113 dB where the sample is at -55). After the key is let go, the release's own fall.
+            // (Measured against the floor-only fix of engines B and D, modelBelowFloor: here this one keeps the
+            // transposed notes' tails and levels better, 35 tails longer otherwise; approved by ear on 2026-11-22.)
+            const float ratio = asRecorded ? (released ? relArr[(size_t) num - 1] : 1.0f)
+                                           : std::min ({ maxBoost, uEnd / den, std::max (1.0f, uEnd / measured) });
             ln.ratio = ratio;
             const float pitchRatio = (float) (ln.step * hostRate / s.sampleRate);
 
@@ -2716,14 +3115,24 @@ private:
             // The partials of this frame. Under Tonos each one takes the level the frame has at the
             // frequency it now sounds at, so the formants stay where they were.
             std::array<float, maxPartials> frameAmp {}, frameFreq {};
+            double holdPower = 0.0, nowPower = 0.0;         // past the end: the partials now against the last whole frame
             for (int q = 0; q < K; ++q)
             {
                 const size_t i0 = (size_t) fBase * pm.numPartials + q;
                 const size_t i1 = (size_t) f1 * pm.numPartials + q;
-                frameAmp[(size_t) q] = beyond ? pm.amp[i0] * dbToGain (-pm.decayDbPerSec[(size_t) q] * beyondSeconds)
+                frameAmp[(size_t) q] = beyond ? pm.amp[i0] * dbToGain (-pm.decayDbPerSec[(size_t) q] * beyondSeconds - pastEndDb)
                                               : pm.amp[i0] + frac * (pm.amp[i1] - pm.amp[i0]);
                 frameFreq[(size_t) q] = beyond ? pm.freq[i0] : pm.freq[i0] + frac * (pm.freq[i1] - pm.freq[i0]);
+                const float held = pm.amp[(size_t) pm.holdFrame * pm.numPartials + q];
+                holdPower += (double) held * held;
+                nowPower += (double) frameAmp[(size_t) q] * frameAmp[(size_t) q];
             }
+            // A file cut while it still sounds, held past its end (a note longer than it, or played higher so that
+            // it runs out sooner): the noise is the last whole frame's, falling with the partials. The last frames'
+            // windows hang over the end, and what the partials there leave out was taken for noise: a steady tone
+            // played an octave up turned into a breath 18 dB under its harmonics (the sample: 80 dB under).
+            const bool cutEnd = beyond && pm.holdFrame < pm.lastFrame;
+            const float noiseFall = cutEnd && holdPower > 1.0e-20 ? (float) std::sqrt (std::min (1.0, nowPower / holdPower)) : 1.0f;
             // The spectral envelope of this frame, drawn through its harmonics only (in log level):
             // a weak partial between them, or below the fundamental, must not take the level of the
             // strong one it lands next to.
@@ -2832,7 +3241,8 @@ private:
                 {
                     const float a0 = pm.noise[(size_t) fBase * nb + b];
                     const float a1 = pm.noise[(size_t) f1 * nb + b];
-                    const float base = beyond ? a0 * dbToGain (-std::max (3.0f, s.detected.fadeDbPerSec) * beyondSeconds)
+                    const float base = cutEnd ? pm.noise[(size_t) pm.holdFrame * nb + b] * noiseFall
+                                     : beyond ? a0 * dbToGain (-std::max (3.0f, s.detected.fadeDbPerSec) * beyondSeconds - pastEndDb)
                                               : a0 + frac * (a1 - a0);
                     bandAmps[(size_t) b] = base * ratio * noiseLevel * air * rateFix * std::exp (bandBrightness[(size_t) b] * darkExp);
                     energy += bandAmps[(size_t) b];
@@ -2890,7 +3300,7 @@ private:
     double loopStep (const SampleData& s, const ParamSnapshot& p) const
     {
         const float semis = pitch - (float) SynthEngine::rootKey + p[P::Transpose] + p[P::Fine] * 0.01f
-                          + engine.pitchBend * p[P::BendRange] + mpeBend() + vibrato + pitchEnv + mod[P::DstPitch] * 24.0f
+                          + engine.pitchBend * p[P::BendRange] + mpeBend() + vibrato + pitchEnv + (mod[P::DstPitch] * 24.0f + mod[P::DstFine])
                           + SynthEngine::snapShift (s, p[P::SnapC] > 0.5f);
         return std::exp2 (semis / 12.0) * s.sampleRate / hostRate;
     }
@@ -2950,7 +3360,8 @@ private:
     //    loop; its first few tens of milliseconds, before it has anything, come from the Textura reader and
     //    hand over in 10 ms.
     //  - (Tonal, the overlapping grains of earlier versions, is gone: it plays Complex. It stays only as the
-    //    first milliseconds of Complex and for a ninth note at once, when the eight stretchers are busy.)
+    //    first milliseconds of Complex, and for a note that starts before LOOP's stretchers exist: the moment after
+    //    LOOP is chosen. There is one per voice.)
     // At its own tempo and pitch it is the file as it is, whatever the algorithm. Without Warp it is a
     // classic sampler: a key up is faster.
     bool renderLoop (const SampleData& s, const ParamSnapshot& p, int num)
@@ -2961,8 +3372,51 @@ private:
         const float* b = buf.getReadPointer (std::min (1, buf.getNumChannels() - 1));
         if ((int) p[P::LoopKind] == P::LoopSlice)
             return renderSlice (s, p, num);
-        const int length = std::max (1, info.length > 0 ? std::min (info.length, s.length) : s.length);
-        const double loopBpm = loopTempo (s, p, length);
+        const int fullLength = std::max (1, info.length > 0 ? std::min (info.length, s.length) : s.length);
+        const double loopBpm = loopTempo (s, p, fullLength);
+        // Ventana: the part of the loop that plays is the loop now (its start the reading's 0, its cuts those in
+        // it). Moved or resized while playing: the old part fades out over 3 ms, then the new one is read from
+        // there, 3 ms faded in, the stretch started afresh (cut at once, a click: measured).
+        auto window = SynthEngine::loopWindow (s, p);
+        if (loopWinLength > 0 && (window.start != loopWinStart || window.length != loopWinLength) && windowOut < 1.0f)
+        {
+            window = { loopWinStart, loopWinLength, loopWinLength != fullLength };       // still the old part
+            const float stepOut = 1.0f / (float) std::max (1.0, 0.003 * hostRate);
+            for (int i = 0; i < num; ++i)
+                uArr[(size_t) i] *= std::max (0.0f, 1.0f - (windowOut + (float) (i + 1) * stepOut));
+            windowOut += (float) num * stepOut;
+        }
+        const int length = window.length;
+        if (window.on)
+        {
+            a += window.start;
+            b += window.start;
+        }
+        if (window.start != loopWinStart || window.length != loopWinLength)
+        {
+            windowOut = 0.0f;
+            if (loopWinLength > 0)
+            {
+                loopTime = std::fmod (loopTime, (double) length);
+                loopRead = loopTime;
+                plainPos = loopTime;
+                loopSlice = -1;
+                stretcherPrimed = false;
+                jumpFade = 0.0f;
+            }
+            loopWinStart = window.start;
+            loopWinLength = window.length;
+        }
+        const auto& allCuts = engine.beatSlices (s);
+        if (window.on)
+        {
+            windowCuts.clear();
+            windowCuts.push_back (0);
+            for (const int c : allCuts)
+                if (c > window.start && c < window.start + length && windowCuts.size() < windowCuts.capacity())
+                    windowCuts.push_back (c - window.start);
+        }
+        const auto& loopCuts = window.on ? windowCuts : allCuts;
         const bool warp = p[P::LoopWarp] > 0.5f;
         const bool follow = p[P::LoopSync] > 0.5f && engine.tempoKnown && loopBpm > 0.0;
         const double tempo = warp && follow ? engine.bpm / loopBpm : 1.0;
@@ -2998,10 +3452,11 @@ private:
             {
                 loopTime = loopRead = plainPos = target;
                 stretcherPrimed = false;
-                const int* sl = info.slices.empty() ? nullptr : info.slices.data();
+                const auto& beatCuts = loopCuts;
+                const int* sl = beatCuts.empty() ? nullptr : beatCuts.data();
                 if (sl != nullptr)
                 {
-                    const int ns = (int) info.slices.size();
+                    const int ns = (int) beatCuts.size();
                     loopSlice = juce::jlimit (0, ns - 1, (int) (std::upper_bound (sl, sl + ns, (int) target) - sl) - 1);
                     loopEnd = loopSlice + 1 < ns ? sl[loopSlice + 1] : length;
                     loopRise = 1.0f;
@@ -3066,6 +3521,7 @@ private:
             {
                 float l, r;
                 readBandLimitedWrap (a, b, loopRead, length, speed, loopCoefs, l, r);
+                jump (l, r);            // after the Ventana moved: 3 ms in (1 otherwise: nothing)
                 bufL[(size_t) i] += l * uArr[(size_t) i];
                 bufR[(size_t) i] += r * uArr[(size_t) i];
                 loopRead += speed;
@@ -3215,10 +3671,12 @@ private:
             {
                 engine.rubberWantTempo.store (tempo, std::memory_order_relaxed);
                 engine.rubberWantPitch.store (pitchRatio, std::memory_order_relaxed);
+                engine.rubberWantStart.store (window.start, std::memory_order_relaxed);
+                engine.rubberWantLength.store (length, std::memory_order_relaxed);
                 engine.rubberWanted.store (true, std::memory_order_release);
             }
             const auto* rr = engine.rubberReady.load (std::memory_order_acquire);
-            if (rr != nullptr && rr->sample == &s && rr->loopLength == length && std::abs (rr->tempo - tempo) < 1.0e-6
+            if (rr != nullptr && rr->sample == &s && rr->loopLength == length && rr->loopStart == window.start && std::abs (rr->tempo - tempo) < 1.0e-6
                 && std::abs (rr->pitch - pitchRatio) < 1.0e-6)
                 rendered = rr;
             algo = bungeeRange ? P::LoopComplex : P::LoopComplexPro;      // what plays until (or besides) it
@@ -3300,45 +3758,64 @@ private:
         {
             auto& st = *stretcher;
             auto& ss = st.stretch;
-            ss.setTransposeFactor ((float) (pitchRatio * natural));
-            // Pro keeps the formants where they were in Hz: the stretch counts in cycles per sample, so the
-            // change of rate (a 44.1 kHz file at 48 kHz) is not a change of pitch to compensate. Measured on a
-            // 44.1 kHz loop with (1, true): -22 dB and a wrong partial at its own pitch.
-            ss.setFormantFactor (algo == P::LoopComplexPro ? (float) natural : 1.0f, algo == P::LoopComplexPro);
+            // The stretch is fed the loop at the host's rate (read band-limited from the file, as Bungee is), so
+            // that it sees only the tempo's stretch and the key's transposition. Fed at the file's rate, a 44.1 kHz
+            // loop in a 96 kHz project was a stretch of x2.18 to it at the loop's own tempo: over x2 Signalsmith
+            // turns to its random-phase mode (a seed of the system's, so not two renders alike), more diffuse.
+            // At the file's own rate it reads the file as before, sample for sample.
+            ss.setTransposeFactor ((float) pitchRatio);
+            // Pro keeps the formants where they were in Hz.
+            ss.setFormantFactor (1.0f, algo == P::LoopComplexPro);
             // Its envelope smoothed over 400 Hz: the pitch guess of a chord is no use, and with it (or 100-200 Hz) a
             // chord moved 5 semitones up came out 5-10 dB quieter. Measured on chords, pad, bass and pluck at
             // +5/-7: the 1-4 kHz band within 3 dB of the original on average (as Complex), 1-3 dB lower level.
             ss.setFormantBase (400.0f / (float) hostRate);
+            // from: in frames at the host's rate (frame j is the file's sample j * natural).
             const auto fill = [&] (double from, int count, size_t offset)
             {
                 for (int i = 0; i < count; ++i)
                 {
-                    int k = (int) std::fmod (from + i, (double) length);
-                    if (k < 0)
-                        k += length;
-                    st.in[0][offset + (size_t) i] = a[k];
-                    st.in[1][offset + (size_t) i] = b[k];
+                    float l, r;
+                    if (natural == 1.0)
+                    {
+                        int k = (int) std::fmod (from + i, (double) length);
+                        if (k < 0)
+                            k += length;
+                        l = a[k];
+                        r = b[k];
+                    }
+                    else
+                    {
+                        double x = std::fmod ((from + i) * natural, (double) length);
+                        if (x < 0.0)
+                            x += length;
+                        readBandLimitedWrap (a, b, x, length, natural, st.coefs, l, r);
+                    }
+                    st.in[0][offset + (size_t) i] = l;
+                    st.in[1][offset + (size_t) i] = r;
                 }
             };
+            const double framesPer = timeStep / natural;     // input frames per output sample: the tempo
+            const double framesInLoop = length / natural;
             if (! stretcherPrimed)
             {
                 // Fed ahead of the loop's time by what the stretch holds back, so that what comes out now is
                 // the loop at loopTime.
                 ss.reset();
                 const int seekLength = ss.seekLength();
-                stretcherFeed = loopTime + ss.inputLatency() + ss.outputLatency() * timeStep;
+                stretcherFeed = loopTime / natural + ss.inputLatency() + ss.outputLatency() * framesPer;
                 fill (stretcherFeed - seekLength, seekLength, 0);
                 const float* in[2] = { st.in[0].data(), st.in[1].data() };
-                ss.seek (in, seekLength, timeStep);
+                ss.seek (in, seekLength, framesPer);
                 stretcherPrimed = true;
                 stretcherAge = 0;
                 stretcherCarry = 0.0;
             }
-            stretcherCarry += num * timeStep;
+            stretcherCarry += num * framesPer;
             const int count = std::min ((int) st.in[0].size(), (int) stretcherCarry);
             stretcherCarry -= count;
             fill (stretcherFeed, count, 0);
-            stretcherFeed = std::fmod (stretcherFeed + count, (double) length);
+            stretcherFeed = std::fmod (stretcherFeed + count, framesInLoop);
             const float* in[2] = { st.in[0].data(), st.in[1].data() };
             float* out[2] = { st.out[0].data(), st.out[1].data() };
             ss.process (in, count, out, num);
@@ -3372,7 +3849,7 @@ private:
             loopRead = loopTime;
             return true;
         }
-        if (algo != P::LoopBeatsAlgo)       // Complex with no stretcher free (more than 8 notes): grains
+        if (algo != P::LoopBeatsAlgo)       // Complex before its stretchers exist (the moment LOOP is chosen): grains
         {
             const auto src = warpSourceOf (buf, length, true);
             float warped[WarpReader::Source::maxChannels] {};
@@ -3411,8 +3888,9 @@ private:
                 // Held 60 ms short of the next hit (Bungee's window reaches some 40 ms ahead; at 30 ms the tail came out
                 // 7 dB over the file's, part of the hit in it): the tail is what
                 // was there just before the hit, stretched over the gap.
-                const int* cuts = info.slices.empty() ? nullptr : info.slices.data();
-                const int count = (int) info.slices.size();
+                const auto& beatCuts = loopCuts;
+                const int* cuts = beatCuts.empty() ? nullptr : beatCuts.data();
+                const int count = (int) beatCuts.size();
                 int k = 0;
                 if (cuts != nullptr)
                     k = juce::jlimit (0, count - 1, (int) (std::upper_bound (cuts, cuts + count, (int) loopTime) - cuts) - 1);
@@ -3424,8 +3902,9 @@ private:
             }
         }
         static constexpr int whole[1] { 0 };       // a plain array: nothing made on the audio thread
-        const int* slices = info.slices.empty() ? whole : info.slices.data();
-        const int numSlices = info.slices.empty() ? 1 : (int) info.slices.size();
+        const auto& beatCuts = loopCuts;
+        const int* slices = beatCuts.empty() ? whole : beatCuts.data();
+        const int numSlices = beatCuts.empty() ? 1 : (int) beatCuts.size();
         const float fadeOut = (float) std::max (1.0, 0.004 * hostRate), rise = (float) std::max (1.0, 0.001 * hostRate);
         for (int i = 0; i < num; ++i)
         {
@@ -3506,7 +3985,13 @@ private:
                                 + p[P::RelDark] * (2.5f * synthetic * (1.0f - std::exp (-(float) t / 2.0f)) + 6.0f * relPhase)
                                 + p[P::VelBright] * 5.0f * (1.0f - std::min (1.0f, velocity / 0.8f))
                                 - 2.5f * pressing + std::max (0.0f, -timbreOct()) * 2.7f;    // MPE timbre below its middle: up to 4 octaves darker
-            tilt.set (20000.0f * std::exp2 (-std::max (0.0f, darkOct)), hostRate);
+            // Por golpe in a loop: the same, hit by hit. Arco while each hit rises through Ataque (as a slowed
+            // attack does to a note), Apagado as each falls towards Sustain (up to 2.5 octaves at Sustain, as the
+            // held part of a note), Brillo by each hit's strength (a weak one as a soft key).
+            const float perHitDark = perHitTimbre ? bow * 3.0f * -std::log2 (hitAttackLevel) + p[P::RelDark] * 2.5f * hitFall
+                                                        + p[P::VelBright] * 5.0f * (1.0f - std::min (1.0f, hitStrength / 0.8f))
+                                                  : 0.0f;
+            tilt.set (20000.0f * std::exp2 (-std::max (0.0f, darkOct + perHitDark)), hostRate);
         }
         else
             tilt.active = false;
@@ -3522,6 +4007,15 @@ private:
                         p[P::FltFreq] * std::exp2 (semis / 12.0f),
                         p[P::FltRes] + mod[P::DstRes], p[P::FltDrive] + 24.0f * mod[P::DstDrive],
                         p[P::FltMorph] + mod[P::DstMorph], p[P::FltMix]);
+            // Armónico: on the harmonics of the note that sounds now (bend, vibrato, glide and pitch modulation
+            // included), so that they stay on the sound's own as it moves.
+            if ((int) p[P::FltType] == P::Harmonic)
+            {
+                const float midi = soundingNote (s, p) + engine.pitchBend * p[P::BendRange] + mpeBend() + vibrato + pitchEnv
+                                 + mod[P::DstPitch] * 24.0f + mod[P::DstFine];
+                filter.setHarmonic (440.0f * std::exp2 ((midi - 69.0f) / 12.0f), p[P::FltHarmGain] + 24.0f * mod[P::DstDrive],
+                                    p[P::FltHarmRegion]);
+            }
         }
 
         const float folAtk = std::exp (-1.0f / (p[P::FltFolAtk] * 0.001f * (float) hostRate));
@@ -3556,6 +4050,13 @@ private:
         {
             mech.keyUp ((int) p[P::MechType], SynthEngine::mechanismAmount (p), s, mechNote (s, p, mechStart));
             keyUpPending = false;
+        }
+        // Mecanismo por golpe: a key strike at each hit of the loop (Por golpe), as strong as the hit.
+        if (hitStrikePending)
+        {
+            hitStrikePending = false;
+            if (perHitTimbre && p[P::MechPerHit] > 0.5f && SynthEngine::mechanismAmount (p) > 0.0f)
+                mech.keyDown ((int) p[P::MechType], SynthEngine::mechanismAmount (p) * std::max (0.25f, hitStrength), s, mechNote (s, p, loopRead + loopWinStart));
         }
         float toneEnergy = 0.0f;
         for (int i = 0; i < num; ++i)
@@ -3675,18 +4176,37 @@ private:
 
             const float rateMod = l == 0 ? mod[P::DstLfo1Rate] : (l == 1 ? mod[P::DstLfo2Rate] : 0.0f);
             const double rate = lfoRateHz (p, l, engine.bpm) * std::exp2 (4.0f * rateMod);
-            lfoOut[(size_t) l] = lfoValue (shape, lfoPhase[(size_t) l], lfoHold[(size_t) l]);
+            const float smooth = p[(size_t) base + 5];
+            auto& dr = drift[(size_t) l];
+            const float raw = shape == P::Drift ? dr.value (lfoPhase[(size_t) l], smooth)
+                                                : lfoValue (shape, lfoPhase[(size_t) l], lfoHold[(size_t) l]);
+            // Suavidad on the other shapes: a glide towards the wave, up to half a cycle long (corners and steps
+            // rounded off). At 0 the wave is as it always was.
+            if (shape != P::Drift && smooth > 0.0f && ! lfoFresh[(size_t) l] && blockSeconds > 0.0)
+            {
+                const double tau = (double) (smooth * smooth) * 0.5 / std::max (1.0e-3, rate);
+                const float a = (float) (1.0 - std::exp (-blockSeconds / tau));
+                lfoOut[(size_t) l] += (raw - lfoOut[(size_t) l]) * a;
+            }
+            else
+                lfoOut[(size_t) l] = raw;
+            lfoFresh[(size_t) l] = false;
             lfoPhase[(size_t) l] += rate * blockSeconds;
             if (lfoPhase[(size_t) l] >= 1.0)
             {
                 lfoPhase[(size_t) l] -= Dsp::floorFast (lfoPhase[(size_t) l]);
                 lfoHold[(size_t) l] = rng.nextFloat() * 2.0f - 1.0f;
+                if (shape == P::Drift)
+                    dr.nextCycle();
             }
+            if (shape == P::Drift)
+                dr.advance (rate * blockSeconds);
         }
 
         const float sources[P::NumSources] = {
             0.0f, lfoOut[0], lfoOut[1], lfoOut[2], e2Level, ampLevel, velocity, ((float) note - 60.0f) / 60.0f,
-            engine.modWheel, std::max ({ engine.aftertouch, pressure, mpePressure() }), p[P::Macro1], p[P::Macro2], p[P::Macro3], p[P::Macro4], randomValue };
+            engine.modWheel, std::max ({ engine.aftertouch, pressure, mpePressure() }), p[P::Macro1], p[P::Macro2], p[P::Macro3], p[P::Macro4], randomValue,
+            engine.sideValue };
 
         mod.fill (0.0f);
         for (int slot = 0; slot < P::numSlots; ++slot)
@@ -3719,6 +4239,8 @@ private:
     float e2Level = 0;
     std::array<double, P::numLfos> lfoPhase {};
     std::array<float, P::numLfos> lfoHold {}, lfoOut {};
+    std::array<DriftLfo, P::numLfos> drift {};
+    std::array<bool, P::numLfos> lfoFresh {};
     float randomValue = 0, variationCents = 0, variationGain = 1, variationDark = 0;
     std::array<float, P::NumDests> mod {};
 
@@ -3728,6 +4250,8 @@ private:
 
     std::array<float, subBlock> uArr {}, relArr {}, punchArr {}, texGain {}, wTrans {}, bufL {}, bufR {}, laneL {}, laneR {};
     std::array<float, subBlock> keepL {}, keepR {};         // listening apart (SynthEngine::listen)
+    std::array<float, subBlock> srcL {}, srcR {};           // Movimiento: the sustain source's part (B and D)
+    MotionEq motion;
     std::array<float, subBlock> gOriginal {}, gBright {}, gDark {};
     alignas (16) float sincCoefs[SincTable::maxTaps] {};
     float heldOriginal = 1.0f, heldBright = 0.0f, heldDark = 0.0f;
@@ -3747,6 +4271,22 @@ private:
     bool sliceGate = false;
     double hitT = 0.0, lastTimeStep = 0.0;
     float hitFrom = 0.0f;
+    // Por golpe in TIMBRE: this block's hit (its strength, 0..1), where its envelope is, and Mecanismo's strike due.
+    bool perHitTimbre = false, hitStrikePending = false;
+    // Ventana: where the part that plays starts and how long it is (0 before the first block of a note), and its
+    // cuts counted from its start (room made once).
+    int loopWinStart = 0, loopWinLength = 0;
+    float windowOut = 0.0f;         // how far the old part has faded out (1: out)
+    std::vector<int> windowCuts;
+    float hitStrength = 1.0f, hitAttackLevel = 1.0f, hitFall = 0.0f;
+
+    // How strong the hit at `at` (samples of the loop) is, as a key's velocity: its peak over its first 15 ms
+    // against that of the loop's strong hits, 0..1 (ReanimaProcessor::hitPeak, the same measure).
+    float strengthOfHit (const SampleData& s, int at) const noexcept
+    {
+        const float ref = std::max (1.0e-6f, engine.hitStrengthRef.load (std::memory_order_relaxed));
+        return juce::jlimit (0.0f, 1.0f, SynthEngine::hitPeak (s, at) / ref);
+    }
     std::array<bool, subBlock> hitArr {};
     std::array<float, subBlock> bgL {}, bgR {};      // Bungee's block (Complex, and Beats's tails)
     int tailSlice = -1;
@@ -3789,6 +4329,7 @@ SynthEngine::SynthEngine()
     pedalNoise = std::make_unique<Mechanism>();
     pedalNoise->seed (0x9edd);
     heldNotes.reserve (128);
+    beatCutsLive.reserve ((size_t) maxBeatCuts);
     for (auto& ps : playSlices)
         ps.store (-1, std::memory_order_relaxed);
     for (auto& ph : playheads)
@@ -3808,31 +4349,13 @@ void SynthEngine::prepare (double sr)
     MechanismLibrary::get();
 
     sampleRate = sr;
-    if (stretchers.empty() || std::abs (stretcherRate - sr) > 0.5)
+    // The stretchers are rebuilt here (the audio is stopped) when the rate changes, if LOOP has asked for them.
+    if (stretchersReady.load (std::memory_order_acquire) && std::abs (stretcherRate - sr) > 0.5)
     {
-        stretchers.clear();
-        for (int i = 0; i < numStretchers; ++i)
-        {
-            auto st = std::make_unique<LoopStretcher>();
-            st->stretch.presetDefault (2, (float) sr, true);        // the work spread over the blocks
-            const size_t room = (size_t) st->stretch.blockSamples() + (size_t) st->stretch.intervalSamples() + 4096;
-            for (auto& v : st->in)
-                v.assign (room, 0.0f);
-            for (auto& v : st->out)
-                v.assign (4096, 0.0f);
-            st->bungee = std::make_unique<Bungee::Stretcher<Bungee::Basic>> (Bungee::SampleRates { (int) std::lround (sr), (int) std::lround (sr) }, 2);
-            const int maxIn = st->bungee->maxInputFrameCount();
-            st->grain.assign ((size_t) (2 * maxIn), 0.0f);
-            int ring = 1;
-            while (ring < 2 * maxIn + 8192)
-                ring <<= 1;
-            for (auto& v : st->cache)
-                v.assign ((size_t) ring, 0.0f);
-            for (auto& v : st->fifo)
-                v.assign (16384, 0.0f);
-            stretchers.push_back (std::move (st));
-        }
-        stretcherRate = sr;
+        stretchersReady.store (false, std::memory_order_release);
+        for (auto& v : voices)
+            v->stopImmediately();       // gives its stretcher back before the old ones go
+        buildStretchers (sr);
     }
     pedalNoise->prepare (sr);
     for (auto& v : voices)
@@ -3841,8 +4364,40 @@ void SynthEngine::prepare (double sr)
     reset();
 }
 
+// Some 2 MB each, 40 of them: made only once LOOP is chosen (prepareFx, message thread, or prepare), and the
+// audio thread takes them only after stretchersReady says they are all there.
+void SynthEngine::buildStretchers (double sr)
+{
+    stretchers.clear();
+    for (int i = 0; i < numStretchers; ++i)
+    {
+        auto st = std::make_unique<LoopStretcher>();
+        st->stretch.presetDefault (2, (float) sr, true);        // the work spread over the blocks
+        const size_t room = (size_t) st->stretch.blockSamples() + (size_t) st->stretch.intervalSamples() + 4096;
+        for (auto& v : st->in)
+            v.assign (room, 0.0f);
+        for (auto& v : st->out)
+            v.assign (4096, 0.0f);
+        st->bungee = std::make_unique<Bungee::Stretcher<Bungee::Basic>> (Bungee::SampleRates { (int) std::lround (sr), (int) std::lround (sr) }, 2);
+        const int maxIn = st->bungee->maxInputFrameCount();
+        st->grain.assign ((size_t) (2 * maxIn), 0.0f);
+        int ring = 1;
+        while (ring < 2 * maxIn + 8192)
+            ring <<= 1;
+        for (auto& v : st->cache)
+            v.assign ((size_t) ring, 0.0f);
+        for (auto& v : st->fifo)
+            v.assign (16384, 0.0f);
+        stretchers.push_back (std::move (st));
+    }
+    stretcherRate = sr;
+    stretchersReady.store (true, std::memory_order_release);
+}
+
 LoopStretcher* SynthEngine::acquireStretcher() noexcept
 {
+    if (! stretchersReady.load (std::memory_order_acquire))
+        return nullptr;
     for (auto& st : stretchers)
         if (! st->inUse)
         {
@@ -3872,9 +4427,48 @@ void SynthEngine::setSlices (const std::vector<int>& starts) noexcept
     setSlices (starts, {});
 }
 
+void SynthEngine::setBeatCuts (const SampleData* owner, const std::vector<int>& cuts) noexcept
+{
+    const unsigned seq = beatCutsSeq.load (std::memory_order_relaxed);
+    beatCutsSeq.store (seq + 1, std::memory_order_release);           // odd: being written
+    std::atomic_thread_fence (std::memory_order_release);
+    const int n = (int) std::min (cuts.size(), (size_t) maxBeatCuts);
+    for (int i = 0; i < n; ++i)
+        beatCutsShared[(size_t) i].store (cuts[(size_t) i], std::memory_order_relaxed);
+    // More than there is room for: the analysis's own cuts rather than a list cut short.
+    beatCutsCount.store (cuts.size() > (size_t) maxBeatCuts ? 0 : n, std::memory_order_relaxed);
+    beatCutsOwner.store (owner, std::memory_order_relaxed);
+    beatCutsSeq.store (seq + 2, std::memory_order_release);
+}
+
+void SynthEngine::takeBeatCuts() noexcept
+{
+    const unsigned seq = beatCutsSeq.load (std::memory_order_acquire);
+    if (seq == beatCutsLiveSeq || (seq & 1u) != 0)
+        return;
+    const int n = std::min (beatCutsCount.load (std::memory_order_relaxed), maxBeatCuts);
+    beatCutsLive.resize ((size_t) n);           // within the room made in the constructor
+    for (int i = 0; i < n; ++i)
+        beatCutsLive[(size_t) i] = beatCutsShared[(size_t) i].load (std::memory_order_relaxed);
+    const SampleData* owner = beatCutsOwner.load (std::memory_order_relaxed);
+    std::atomic_thread_fence (std::memory_order_acquire);
+    if (beatCutsSeq.load (std::memory_order_relaxed) != seq)
+        return;                                 // written meanwhile: taken next block
+    beatCutsLiveOwner = owner;
+    beatCutsLiveSeq = seq;
+}
+
+const std::vector<int>& SynthEngine::beatSlices (const SampleData& s) const noexcept
+{
+    return beatCutsLiveOwner == &s && ! beatCutsLive.empty() ? beatCutsLive : s.loopInfo.slices;
+}
+
 void SynthEngine::prepareFx (const ParamSnapshot& p)
 {
     fx->ensureModules (p);
+
+    if ((int) p[P::PlayMode] == P::PlayLoop && ! stretchersReady.load (std::memory_order_acquire))
+        buildStretchers (sampleRate);
 
     if ((int) p[P::Engine] == P::EngineDrone && ! dronesReady.load())
     {
@@ -3912,6 +4506,8 @@ void SynthEngine::reset()
     fx->reset();
     heldNotes.clear();
     pedalDown = false;
+    sideEnv = sideHighEnv = sideValue = 0.0f;
+    sideResponse = -1;          // its filters set again, at the current rate
     pedalNoise->reset();
     limiterGain = 1.0f;
     masterGainsReady = false;
@@ -3957,6 +4553,99 @@ std::shared_ptr<const SampleData> SynthEngine::upgradeSample (std::shared_ptr<co
 const SampleData& SynthEngine::sampleFor (const Voice& v) const noexcept
 {
     return v.onPrevious && previous != nullptr ? *previous : *sample;
+}
+
+int SynthEngine::destOf (int id) noexcept
+{
+    switch (id)
+    {
+        case P::FltFreq:        return P::DstCutoff;
+        case P::FltRes:         return P::DstRes;
+        case P::FltDrive:       return P::DstDrive;
+        case P::FltMorph:       return P::DstMorph;
+        case P::Volume:         return P::DstVolume;
+        case P::Pan:            return P::DstPan;
+        case P::StartPos:
+        case P::GrainPos:       return P::DstStart;
+        case P::Spray:          return P::DstSpray;
+        case P::GrainMs:        return P::DstGrain;
+        case P::UniDetune:      return P::DstDetune;
+        case P::Transpose:      return P::DstPitch;
+        case P::Fine:           return P::DstFine;
+        case P::FltHarmGain:    return P::DstDrive;         // Armónico: the matrix's Drive moves Realce
+        case P::Lfo1Rate:       return P::DstLfo1Rate;
+        case P::Lfo2Rate:       return P::DstLfo2Rate;
+        case P::TransientGain:  return P::DstTransient;
+        case P::Bow:            return P::DstBow;
+        case P::Breath:         return P::DstBreath;
+        default:                return P::DstNone;
+    }
+}
+
+// As the voices apply each destination (renderVoice, postProcess, updateModulation).
+float SynthEngine::modulated (int id, float v, float m) noexcept
+{
+    const auto& d = P::defs()[(size_t) id];
+    float out = v;
+    switch (destOf (id))
+    {
+        case P::DstCutoff:      out = v * std::exp2 (5.0f * m); break;            // 60 semitones a unit
+        case P::DstDrive:
+        case P::DstVolume:
+        case P::DstTransient:   out = v + 24.0f * m; break;                       // dB
+        case P::DstPitch:       out = v + 24.0f * m; break;                       // semitones
+        case P::DstFine:        out = v + 100.0f * m; break;                      // cents
+        case P::DstDetune:      out = v + 100.0f * m; break;                      // %
+        case P::DstGrain:       out = v * std::exp2 (2.0f * m); break;
+        case P::DstLfo1Rate:
+        case P::DstLfo2Rate:    out = v * std::exp2 (4.0f * m); break;
+        case P::DstNone:        return v;
+        default:                out = v + m; break;                               // Res, Morph, Pan, Start, Spray, Bow, Breath
+    }
+    return juce::jlimit (d.min, d.max, out);
+}
+
+double SynthEngine::loopBpmOf (const SampleData& s, const ParamSnapshot& p) noexcept
+{
+    const int length = std::max (1, s.loopInfo.length > 0 ? std::min (s.loopInfo.length, s.length) : s.length);
+    if (p[P::LoopBpm] > 0.0f)
+        return p[P::LoopBpm];
+    const int chosen = P::loopBeatChoices[(size_t) juce::jlimit (0, 12, (int) p[P::LoopBeats])];
+    const int beats = chosen > 0 ? chosen : s.loopInfo.beats;
+    return beats > 0 ? beats * 60.0 / (length / s.sampleRate) : 0.0;
+}
+
+SynthEngine::LoopWindow SynthEngine::loopWindow (const SampleData& s, const ParamSnapshot& p) noexcept
+{
+    LoopWindow w;
+    const int full = std::max (1, s.loopInfo.length > 0 ? std::min (s.loopInfo.length, s.length) : s.length);
+    w.length = full;
+    const int choice = juce::jlimit (0, (int) std::size (P::loopWindowBeats) - 1, (int) p[P::LoopWinLen]);
+    const double bpm = loopBpmOf (s, p);
+    if (choice == 0 || bpm <= 0.0 || (int) p[P::LoopKind] == P::LoopSlice)
+        return w;
+    const double beat = 60.0 / bpm * s.sampleRate;                      // samples of the file a beat
+    const int length = (int) std::lround (P::loopWindowBeats[(size_t) choice] * beat);
+    if (length < 32 || length >= full)
+        return w;
+    w.on = true;
+    w.length = length;
+    w.start = juce::jlimit (0, full - length, (int) std::lround (std::max (0.0f, p[P::LoopWinPos]) * beat));
+    return w;
+}
+
+float SynthEngine::hitPeak (const SampleData& s, int at) noexcept
+{
+    const auto& buf = s.loopAudio.getNumSamples() >= s.length ? s.loopAudio : s.audio;
+    const int from = std::max (0, at), to = std::min (buf.getNumSamples(), at + std::max (1, (int) (0.015 * s.sampleRate)));
+    float peak = 0.0f;
+    for (int c = 0; c < std::min (2, buf.getNumChannels()); ++c)
+    {
+        const float* x = buf.getReadPointer (c);
+        for (int i = from; i < to; ++i)
+            peak = std::max (peak, std::abs (x[i]));
+    }
+    return peak;
 }
 
 float SynthEngine::mechanismAmount (const ParamSnapshot& p) noexcept
@@ -4071,6 +4760,7 @@ void SynthEngine::process (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
 
     if (buffer.getNumChannels() < 2)
         return;
+    takeBeatCuts();
     manageTransport (p);
     grainBudget = 6;
 
@@ -4138,6 +4828,7 @@ void SynthEngine::process (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
     if (pos < n)
         renderVoices (buffer, pos, n - pos, p);
     fx->process (buffer, p, bpm);
+    setSidechain (nullptr, nullptr, 0);     // given again for each block: never read after the host's buffer is gone
 
     const float monoTarget = p[P::MonoOut] > 0.5f ? 1.0f : 0.0f;
     if (! masterGainsReady)
@@ -4232,6 +4923,91 @@ void SynthEngine::process (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
         playheads[i].store (voices[i]->getPlayhead(), std::memory_order_relaxed);
         playSlices[i].store (voices[i]->getSlice(), std::memory_order_relaxed);
     }
+
+    // The knobs' outer ring: the newest note's modulation, or the macros alone when none sounds.
+    {
+        const Voice* newest = nullptr;
+        for (const auto& v : voices)
+            if (v->isActive() && ! v->isFading() && (newest == nullptr || (juce::int32) (v->startOrder() - newest->startOrder()) > 0))
+                newest = v.get();
+        std::array<float, P::NumDests> shown {};
+        if (newest != nullptr)
+            for (int d = 0; d < P::NumDests; ++d)
+                shown[(size_t) d] = newest->modulationOf (d);
+        else
+            for (int slot = 0; slot < P::numSlots; ++slot)
+            {
+                const int base = P::M1Src + slot * P::slotStride;
+                const int src = (int) p[(size_t) base], dst = (int) p[(size_t) base + 1];
+                if (src >= P::SrcMacro1 && src <= P::SrcMacro4 && dst > 0 && dst < P::NumDests)
+                    shown[(size_t) dst] += p[(size_t) (P::Macro1 + src - P::SrcMacro1)] * p[(size_t) base + 2];
+            }
+        for (int d = 0; d < P::NumDests; ++d)
+            modShown[(size_t) d].store (shown[(size_t) d], std::memory_order_relaxed);
+    }
+}
+
+void SynthEngine::setSidechain (const float* left, const float* right, int length) noexcept
+{
+    sideL = length > 0 ? left : nullptr;
+    sideR = length > 0 ? right : nullptr;
+    sideLen = length;
+    fx->setSidechain (sideL, sideR, sideLen);
+}
+
+// The Sidechain source: the level of the sound coming in (or of its lows, mids or highs), followed with Ataque and
+// Release and read in decibels (-48 dB to 0 dB over the source's 0 to 1, Sensibilidad moving that window), so that
+// a soft and a loud passage both move what it modulates. Brillo: how much of the sound is above 2.5 kHz, whatever
+// its level (a hi-hat bright, a kick dark), falling back to 0 when nothing comes in.
+void SynthEngine::followSidechain (int start, int num, const ParamSnapshot& p) noexcept
+{
+    const float sr = (float) sampleRate;
+    const float atk = 1.0f - std::exp (-1.0f / (std::max (0.1f, p[P::ScAttack]) * 0.001f * sr));
+    const float rel = 1.0f - std::exp (-1.0f / (std::max (1.0f, p[P::ScRelease]) * 0.001f * sr));
+    const int response = juce::jlimit (0, 4, (int) p[P::ScResponse]);
+    if (response != sideResponse)
+    {
+        switch (response)
+        {
+            case P::ScLows:  sideBand.set (Dsp::Biquad::LowPass, sampleRate, 150.0f, 0.707f); break;
+            case P::ScMids:  sideBand.set (Dsp::Biquad::BandPass, sampleRate, 1000.0f, 0.7f); break;
+            case P::ScHighs: sideBand.set (Dsp::Biquad::HighPass, sampleRate, 3000.0f, 0.707f); break;
+            default:         break;
+        }
+        sideHigh.set (Dsp::Biquad::HighPass, sampleRate, 2500.0f, 0.707f);
+        sideBand.reset();
+        sideHigh.reset();
+        sideResponse = response;
+    }
+    const bool band = response == P::ScLows || response == P::ScMids || response == P::ScHighs;
+    const bool present = sideL != nullptr && start + num <= sideLen;
+
+    for (int i = 0; i < num; ++i)
+    {
+        const float x = present ? 0.5f * (sideL[start + i] + (sideR != nullptr ? sideR[start + i] : sideL[start + i])) : 0.0f;
+        const float a = std::abs (band ? sideBand.process (0, x) : x);
+        sideEnv += (a - sideEnv) * (a > sideEnv ? atk : rel);
+        if (response == P::ScBright)
+        {
+            const float h = std::abs (sideHigh.process (0, x));
+            sideHighEnv += (h - sideHighEnv) * (h > sideHighEnv ? atk : rel);
+        }
+    }
+    if (sideEnv < 1.0e-9f) sideEnv = 0.0f;          // no denormals once the sound has gone
+    if (sideHighEnv < 1.0e-9f) sideHighEnv = 0.0f;
+
+    const float sens = p[P::ScSens];
+    float v;
+    if (response == P::ScBright)
+    {
+        // Below -60 dB there is nothing to judge: the brightness falls with the level.
+        const float gate = juce::jlimit (0.0f, 1.0f, (Dsp::gainToDb (sideEnv + 1.0e-9f) + 66.0f) / 12.0f);
+        v = juce::jlimit (0.0f, 1.0f, sideHighEnv / (sideEnv + 1.0e-9f) * 2.0f * Dsp::dbToGain (sens)) * gate;
+    }
+    else
+        v = juce::jlimit (0.0f, 1.0f, (Dsp::gainToDb (sideEnv * 1.4142f + 1.0e-9f) + sens + 48.0f) / 48.0f);
+    sideValue = v;
+    sideShown.store (v, std::memory_order_relaxed);
 }
 
 void SynthEngine::renderVoices (juce::AudioBuffer<float>& buffer, int start, int num, const ParamSnapshot& p)
@@ -4243,6 +5019,7 @@ void SynthEngine::renderVoices (juce::AudioBuffer<float>& buffer, int start, int
     {
         const int chunk = std::min (subBlock, num - done);
 
+        followSidechain (start + done, chunk, p);
         if (sample != nullptr)
         {
             transportPpqNow = hostPpq + (start + done) / sampleRate * bpm / 60.0;

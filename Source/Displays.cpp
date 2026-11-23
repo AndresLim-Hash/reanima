@@ -183,10 +183,13 @@ void OutputMeter::paint (juce::Graphics& g)
 
 //==============================================================================
 FilterCurve::FilterCurve (ReanimaProcessor& p)
-    : ParamView (p, { P::FltOn, P::FltType, P::FltSlope, P::FltCircuit, P::FltFreq, P::FltRes, P::FltMorph, P::FltMix })
+    : ParamView (p, { P::FltOn, P::FltType, P::FltSlope, P::FltCircuit, P::FltFreq, P::FltRes, P::FltMorph, P::FltMix,
+                      P::FltHarmGain, P::FltHarmRegion })
 {
-    setTooltip (P::u8 ("Respuesta real del filtro con los ajustes actuales, sin modulación, de 20 Hz a 20 kHz."));
+    setTooltip (P::u8 ("Respuesta real del filtro con los ajustes actuales, sin modulación, de 20 Hz a 20 kHz. "
+                       "Armónico se dibuja sobre una nota La1 (110 Hz)."));
     filter.prepare (rate);
+    filter.compensateLevel = false;
 }
 
 void FilterCurve::measure()
@@ -194,6 +197,16 @@ void FilterCurve::measure()
     filter.reset();
     filter.set ((int) value (P::FltType), (int) value (P::FltSlope), (int) value (P::FltCircuit), value (P::FltFreq),
                 value (P::FltRes), 0.0f, value (P::FltMorph), value (P::FltMix));
+    // Armónico on a note of 110 Hz: its resonances settle on their gains at once (the drawing has no time).
+    for (int i = 0; i < 2; ++i)
+    {
+        filter.setHarmonic (110.0f, value (P::FltHarmGain), value (P::FltHarmRegion));
+        for (int k = 0; k < 40; ++k)
+        {
+            float l = 0.0f, r = 0.0f;
+            filter.process (l, r);
+        }
+    }
 
     // Small enough for the circuits to behave linearly.
     constexpr float impulse = 0.01f;
@@ -407,9 +420,10 @@ void DroneCurveView::drawTo (juce::Point<float> p)
 }
 
 //==============================================================================
-LfoShape::LfoShape (ReanimaProcessor& p, int shapeParam) : ParamView (p, { shapeParam }), shape (shapeParam)
+LfoShape::LfoShape (ReanimaProcessor& p, int shapeParam, int smoothParam)
+    : ParamView (p, { shapeParam, smoothParam }), shape (shapeParam), smooth (smoothParam)
 {
-    setTooltip (P::u8 ("Forma de onda del LFO: dos ciclos."));
+    setTooltip (P::u8 ("Forma de onda del LFO: dos ciclos. Deriva: un ejemplo de su recorrido, distinto en cada nota."));
 }
 
 void LfoShape::paint (juce::Graphics& g)
@@ -425,6 +439,28 @@ void LfoShape::paint (juce::Graphics& g)
     static constexpr float steps[] = { 0.4f, -0.7f, 0.9f, -0.2f, 0.65f, -0.85f, 0.15f, -0.45f };
     constexpr int points = 256;
     const int type = (int) value (shape);
+    const float soft = value (smooth);
+
+    // Deriva: the same kind of curve the voices make (random points joined smoothly, quicker layers that Suavidad
+    // takes out), from fixed points so that the drawing stands still.
+    const auto catmull = [] (const float* k, float t)
+    {
+        const float a = -0.5f * k[0] + 1.5f * k[1] - 1.5f * k[2] + 0.5f * k[3];
+        const float b = k[0] - 2.5f * k[1] + 2.0f * k[2] - 0.5f * k[3];
+        const float c = 0.5f * (k[2] - k[0]);
+        return ((a * t + b) * t + c) * t + k[1];
+    };
+    const auto layer = [&catmull] (float x, int seed)
+    {
+        static constexpr float knots[] = { 0.1f, 0.6f, -0.3f, 0.8f, -0.7f, 0.2f, 0.5f, -0.9f, 0.3f, -0.2f, 0.7f, -0.5f, 0.0f,
+                                           0.9f, -0.4f, 0.4f, -0.8f, 0.6f, -0.1f, 0.2f, -0.6f, 0.8f, -0.3f, 0.1f };
+        constexpr int n = (int) (sizeof (knots) / sizeof (knots[0]));
+        const int i = (int) std::floor (x);
+        float k[4];
+        for (int j = 0; j < 4; ++j)
+            k[j] = knots[(size_t) (((i + j - 1 + seed) % n + n) % n)];
+        return catmull (k, x - (float) i);
+    };
 
     juce::Path line;
     for (int i = 0; i <= points; ++i)
@@ -439,6 +475,13 @@ void LfoShape::paint (juce::Graphics& g)
             case P::SawUp:      v = phase * 2.0f - 1.0f; break;
             case P::SawDown:    v = 1.0f - phase * 2.0f; break;
             case P::Square:     v = phase < 0.5f ? 1.0f : -1.0f; break;
+            case P::Drift:
+            {
+                const float rough = 1.0f - soft;
+                v = layer (cycles * 2.0f, 0) + rough * (0.5f * layer (cycles * 7.4f, 7) + 0.3f * layer (cycles * 22.6f, 13));
+                v = juce::jlimit (-1.0f, 1.0f, v / (1.0f + 0.4f * rough));
+                break;
+            }
             default:            v = steps[std::min (7, (int) (cycles * 4.0f))]; break;
         }
 
@@ -452,6 +495,42 @@ void LfoShape::paint (juce::Graphics& g)
 
     g.setColour (moduleColour (*this, Theme::good));
     g.strokePath (line, juce::PathStrokeType (2.0f, juce::PathStrokeType::mitered, juce::PathStrokeType::rounded));
+}
+
+//==============================================================================
+SidechainMeter::SidechainMeter (ReanimaProcessor& p) : ParamView (p, { P::ScResponse })
+{
+    setTooltip (P::u8 ("Lo que da ahora la fuente Sidechain de la matriz, de 0 a 100 %."));
+    startTimerHz (30);
+}
+
+void SidechainMeter::timerCallback()
+{
+    const float v = proc.engine.sideShown.load (std::memory_order_relaxed);
+    if (std::abs (v - shown) > 0.002f)
+    {
+        shown = v;
+        repaint();
+    }
+}
+
+void SidechainMeter::paint (juce::Graphics& g)
+{
+    const auto bounds = getLocalBounds().toFloat();
+    drawDisplay (g, bounds);
+    auto area = bounds.reduced (10.0f, 10.0f);
+    g.setFont (Theme::font (12.0f));
+    g.setColour (Theme::dim);
+    const bool input = proc.hasSidechain();
+    g.drawText (input ? P::u8 ("Fuente Sidechain: ") + juce::String (juce::roundToInt (shown * 100.0f)) + " %"
+                      : P::u8 ("Sin entrada lateral"),
+                area.removeFromTop (16.0f), juce::Justification::centredLeft);
+    area.removeFromTop (6.0f);
+    const auto bar = area.withHeight (std::min (14.0f, area.getHeight()));
+    g.setColour (Theme::panelEdge);
+    g.fillRoundedRectangle (bar, 3.0f);
+    g.setColour (moduleColour (*this, Theme::pink));
+    g.fillRoundedRectangle (bar.withWidth (bar.getWidth() * juce::jlimit (0.0f, 1.0f, shown)), 3.0f);
 }
 
 //==============================================================================
@@ -536,8 +615,11 @@ void MechanismAdvice::resized()
 void MechanismAdvice::paint (juce::Graphics& g)
 {
     g.setColour (warning ? Theme::warning : Theme::dim);
-    g.setFont (Theme::font (11.5f));
-    g.drawFittedText (text, getLocalBounds().withTrimmedRight (58), juce::Justification::centredLeft, 1, 0.85f);
+    // One line if it fits, else two (it shares its row with Oír todo and Por golpe); the whole text in the tooltip.
+    const auto room = getLocalBounds().withTrimmedRight (58);
+    const bool fits = juce::GlyphArrangement::getStringWidthInt (Theme::font (11.5f), text) <= room.getWidth();
+    g.setFont (Theme::font (fits ? 11.5f : 10.5f));
+    g.drawFittedText (text, room, juce::Justification::centredLeft, fits ? 1 : 2, 0.9f);
 }
 
 // The menu shows the new text of the chosen item only when the choice changes.
@@ -593,5 +675,7 @@ void MechanismAdvice::update()
     }
     else
         text = names[chosen] + " " + percent (chosen) + P::u8 (" · el que mejor encaja: ") + best;
+    setTooltip (text + "\n\n" + P::u8 ("Cuánto encaja cada gesto de Mecanismo con este sample y con el ataque que le das: mira el ataque, si el sonido "
+                                    "se sostiene, si tiene golpe propio, tono o ruido, y su registro. Es una guía: cualquier gesto se puede elegir."));
     repaint();
 }

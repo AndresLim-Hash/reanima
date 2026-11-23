@@ -26,7 +26,7 @@ struct Targets
     Area area (const juce::String& name) const;
 };
 
-constexpr int numTabs = 5;
+constexpr int numTabs = 6;
 juce::String tabName (int tab);
 std::vector<GuideOverlay::Step> forTab (int tab, const Targets& targets);
 } // namespace TabGuides

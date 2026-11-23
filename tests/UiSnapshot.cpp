@@ -5,6 +5,7 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "EditPage.h"
 #include "MasterStage.h"
 #include "FxRack.h"
 #include "FactoryPresets.h"
@@ -226,8 +227,15 @@ void checkTooltips (ReanimaProcessor& proc, juce::AudioProcessorEditor& editor, 
     }
     engine->setValueNotifyingHost (1.0f);
 
-    // Every effect shows different controls.
+    // Every effect shows different controls (the FX page is there while its tab is open).
+    tabs.setCurrentTabIndex (4);
+    wait (100);
     auto* page = findChild<FxPage> (editor);
+    if (page == nullptr)
+    {
+        check (false, "la página FX existe");
+        return;
+    }
     for (int type = 1; type < Fx::NumTypes; ++type)
     {
         proc.setFxSlotType (2, type);
@@ -1665,7 +1673,7 @@ int main (int argc, char* argv[])
     editor->setVisible (true);
 
     auto* tabs = findChild<juce::TabbedComponent> (*editor);
-    const char* names[] = { "1_sample", "2_edicion", "3_filtro_mod", "4_matriz", "5_fx" };
+    const char* names[] = { "1_sample", "2_edicion", "3_filtro_mod", "4_matriz", "5_fx", "6_arp_seq" };
     auto shot = [&] (const juce::String& name)
     {
         const auto img = editor->createComponentSnapshot (editor->getLocalBounds(), true, 1.0f);
@@ -1681,6 +1689,98 @@ int main (int argc, char* argv[])
         tabs->setCurrentTabIndex (t);
         wait (100);
         shot (names[t]);
+    }
+
+    // iman <loop.wav>: a loop in LOOP with a hit turned off and one added (SAMPLE), and EDICIÓN with the magnet on, at
+    // 100 % and 75 %.
+    if (argc > 3 && juce::String (argv[2]) == "iman")
+    {
+        proc.loadSampleNow (juce::File (juce::String::fromUTF8 (argv[3])));
+        for (int k = 0; k < 600 && proc.isLoading(); ++k)
+        {
+            juce::Thread::sleep (10);
+            proc.serviceMessageThread();
+        }
+        proc.serviceMessageThread();
+        if (auto* p = proc.apvts.getParameter ("playMode"))
+            p->setValueNotifyingHost (p->convertTo0to1 (1.0f));
+        wait (300);
+        const auto cuts = proc.getBeatCuts().empty() && proc.getSample() != nullptr ? proc.getSample()->loopInfo.slices : proc.getBeatCuts();
+        HitEdits edits;
+        if (cuts.size() > 4 && proc.getSample() != nullptr)
+        {
+            const int tol = HitEdits::tolerance (proc.getSample()->sampleRate);
+            edits.toggle (cuts[3], true, tol);
+            edits.add ((cuts[1] + cuts[2]) / 2, tol);
+        }
+        proc.setHitEdits (edits);
+        std::printf ("golpes: %d cortes, correcciones %s\n", (int) proc.getBeatCuts().size(), edits.toString().toRawUTF8());
+        wait (300);
+        tabs->setCurrentTabIndex (0);
+        wait (200);
+        shot ("iman_1_sample_loop_golpes");
+        // Ventana: a bar from beat 5 (bar 2)
+        if (auto* p = proc.apvts.getParameter ("loopWinLen"))
+            p->setValueNotifyingHost (p->convertTo0to1 (3.0f));
+        if (auto* p = proc.apvts.getParameter ("loopWinPos"))
+            p->setValueNotifyingHost (p->convertTo0to1 (4.0f));
+        wait (300);
+        shot ("iman_4_sample_ventana");
+        if (auto* p = proc.apvts.getParameter ("loopWinLen"))
+            p->setValueNotifyingHost (0.0f);
+        wait (100);
+        tabs->setCurrentTabIndex (1);         // the page is made when its tab opens
+        wait (200);
+        if (auto* view = findChild<EditView> (*editor))
+        {
+            view->setSnapsToGrid (true);
+            if (view->onMagnetChanged)
+                view->onMagnetChanged();
+            view->selectAll();
+        }
+        else
+            std::printf ("sin vista de EDICIÓN\n");
+        wait (200);
+        shot ("iman_2_edicion_100");
+        editor->setSize (juce::roundToInt (ReanimaEditor::designW * 0.75), juce::roundToInt (ReanimaEditor::designH * 0.75));
+        wait (250);
+        shot ("iman_3_edicion_75");
+        // Aros: Macro 1 to the cutoff and to Drive, Macro 2 to the resonance (negative), with no note.
+        editor->setSize (ReanimaEditor::designW, ReanimaEditor::designH);
+        for (const auto& [id, v] : { std::pair<const char*, float> { "fltOn", 1.0f }, { "fltFreq", 800.0f }, { "m1Src", (float) P::SrcMacro1 },
+                                     { "m1Dst", (float) P::DstCutoff }, { "m1Amt", 0.5f }, { "m2Src", (float) P::SrcMacro2 }, { "m2Dst", (float) P::DstRes },
+                                     { "m2Amt", -0.6f }, { "m3Src", (float) P::SrcMacro1 }, { "m3Dst", (float) P::DstDrive }, { "m3Amt", 0.4f },
+                                     { "macro1", 0.7f }, { "macro2", 0.5f } })
+            if (auto* p = proc.apvts.getParameter (id))
+                p->setValueNotifyingHost (p->convertTo0to1 (v));
+        juce::AudioBuffer<float> silent (2, 512);
+        juce::MidiBuffer none;
+        silent.clear();
+        proc.processBlock (silent, none);
+        tabs->setCurrentTabIndex (2);
+        wait (400);
+        shot ("aros_1_filtro_mod");
+        // Explorador: open, on its first source (Live's folders of this computer)
+        std::function<juce::Button* (juce::Component&)> findBrowse = [&] (juce::Component& c) -> juce::Button*
+        {
+            for (auto* child : c.getChildren())
+            {
+                if (child->getName() == "explorar")
+                    return dynamic_cast<juce::Button*> (child);
+                if (auto* b = findBrowse (*child))
+                    return b;
+            }
+            return nullptr;
+        };
+        if (auto* b = findBrowse (*editor))
+        {
+            b->triggerClick();
+            wait (1500);
+            shot ("explorador_1");
+        }
+        else
+            std::printf ("sin botón del explorador\n");
+        return 0;
     }
 
     // escalas: every tab at the sizes the menu offers below 100 % (and 100 %), to judge text and colour.
@@ -1700,7 +1800,9 @@ int main (int argc, char* argv[])
         return 0;
     }
 
-    // FX: the effect chosen in each chain, in that chain's colour.
+    // FX: the effect chosen in each chain, in that chain's colour (its page is there while its tab is open).
+    tabs->setCurrentTabIndex (4);
+    wait (100);
     if (auto* fx = findChild<FxPage> (*editor))
     {
         tabs->setCurrentTabIndex (4);

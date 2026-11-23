@@ -276,14 +276,114 @@ int WaveformView::snapToHit (int at, const Geometry& g) const
     return best;
 }
 
+bool WaveformView::editsHits() const
+{
+    return sample != nullptr && proc.hitsEditable();
+}
+
+int WaveformView::loopLength() const
+{
+    return sample == nullptr ? 0 : std::max (1, sample->loopInfo.length > 0 ? std::min (sample->loopInfo.length, sample->length) : sample->length);
+}
+
+// What the loop is cut at as it plays: SLICE's slices, Por golpe's hits, or Beats's cuts.
+std::vector<int> WaveformView::cutsShown() const
+{
+    return sample == nullptr ? std::vector<int>() : proc.getLoopCuts();
+}
+
+int WaveformView::hitAt (juce::Point<float> p, bool& isCut) const
+{
+    isCut = false;
+    if (! editsHits())
+        return -1;
+    const auto g = geometry (false);
+    if (! g.area.contains (p))
+        return -1;
+    int best = -1;
+    float nearest = (float) markerGrab + 1.0f;
+    for (const int c : cutsShown())
+    {
+        const float d = std::abs (g.xFor (c / sample->sampleRate) - p.x);
+        if (c > 0 && d < nearest)
+        {
+            nearest = d;
+            best = c;
+            isCut = true;
+        }
+    }
+    const int length = loopLength();
+    for (const int c : proc.getHitEdits().off)
+    {
+        const float d = std::abs (g.xFor (c / sample->sampleRate) - p.x);
+        if (c < length && d < nearest)
+        {
+            nearest = d;
+            best = c;
+            isCut = false;
+        }
+    }
+    return best;
+}
+
+SynthEngine::LoopWindow WaveformView::window() const
+{
+    if (sample == nullptr || (int) proc.paramValue (P::PlayMode) != P::PlayLoop)
+        return {};
+    ParamSnapshot q {};
+    for (const int id : { P::LoopWinLen, P::LoopWinPos, P::LoopKind, P::LoopBpm, P::LoopBeats })
+        q[(size_t) id] = proc.paramValue (id);
+    return SynthEngine::loopWindow (*sample, q);
+}
+
+double WaveformView::beatSamples() const
+{
+    if (sample == nullptr)
+        return 0.0;
+    ParamSnapshot q {};
+    for (const int id : { P::LoopBpm, P::LoopBeats })
+        q[(size_t) id] = proc.paramValue (id);
+    const double bpm = SynthEngine::loopBpmOf (*sample, q);
+    return bpm > 0.0 ? 60.0 / bpm * sample->sampleRate : 0.0;
+}
+
+bool WaveformView::overWindow (juce::Point<float> p) const
+{
+    const auto w = window();
+    if (! w.on)
+        return false;
+    const auto g = geometry (false);
+    const float x0 = g.xFor (w.start / sample->sampleRate), x1 = g.xFor ((w.start + w.length) / sample->sampleRate);
+    // its body, above the strip of cuts along the bottom
+    return p.x >= x0 && p.x <= x1 && p.y >= g.area.getY() && p.y < g.area.getBottom() - 22.0f;
+}
+
 int WaveformView::handleAt (juce::Point<float> p) const
 {
+    auto* self = const_cast<WaveformView*> (this);
+    self->hoverHit = -1;
     if (slicing())
     {
-        const_cast<WaveformView*> (this)->hoverSlice = sliceAt (p);
-        return hoverSlice >= 0 ? HSlice : -1;
+        self->hoverSlice = sliceAt (p);
+        if (hoverSlice >= 0)
+            return HSlice;
+        // a hit turned off: a click brings it back
+        bool isCut = false;
+        self->hoverHit = hitAt (p, isCut);
+        self->hoverHitIsCut = isCut;
+        return hoverHit >= 0 ? HHit : -1;
     }
-    if (sample == nullptr || (int) proc.paramValue (P::PlayMode) == P::PlayLoop)     // LOOP: no ADSR handles
+    if (sample != nullptr && (int) proc.paramValue (P::PlayMode) == P::PlayLoop)
+    {
+        // LOOP: no ADSR handles; the cuts are, and the Ventana's body.
+        bool isCut = false;
+        self->hoverHit = hitAt (p, isCut);
+        self->hoverHitIsCut = isCut;
+        if (hoverHit >= 0)
+            return HHit;
+        return overWindow (p) ? HWindow : -1;
+    }
+    if (sample == nullptr)
         return -1;
 
     const auto g = geometry (false);
@@ -325,10 +425,22 @@ juce::String WaveformView::getTooltip()
         case HStart:   return P::u8 ("Inicio: arrástralo para elegir dónde empieza la nota; se pega al inicio detectado. Con Mayús, ajuste fino. "
                                      "Doble clic: vuelve al inicio detectado.");
         case HPan:     return P::u8 ("Arrastra para desplazarte. Rueda: zoom. Doble clic: pone aquí el inicio de la nota.");
-        case HSlice:   return P::u8 ("Corte de Slice: arrástralo para moverlo (se pega a los golpes; con Mayús, libre); doble clic lo quita. "
+        case HSlice:   return (int) param (P::SliceBy) == P::SliceTransients
+                            ? P::u8 ("Corte de Slice en un golpe: clic lo apaga (y vuelve a encenderlo), y se recuerda aunque cambies "
+                                     "Sensibilidad o se analice de nuevo. Arrástralo para moverlo: entonces los cortes pasan a «A mano». "
+                                     "Cada trozo suena en la tecla que lleva escrita.")
+                            : P::u8 ("Corte de Slice: arrástralo para moverlo (se pega a los golpes; con Mayús, libre); doble clic lo quita. "
                                      "Cada trozo suena en la tecla que lleva escrita.");
+        case HWindow:  return P::u8 ("Ventana: la parte del loop que suena. Arrástrala para moverla (se pega a semicorcheas; con Alt, libre). "
+                                     "Su duración se elige en MOTOR (Ventana).");
+        case HHit:     return hoverHitIsCut ? P::u8 ("Golpe que corta el loop: clic lo apaga (deja de cortar y de reiniciar las envolventes "
+                                                     "con Por golpe). Doble clic en un hueco añade uno. Se guarda con el proyecto.")
+                                            : P::u8 ("Golpe apagado: clic lo vuelve a encender.");
         default:       return sample == nullptr ? juce::String()
-                            : slicing() ? P::u8 ("Slice: doble clic añade un corte aquí. Rueda: zoom.")
+                            : slicing() ? ((int) param (P::SliceBy) == P::SliceTransients
+                                               ? P::u8 ("Slice: doble clic añade un golpe aquí (sigue por Transitorios). Rueda: zoom.")
+                                               : P::u8 ("Slice: doble clic añade un corte aquí. Rueda: zoom."))
+                            : (int) param (P::PlayMode) == P::PlayLoop ? P::u8 ("Loop: doble clic añade un golpe aquí; clic en un golpe lo apaga. Rueda: zoom.")
                                         : P::u8 ("Rueda: zoom. Doble clic: pone aquí el inicio de la nota.");
     }
 }
@@ -365,11 +477,23 @@ void WaveformView::mouseMove (const juce::MouseEvent& e)
 void WaveformView::mouseDown (const juce::MouseEvent& e)
 {
     dragging = handleAt (e.position);
+    downAt = e.position;
     if (dragging == HSlice)
     {
         dragSlice = hoverSlice;
         dragMarks = proc.getSlices();
+        sliceMoved = false;
         frozenView = geometry (false).viewSeconds;
+        return;
+    }
+    if (dragging == HHit)
+        return;
+    if (dragging == HWindow)
+    {
+        windowFrom = param (P::LoopWinPos);
+        frozenView = geometry (false).viewSeconds;
+        if (auto* p = proc.apvts.getParameter (P::defs()[(size_t) P::LoopWinPos].id))
+            p->beginChangeGesture();
         return;
     }
     if (dragging < 0)
@@ -406,10 +530,31 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
         return;
 
     const auto g = geometry (true);
+    if (dragging == HHit)
+        return;
+    if (dragging == HWindow)
+    {
+        const double beat = beatSamples();
+        if (beat <= 0.0)
+            return;
+        const double moved = e.getDistanceFromDragStartX() / g.area.getWidth() * g.shown * sample->sampleRate / beat;     // in beats
+        double at = std::max (0.0, windowFrom + moved);
+        if (! e.mods.isAltDown())
+            at = std::round (at * 4.0) / 4.0;           // sixteenths
+        const auto w = window();
+        const double room = (loopLength() - w.length) / beat;
+        setParam (P::LoopWinPos, (float) juce::jlimit (0.0, std::max (0.0, room), at));
+        repaint();
+        return;
+    }
     if (dragging == HSlice)
     {
         if (dragSlice <= 0 || dragSlice >= (int) dragMarks.size())
             return;
+        // A click that shakes a little is still a click (it turns a hit off under Transitorios).
+        if (! sliceMoved && e.position.getDistanceFrom (downAt) < 4.0f)
+            return;
+        sliceMoved = true;
         // Between its neighbours, at least 10 ms from each.
         const int gap = (int) (0.01 * sample->sampleRate);
         const int length = sample->loopInfo.length > 0 ? std::min (sample->loopInfo.length, sample->length) : sample->length;
@@ -464,11 +609,28 @@ void WaveformView::mouseDrag (const juce::MouseEvent& e)
     repaint();
 }
 
-void WaveformView::mouseUp (const juce::MouseEvent&)
+void WaveformView::mouseUp (const juce::MouseEvent& e)
 {
-    if (dragging == HSlice)
+    // A click on a hit (LOOP), or on a slice marker cut by Transitorios: turned off, or back on.
+    const bool clickOnSlice = dragging == HSlice && ! sliceMoved && editsHits() && dragSlice > 0;
+    if ((dragging == HHit || clickOnSlice) && e.position.getDistanceFrom (downAt) < 4.0f)
+    {
+        const int at = dragging == HHit ? hoverHit : (dragSlice < (int) dragMarks.size() ? dragMarks[(size_t) dragSlice] : -1);
+        const bool isCut = dragging == HHit ? hoverHitIsCut : true;
+        if (at > 0 && sample != nullptr)
+        {
+            auto edits = proc.getHitEdits();
+            if (edits.toggle (at, isCut, HitEdits::tolerance (sample->sampleRate)))
+                proc.setHitEdits (edits);
+        }
+    }
+    if (dragging == HWindow)
+        if (auto* p = proc.apvts.getParameter (P::defs()[(size_t) P::LoopWinPos].id))
+            p->endChangeGesture();
+    if (dragging == HSlice || dragging == HHit || dragging == HWindow)
     {
         dragging = dragSlice = -1;
+        sliceMoved = false;
         frozenView = -1.0;
         repaint();
         return;
@@ -483,6 +645,28 @@ void WaveformView::mouseUp (const juce::MouseEvent&)
 
 void WaveformView::mouseDoubleClick (const juce::MouseEvent& e)
 {
+    // LOOP Normal, or SLICE by Transitorios: a double click in a gap adds a hit there (on a cut, its two clicks
+    // have already turned it off and on again: nothing more).
+    if (editsHits())
+    {
+        bool isCut = false;
+        if (hitAt (e.position, isCut) >= 0 || (slicing() && sliceAt (e.position) > 0))
+            return;
+        const auto g = geometry (false);
+        if (! g.area.contains (e.position))
+            return;
+        int at = (int) std::lround (g.secondsFor (e.position.x) * sample->sampleRate);
+        if (! e.mods.isShiftDown())
+            at = snapToHit (at, g);
+        if (at > 0 && at < loopLength())
+        {
+            auto edits = proc.getHitEdits();
+            edits.add (at, HitEdits::tolerance (sample->sampleRate));
+            proc.setHitEdits (edits);
+        }
+        repaint();
+        return;
+    }
     if (slicing())
     {
         // On a marker: it goes. Elsewhere on the loop: a new one. Either way the cuts are the user's now.
@@ -751,14 +935,87 @@ void WaveformView::paint (juce::Graphics& gfx)
                         gfx.drawText (juce::String (names[key % 12]) + juce::String (key / 12 - 2), (int) x0 + 3, (int) area.getY() + 3,
                                       (int) std::min (60.0f, x1 - x0 - 4.0f), 12, juce::Justification::centredLeft);
                 }
+                if ((int) param (P::SliceBy) == P::SliceTransients)
+                {
+                    const auto edits = proc.getHitEdits();
+                    const int tol = HitEdits::tolerance (sr), length = loopLength();
+                    for (const int off : edits.off)
+                    {
+                        if (off >= length)
+                            continue;
+                        const bool hot = hover == HHit && std::abs (off - hoverHit) <= tol;
+                        const float x = g.xFor (off / sr);
+                        gfx.setColour (Theme::text.withAlpha (hot ? 0.9f : 0.4f));
+                        for (float y = area.getY(); y < area.getBottom(); y += 6.0f)
+                            gfx.fillRect (x - 0.5f, y, 1.0f, std::min (3.0f, area.getBottom() - y));
+                    }
+                    gfx.setColour (Theme::accent2);
+                    for (const int on : edits.on)
+                        if (on < length)
+                            gfx.fillEllipse (g.xFor (on / sr) - 2.5f, area.getY() + 16.0f, 5.0f, 5.0f);
+                }
             }
             else
             {
-                // The cuts: Beats's, or with Por golpe the hits the envelopes start again on (taller).
+                // The cuts: Beats's, or with Por golpe the hits the envelopes start again on (taller); the one under
+                // the mouse full height. Added by the user: a dot on top. Turned off: grey and dashed.
                 const bool hits = param (P::LoopHitEnv) > 0.5f;
-                gfx.setColour (Theme::accent2.withAlpha (hits ? 0.95f : 0.8f));
-                for (const int cut : hits ? proc.getSlices() : loop.slices)
-                    gfx.fillRect (g.xFor (cut / sr) - 0.5f, area.getBottom() - (hits ? 14.0f : 6.0f), 1.0f, hits ? 14.0f : 6.0f);
+                const auto edits = proc.getHitEdits();
+                const int tol = HitEdits::tolerance (sr);
+                for (const int cut : cutsShown())
+                {
+                    const bool hot = hover == HHit && hoverHitIsCut && std::abs (cut - hoverHit) <= tol;
+                    const float tall = hot ? area.getHeight() : (hits ? 14.0f : 8.0f);
+                    gfx.setColour (Theme::accent2.withAlpha (hot ? 1.0f : (hits ? 0.95f : 0.8f)));
+                    gfx.fillRect (g.xFor (cut / sr) - (hot ? 1.0f : 0.5f), area.getBottom() - tall, hot ? 2.0f : 1.0f, tall);
+                    if (HitEdits::near (edits.on, cut, tol))
+                        gfx.fillEllipse (g.xFor (cut / sr) - 2.5f, area.getBottom() - tall - 6.0f, 5.0f, 5.0f);
+                }
+                const int length = loopLength();
+                for (const int off : edits.off)
+                {
+                    if (off >= length)
+                        continue;
+                    const bool hot = hover == HHit && ! hoverHitIsCut && std::abs (off - hoverHit) <= tol;
+                    const float x = g.xFor (off / sr);
+                    gfx.setColour (Theme::text.withAlpha (hot ? 0.9f : 0.45f));
+                    const float top = hot ? area.getY() : area.getBottom() - 14.0f;
+                    for (float y = area.getBottom() - 3.0f; y > top; y -= 5.0f)
+                        gfx.fillRect (x - 0.5f, std::max (top, y - 3.0f), 1.0f, std::min (3.0f, y - top));
+                    gfx.drawLine (x - 3.0f, area.getBottom() - 20.0f, x + 3.0f, area.getBottom() - 14.0f, 1.2f);
+                    gfx.drawLine (x - 3.0f, area.getBottom() - 14.0f, x + 3.0f, area.getBottom() - 20.0f, 1.2f);
+                }
+            }
+            // Ventana: what is outside it darkened, its edges, and its length and start on it.
+            if (const auto win = window(); win.on)
+            {
+                const float x0 = g.xFor (win.start / sr), x1 = g.xFor ((win.start + win.length) / sr);
+                gfx.setColour (Theme::well.withAlpha (0.6f));
+                gfx.fillRect (juce::Rectangle<float> (area.getX(), area.getY(), std::max (0.0f, x0 - area.getX()), area.getHeight()));
+                gfx.fillRect (juce::Rectangle<float> (x1, area.getY(), std::max (0.0f, area.getRight() - x1), area.getHeight()));
+                const bool hot = hover == HWindow || dragging == HWindow;
+                gfx.setColour (Theme::good.withAlpha (hot ? 0.16f : 0.08f));
+                gfx.fillRect (x0, area.getY(), x1 - x0, area.getHeight());
+                gfx.setColour (Theme::good);
+                gfx.fillRect (x0 - 1.0f, area.getY(), 2.0f, area.getHeight());
+                gfx.fillRect (x1 - 1.0f, area.getY(), 2.0f, area.getHeight());
+                const double beat = beatSamples();
+                // where it starts as bar.beat (the beat with its fraction, if any: 2.3,5); the start is a whole sample,
+                // a hair off the beat: rounded to a thousandth of a beat first
+                const double startBeats = beat > 0.0 ? std::round (win.start / beat * 1000.0) / 1000.0 : 0.0;
+                const int bar = (int) std::floor (startBeats / 4.0) + 1;
+                const double inBar = startBeats - 4.0 * (bar - 1) + 1.0;
+                const bool whole = std::abs (inBar - std::round (inBar)) < 1.0e-6;
+                const juce::String beatText = whole ? juce::String ((int) std::round (inBar))
+                                                    : juce::String (inBar, 2).trimCharactersAtEnd ("0").replaceCharacter ('.', ',');
+                const juce::String text = P::u8 ("VENTANA ") + P::choicesOf (P::LoopWinLen)[(int) param (P::LoopWinLen)]
+                                        + P::u8 (" · desde ") + juce::String (bar) + "." + beatText;
+                gfx.setFont (Theme::font (10.0f, true));
+                const float tw = (float) juce::GlyphArrangement::getStringWidthInt (Theme::font (10.0f, true), text) + 10.0f;
+                const auto tab = juce::Rectangle<float> (x0, area.getY() + 2.0f, tw, 14.0f);
+                gfx.fillRoundedRectangle (tab, 3.0f);
+                gfx.setColour (Theme::well);
+                gfx.drawText (text, tab, juce::Justification::centred);
             }
             gfx.setColour (Theme::good);
             gfx.setFont (Theme::font (10.0f, true));
@@ -792,7 +1049,7 @@ void WaveformView::paint (juce::Graphics& gfx)
         if (! looping && engineMode == P::EngineDrone)
         {
             // Where the drone reads, and how much of the sound each of its frames hears.
-            const double centre = s.soundingPosition (param (P::GrainPos)) / sr;
+            const double centre = s.readingPosition (param (P::GrainPos)) / sr;
             const double frame = std::ldexp (1.0, Drone::orderFor ((int) param (P::DroneSize), 48000.0)) / 48000.0;
             const float x0 = g.xFor (centre - frame * 0.5), x1 = g.xFor (centre + frame * 0.5);
             gfx.setColour (Theme::good.withAlpha (0.14f));
@@ -809,7 +1066,7 @@ void WaveformView::paint (juce::Graphics& gfx)
         }
         else if (engineMode == P::EngineGranular)
         {
-            const double centre = s.soundingPosition (param (P::GrainPos)) / sr, spray = param (P::Spray) * 0.25;
+            const double centre = s.readingPosition (param (P::GrainPos)) / sr, spray = param (P::Spray) * 0.25;
             const float x0 = g.xFor (centre - spray), x1 = g.xFor (centre + spray + param (P::GrainMs) * 0.001);
             gfx.setColour (Theme::good.withAlpha (0.14f));
             gfx.fillRect (x0, area.getY(), std::max (2.0f, x1 - x0), area.getHeight());

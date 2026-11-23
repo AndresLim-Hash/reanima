@@ -284,6 +284,36 @@ int main (int argc, char* argv[])
                 proc->setFxSlotType (0, Fx::Empty);
                 host.messageThread();
 
+                // ARP · SEQ: a generated pattern (ratchets, swing), Arp over a chord and Seq, rate automated.
+                {
+                    StepSeq::Pattern pattern;
+                    juce::Random seed (3);
+                    StepSeq::generate (pattern, -1, 0.9f, seed);
+                    pattern.value[StepSeq::Ratchet].fill (4.0f);
+                    proc->setSeqPattern (pattern);
+                    host.messageThread();
+                    host.set (P::ArpOn, 1.0f);
+                    host.set (P::ArpSwing, 60.0f);
+                    host.set (P::ArpOctaves, 4.0f);
+                    host.play ("arp warm-up", 2, {});
+                    allocs = frees = bytes = 0;
+                    for (int style = 0; style < 7; ++style)
+                    {
+                        host.set (P::ArpStyle, (float) style);
+                        host.play ("arp", blocks / 2, { 48, 55, 60, 64, 67, 71 }, P::ArpRate, 0.0f, 11.0f);
+                    }
+                    host.set (P::ArpMode, 1.0f);
+                    for (int dir = 0; dir < 4; ++dir)
+                    {
+                        host.set (P::SeqDir, (float) dir);
+                        host.play ("seq", blocks / 2, { 60 }, P::ArpRate, 0.0f, 11.0f);
+                    }
+                    host.set (P::ArpOn, 0.0f);
+                    host.play ("arp off", 4, {});
+                    host.set (P::ArpMode, 0.0f);
+                    report ("ARP/SEQ: 7 styles, 4 directions, ratchets x4, rate automated", allocs, frees, bytes);
+                }
+
                 // Polyphony beyond the voices: stealing.
                 allocs = frees = bytes = 0;
                 for (int k = 0; k < 6; ++k)

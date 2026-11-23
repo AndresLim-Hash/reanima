@@ -18,7 +18,7 @@ struct RubberRender
     int length = 0;                         // samples (the loop's length over the tempo)
     double tempo = 1.0, pitch = 1.0;
     const SampleData* sample = nullptr;
-    int loopLength = 0;
+    int loopLength = 0, loopStart = 0;      // the part of the file rendered (Ventana)
 };
 class FxRack;
 class Mechanism;
@@ -56,6 +56,11 @@ public:
     std::atomic<bool> previousInUse { false };
 
     void process (juce::AudioBuffer<float>& buffer, const juce::MidiBuffer& midi, const ParamSnapshot& params, double bpm);
+    // Audio thread, before process(): the sidechain's audio for the coming block (null: none), for the matrix's
+    // Sidechain source and the Impronta effect. It must stay valid until process() returns.
+    void setSidechain (const float* left, const float* right, int length) noexcept;
+    // The Sidechain source as the voices last read it (0..1), for the panel.
+    std::atomic<float> sideShown { 0.0f };
     // The host's transport at the start of the next block: playing, and where (quarter notes from the start).
     void setTransport (bool playing, double ppq) noexcept { hostPlaying = playing; hostPpq = ppq; }
 
@@ -66,6 +71,8 @@ public:
     // alone (no Mecanismo) or Mecanismo alone (the note muted; its level still drives the bow and the air).
     enum Listen { ListenAll, ListenSample, ListenMechanism };
     std::atomic<int> listen { ListenAll };
+    // Tests: each note's random seed from its key only (ReanimaAudit estres), so that it can be set against itself alone.
+    std::atomic<bool> keySeeds { false };
 
     // Playback position (in samples) of each voice for the UI, or -1.
     std::array<std::atomic<float>, physicalVoices> playheads;
@@ -87,6 +94,20 @@ public:
     // Under Warp Tonos, whether this sample is played as Textura instead (engines A, B and D).
     static bool tonesFallBack (const SampleData& s, int engine) noexcept;
 
+    // LOOP Normal's Ventana: the part of the loop that plays (samples of the file), from its length in beats and its
+    // Posición; the whole loop with Completo, without a tempo, or in SLICE.
+    struct LoopWindow { int start = 0, length = 0; bool on = false; };
+    static LoopWindow loopWindow (const SampleData& s, const ParamSnapshot& p) noexcept;
+    static double loopBpmOf (const SampleData& s, const ParamSnapshot& p) noexcept;
+
+    // The matrix's modulation as the knobs show it (their outer ring): that of the last note played (its LFOs,
+    // envelopes, velocity, macros...), or with no note sounding the macros alone. Audio thread writes, UI reads.
+    std::array<std::atomic<float>, P::NumDests> modShown {};
+    // The destination that moves a knob's parameter (DstNone: none), and its value moved by `amount` of that
+    // destination, in the parameter's own units, as the voices apply it.
+    static int destOf (int paramId) noexcept;
+    static float modulated (int paramId, float value, float amount) noexcept;
+
     // The Mecanismo knob, or 0 while its On/Off is off.
     static float mechanismAmount (const ParamSnapshot& p) noexcept;
 
@@ -96,8 +117,19 @@ public:
     // The cuts in time order, and which slice each key plays (slot k from Primera nota: slice order[k]).
     void setSlices (const std::vector<int>& cuts, const std::vector<int>& order) noexcept;
     int sliceCount() const noexcept { return slicesUsed.load (std::memory_order_acquire); }
+    // LOOP Beats: its cuts as the user left them (hits turned off or added, HitEdits), for the sample they were
+    // worked out on; empty: the analysis's own (SampleData::LoopInfo::slices). Message thread.
+    static constexpr int maxBeatCuts = 1024;
+    void setBeatCuts (const SampleData* owner, const std::vector<int>& cuts) noexcept;
+    // Audio thread: the cuts Beats plays for this sample.
+    const std::vector<int>& beatSlices (const SampleData& s) const noexcept;
+    // Por golpe in TIMBRE: a hit's peak over its first 15 ms, and the peak that counts as full (Brillo darkens the
+    // weaker hits as softer keys): that of the loop's strong hits (three quarters of its hits stay under). Message thread.
+    static float hitPeak (const SampleData& s, int at) noexcept;
+    std::atomic<float> hitStrengthRef { 1.0f };
     // LOOP "Rubber Band": what a voice asks for (tempo, pitch), and the render ready (set on the message thread).
     std::atomic<double> rubberWantTempo { 1.0 }, rubberWantPitch { 1.0 };
+    std::atomic<int> rubberWantStart { 0 }, rubberWantLength { 0 };     // the part of the loop (Ventana)
     std::atomic<bool> rubberWanted { false };
     std::atomic<const RubberRender*> rubberReady { nullptr };
     // SLICE diagnosis for the window: the last key received and the slice its voice took (-1: none).
@@ -108,16 +140,24 @@ private:
     void noteOn (int note, float velocity, const ParamSnapshot& p, int channel = 1);
     void noteOff (int note, const ParamSnapshot& p, int channel = 1);
     void renderVoices (juce::AudioBuffer<float>& buffer, int start, int num, const ParamSnapshot& p);
+    // The matrix's Sidechain source over samples [start, start + num) of the block.
+    void followSidechain (int start, int num, const ParamSnapshot& p) noexcept;
     Voice* allocateVoice();
     Drone::Stream* acquireDrone() noexcept;
     LoopStretcher* acquireStretcher() noexcept;
 
-    // LOOP Complex: Signalsmith Stretch (MIT) per note, made in prepare(), never on the audio thread.
-    static constexpr int numStretchers = 8;
+    // LOOP Complex / Complex Pro and Beats's tails: a stretcher (Bungee, Signalsmith) per note, made in prepare(),
+    // never on the audio thread. One for every voice, stolen ones fading out included: with fewer (there were 8),
+    // the 9th note sounding at once, release tails counted, found none and played as Textura, broken until
+    // an earlier note ended (ReanimaAudit estres).
+    static constexpr int numStretchers = physicalVoices;
     std::vector<std::unique_ptr<LoopStretcher>> stretchers;
+    std::atomic<bool> stretchersReady { false };
+    void buildStretchers (double sr);
 
-    // Engine F needs long buffers; they are made the first time it is chosen, off the audio thread.
-    static constexpr int numDroneStreams = 16;
+    // Engine F needs long buffers; they are made the first time it is chosen, off the audio thread. One for
+    // every voice (with 16, the 17th note at once had none and was left empty).
+    static constexpr int numDroneStreams = physicalVoices;
     std::unique_ptr<Drone::Shared> droneShared;
     std::vector<std::unique_ptr<Drone::Stream>> droneStreams;
     std::atomic<bool> dronesReady { false };
@@ -125,6 +165,16 @@ private:
     std::array<std::atomic<int>, maxSlices> sliceStarts {};
     std::array<std::atomic<int>, maxSlices> sliceEnds {}, sliceOriginal {}, cutPoints {};      // end -1: the sample's end
     std::atomic<int> slicesUsed { 0 };
+    // Beats's cuts: written on the message thread under a sequence number (odd while writing), copied by the
+    // audio thread at the start of a block when it has moved on and is even (never torn, nothing allocated).
+    std::array<std::atomic<int>, maxBeatCuts> beatCutsShared {};
+    std::atomic<int> beatCutsCount { 0 };
+    std::atomic<const SampleData*> beatCutsOwner { nullptr };
+    std::atomic<unsigned> beatCutsSeq { 0 };
+    std::vector<int> beatCutsLive;              // the audio thread's copy (room for maxBeatCuts)
+    const SampleData* beatCutsLiveOwner = nullptr;
+    unsigned beatCutsLiveSeq = 0;
+    void takeBeatCuts() noexcept;
     double stretcherRate = 0.0;
 
     std::vector<std::unique_ptr<Voice>> voices;
@@ -164,6 +214,15 @@ private:
     float masterGainL = 1.0f, masterGainR = 1.0f, monoMix = 0.0f;
     bool masterGainsReady = false;
     juce::uint32 noteCounter = 0;
+
+    // The sidechain (setSidechain) and its follower: the level of what Respuesta listens to, and of its highs for Brillo.
+    const float* sideL = nullptr;
+    const float* sideR = nullptr;
+    int sideLen = 0;
+    float sideValue = 0.0f;
+    float sideEnv = 0.0f, sideHighEnv = 0.0f;
+    int sideResponse = -1;
+    Dsp::Biquad sideBand, sideHigh;
 
     std::array<double, P::numLfos> globalLfoPhase {};
     std::array<float, P::numLfos> globalSampleHold {};

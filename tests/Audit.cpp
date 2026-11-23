@@ -11,8 +11,11 @@
 #include "FxRack.h"
 #include "DspUtil.h"
 #include "HelpText.h"
+#include "EditPage.h"
+#include "SampleBrowser.h"
 #include <atomic>
 #include <cstdio>
+#include <set>
 #include <cstdlib>
 #include <functional>
 #include <new>
@@ -1214,6 +1217,7 @@ struct FxRun
 {
     ParamSnapshot p {};
     int slot = 0;
+    const Audio* side = nullptr;    // the sidechain (Impronta), as long as the input
 
     explicit FxRun (int type, float mix = 1.0f)
     {
@@ -1247,6 +1251,10 @@ struct FxRun
             Audio view (chunk.getArrayOfWritePointers(), 2, n);
             view.copyFrom (0, 0, in, 0, pos, n);
             view.copyFrom (1, 0, in, 1, pos, n);
+            if (side != nullptr && pos + n <= side->getNumSamples())
+                rack.setSidechain (side->getReadPointer (0, pos), side->getReadPointer (1, pos), n);
+            else
+                rack.setSidechain (nullptr, nullptr, 0);
             rack.process (view, p, 120.0);
             in.copyFrom (0, pos, view, 0, 0, n);
             in.copyFrom (1, pos, view, 1, 0, n);
@@ -1642,9 +1650,15 @@ void auditParameters()
         const bool mode = id == P::SustainMode, grain = id == P::GrainMs || id == P::Spray || id == P::GranSpeed;
         const bool partials = id == P::Partials || id == P::NoiseLevel;
         const bool transient = id == P::TransientMs || id == P::TransientGain;
-        const bool cloud = id == P::GrainPos || id == P::GrainDensity || id == P::GrainPitch || id == P::GrainReverse || id == P::GrainWidth;
+        const bool cloud = id == P::GrainPos || id == P::GrainDensity || id == P::GrainPitch || id == P::GrainReverse || id == P::GrainWidth || id == P::GrainCoherent;
         const bool drone = id >= P::DroneStretch && id <= P::DroneCurveOn;
 
+        // Armónico's knobs need that filter type and the Sidechain source a sidechain (auditColorPlay); Movimiento is
+        // engines B and D's alone.
+        if (id == P::FltHarmGain || id == P::FltHarmRegion || (id >= P::ScSens && id <= P::ScResponse))
+            return true;
+        if (id == P::SustainMotion && engineMode != P::EngineReenvelope && engineMode != P::EngineHybrid)
+            return true;
         // They act when a sample is loaded or tuned, on a faster attack or a sample whose level
         // moves (auditSynthEnvelope), or answer the keyboard's controls (auditExpression).
         if (id == P::SnapC || id == P::Reverse || id == P::EnvLock || id == P::Punch || id == P::EnvMode)
@@ -1654,7 +1668,13 @@ void auditParameters()
         // The settings of LOOP act only in LOOP (auditLoops); Reproducción itself switches to it.
         if (id == P::LoopWarp || id == P::LoopSync || id == P::LoopBeats || id == P::LoopAlgo || id == P::LoopKind || id == P::LoopBpm
             || id == P::SliceBy || id == P::SliceDivision || id == P::SliceSensitivity || id == P::SliceStart
-            || id == P::LoopPlay || id == P::SliceThru || id == P::SliceFade || id == P::LoopHitEnv)
+            || id == P::LoopPlay || id == P::SliceThru || id == P::SliceFade || id == P::LoopHitEnv || id == P::MechPerHit || id == P::LoopWinLen || id == P::LoopWinPos)    // auditTimbreHits, auditLoopWindow
+            return true;
+        // The key: for the arpeggiator and sequencer, it does not sound by itself (auditKey).
+        if (id == P::KeySource || id == P::KeyRoot || id == P::KeyScale)
+            return true;
+        // ARP · SEQ: it acts on the notes played, not on a held note (auditArp).
+        if (id >= P::ArpOn && id <= P::ArpDensity)
             return true;
         // The hand-over to the granular sustain of engines B and D.
         if ((id == P::GrainFade || id == P::GrainBlend) && engineMode != P::EngineReenvelope && engineMode != P::EngineHybrid)
@@ -1738,6 +1758,10 @@ void auditParameters()
 
     title ("Cada parámetro de cada efecto hace algo audible");
     const auto input = richInput (1.2, rate);
+    // Impronta listens to a sidechain: a sound of its own, the input played backwards at half its level.
+    Audio side (input);
+    side.reverse (0, side.getNumSamples());
+    side.applyGain (0.5f);
     for (int type = 1; type < Fx::NumTypes; ++type)
     {
         const auto& spec = Fx::spec (type);
@@ -1748,6 +1772,7 @@ void auditParameters()
             for (int variant = 0; variant < 3 && ! alive; ++variant)
             {
                 FxRun run (type);
+                run.side = &side;
                 // Some knobs depend on a switch or a menu: try them with those changed too.
                 for (int j = 0; j < (int) spec.params.size() && variant > 0; ++j)
                     if (j != k && spec.params[(size_t) j].kind != Fx::ParamSpec::Knob)
@@ -3805,6 +3830,1685 @@ void auditRubber()
 }
 
 //==============================================================================
+// Where a hit is placed when it lands on the loud tail of the one before (a bass, a pad, a ringing tom): a loop
+// of 16 hits, a quarter of a second apart, each a tone or noise burst rising in 1 ms and dying away slowly, so
+// that the tail of each one is still at half to two thirds of the next hit's level when it comes. Each hit must
+// be found, and placed on its rise: never more than 3 ms early (before, the start was walked back while the
+// level stayed over a tenth of the peak, and on such a tail that went back by up to 20 ms) nor 1.5 ms late
+// (a slice that starts after its hit's attack loses it).
+void onsetCase (double tauTone, double tauNoise, const juce::String& label, double maxEarly, double maxLate)
+{
+    const double rate = 44100.0;
+    const int n = (int) (4.0 * rate);
+    juce::AudioBuffer<float> loop (2, n);
+    loop.clear();
+    juce::Random rng (21);
+    std::vector<int> truth;
+    for (int k = 0; k < 16; ++k)
+    {
+        const int at = (int) ((0.1 + k * 0.25) * rate);         // (a hit at the very start is the loop's start: not looked for)
+        truth.push_back (at);
+        const int kind = k % 4;                   // 80 Hz, 300 Hz, 1.2 kHz, noise
+        const double f = kind == 0 ? 80.0 : kind == 1 ? 300.0 : 1200.0;
+        const double tau = kind == 3 ? tauNoise : tauTone;
+        for (int i = 0; at + i < n; ++i)
+        {
+            const double t = i / rate;
+            const double env = std::min (1.0, t / 0.001) * std::exp (-t / tau);
+            if (i > 100 && env < 1.0e-4)
+                break;
+            const double v = kind == 3 ? rng.nextFloat() * 2.0 - 1.0 : std::sin (2.0 * juce::MathConstants<double>::pi * f * t);
+            loop.addSample (0, at + i, (float) (0.25 * env * v));
+            loop.addSample (1, at + i, (float) (0.25 * env * v));
+        }
+    }
+    const auto info = SampleAnalysis::analyseLoop (loop, rate, "colas loop 120bpm");
+    const auto& hits = info.hits;
+    int found = 0;
+    double worstEarly = 0.0, worstLate = 0.0;
+    juce::String detail;
+    for (const int t : truth)
+    {
+        int best = -1;
+        for (const auto& h : hits)
+            if (std::abs (h.first - t) < (int) (0.03 * rate) && (best < 0 || std::abs (h.first - t) < std::abs (best - t)))
+                best = h.first;
+        if (best < 0)
+        {
+            detail << "falta " << juce::String (t / rate, 2) << " s; ";
+            continue;
+        }
+        ++found;
+        const double ms = (best - t) / rate * 1000.0;
+        worstEarly = std::min (worstEarly, ms);
+        worstLate = std::max (worstLate, ms);
+    }
+    if (found < (int) truth.size())
+    {
+        juce::String all;
+        for (const auto& h : hits)
+            all << juce::String (h.first / rate, 3) << " ";
+        detail << "hallados: " << all << "(loop " << info.length << ", tiempos " << info.beats << ")";
+    }
+    // (A hit not found at all is the detector's, not where it places one: an 80 Hz hit just after a noise burst is not seen;
+    // it was not before either. Reported, not failed.)
+    std::printf ("(info) %s: %d de 16 golpes hallados %s\n", label.toRawUTF8(), found, detail.toRawUTF8());
+    check (worstEarly >= -maxEarly && worstLate <= maxLate, label + ": cada golpe en su subida, no más de " + juce::String (maxEarly, 1) + " ms antes ni "
+               + juce::String (maxLate, 1) + " ms después",
+           "de " + juce::String (worstEarly, 1) + " a " + juce::String (worstLate, 1) + " ms");
+}
+
+void auditOnsetOnTail()
+{
+    title ("Golpes sobre la cola fuerte del anterior: en su sitio, no hasta 20 ms antes");
+    onsetCase (0.25, 0.15, "Colas a -9 dB al llegar el siguiente", 3.0, 1.5);
+    onsetCase (0.6, 0.35, "Colas a -3,5 dB y sumadas (extremo)", 3.0, 1.5);
+}
+
+//==============================================================================
+// LOOP: the hits the user turns off or adds (HitEdits). Eight tones, a hit each 0.25 s (4 beats at 120 BPM):
+// the corrections hold through Sensibilidad, saving and reopening, and a new analysis; a new sample starts
+// without; Beats in a host at 100 BPM plays without a hit turned off (the slice before it runs on through it).
+void auditHitEdits()
+{
+    title ("LOOP: golpes apagados y añadidos a mano (se guardan, sobreviven a Sensibilidad y al reanálisis; Beats los usa)");
+
+    // The corrections alone.
+    {
+        HitEdits e;
+        e.off = { 1000 };
+        e.on = { 5000 };
+        const auto cut = e.apply ({ 0, 1000, 3000, 5020, 8000 }, 10000, 100, 50);
+        check (cut == std::vector<int> ({ 0, 3000, 5000, 8000 }), "Correcciones: quita la apagada, pone la añadida (y gana a una encontrada a 20 muestras)",
+               juce::String ((int) cut.size()) + " cortes");
+        const auto again = HitEdits::fromString (e.toString());
+        check (again.off == e.off && again.on == e.on && e.toString() == "off:1000|on:5000", "Correcciones: se escriben y se leen igual", e.toString());
+        HitEdits t;
+        const bool a = t.toggle (2000, true, 50), b = t.toggle (2030, true, 50);
+        t.add (7000, 50);
+        const bool c = t.toggle (7010, true, 50);
+        check (a && b && t.empty() && c, "Correcciones: clic apaga, otro clic enciende; un clic quita una añadida", t.toString());
+        check (HitEdits().apply ({ 0, 10, 20 }, 100, 5, 2) == std::vector<int> ({ 0, 10, 20 }), "Sin correcciones, los cortes son los de siempre", "");
+    }
+
+    const double rate = 48000.0;
+    constexpr int slices = 8;
+    const double freqs[slices] = { 1000.0, 1189.2, 1414.2, 1681.8, 2000.0, 2378.4, 2828.4, 3363.6 };
+    const int seg = (int) (0.25 * rate), n = slices * seg;
+    Audio loop (2, n);
+    for (int k = 0; k < slices; ++k)
+        for (int i = 0; i < seg; ++i)
+        {
+            const double t = i / rate;
+            // each a hit that dies away (a level that rises at each hit, as Transitorios asks)
+            // dying away before the next (its tail under a tenth of the hit: the analysis places the hit on its
+            // rise; over the tail of a loud note it can place it up to some 20 ms early, a matter of its own)
+            const float v = (float) (0.5 * std::exp (-t / 0.04) * std::sin (2.0 * juce::MathConstants<double>::pi * freqs[k] * t));
+            loop.setSample (0, k * seg + i, v);
+            loop.setSample (1, k * seg + i, v);
+        }
+    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Golpes tonos loop 120bpm.wav");
+    file.deleteFile();
+    {
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (loop, 0, n);
+    }
+    const auto settle = [] (ReanimaProcessor& p)
+    {
+        for (int k = 0; k < 600 && p.isLoading(); ++k)
+        {
+            juce::Thread::sleep (10);
+            p.serviceMessageThread();
+        }
+        for (int k = 0; k < 20; ++k)
+        {
+            p.serviceMessageThread();
+            juce::Thread::sleep (5);
+        }
+    };
+    HostAt host;        // 100 BPM: the loop (120) plays at x0.83
+    ReanimaProcessor proc;
+    proc.setPlayConfigDetails (0, 2, rate, 256);
+    proc.prepareToPlay (rate, 256);
+    proc.loadSampleNow (file);
+    settle (proc);
+    const auto set = [&] (ReanimaProcessor& p, const char* id, float v)
+    {
+        if (auto* param = p.apvts.getParameter (id))
+            param->setValueNotifyingHost (param->convertTo0to1 (v));
+        p.serviceMessageThread();
+    };
+    for (const auto& [id, v] : { std::pair<const char*, float> { "playMode", 1.0f }, { "loopKind", 1.0f }, { "sliceBy", 0.0f },
+                                 { "volume", 0.0f }, { "monoBass", 0.0f }, { "envLock", 1.0f }, { "ampA", 0.1f }, { "ampS", 1.0f }, { "ampR", 30.0f } })
+        set (proc, id, v);
+    settle (proc);
+    const int tol = HitEdits::tolerance (rate);
+    const auto hasCut = [tol] (const std::vector<int>& cuts, int at) { return HitEdits::near (cuts, at, tol); };
+    const auto first = proc.getSlices();
+    if (std::getenv ("GOLPES_DIAG") != nullptr && proc.getSample() != nullptr)
+    {
+        for (const int c : first)
+            std::printf ("corte %d\n", c);
+        for (const auto& h : proc.getSample()->loopInfo.hits)
+            std::printf ("golpe %d %.3f\n", h.first, h.second);
+        std::printf ("loop length %d beats %d\n", proc.getSample()->loopInfo.length, proc.getSample()->loopInfo.beats);
+    }
+    check (first.size() == (size_t) slices && hasCut (first, 3 * seg), "Transitorios encuentra los 8 golpes", juce::String ((int) first.size()) + " cortes");
+
+    // Off: the 4th hit.
+    auto edits = proc.getHitEdits();
+    edits.toggle (first.size() > 3 ? first[3] : 3 * seg, true, tol);
+    proc.setHitEdits (edits);
+    auto now = proc.getSlices();
+    check (now.size() == (size_t) slices - 1 && ! hasCut (now, 3 * seg), "Clic en un golpe: deja de cortar (SLICE: un trozo menos)", juce::String ((int) now.size()) + " cortes");
+    check ((int) proc.paramValue (P::SliceBy) == P::SliceTransients, "Apagar un golpe no pasa los cortes a «A mano»", "");
+
+    // Sensibilidad down and up: still off.
+    set (proc, "sliceSensitivity", 0.2f);
+    set (proc, "sliceSensitivity", 0.9f);
+    proc.serviceMessageThread();
+    now = proc.getSlices();
+    check (! hasCut (now, 3 * seg), "Sigue apagado al mover Sensibilidad", juce::String ((int) now.size()) + " cortes a 0,9");
+    set (proc, "sliceSensitivity", 0.5f);
+
+    // Added: one in the middle of the 6th tone.
+    edits = proc.getHitEdits();
+    edits.add (5 * seg + seg / 2, tol);
+    proc.setHitEdits (edits);
+    now = proc.getSlices();
+    check (hasCut (now, 5 * seg + seg / 2) && now.size() == (size_t) slices, "Doble clic: añade un golpe donde no lo había", juce::String ((int) now.size()) + " cortes");
+
+    // The project saved and opened: the same corrections, the same cuts.
+    {
+        juce::MemoryBlock state;
+        proc.getStateInformation (state);
+        ReanimaProcessor reopened;
+        reopened.setPlayConfigDetails (0, 2, rate, 256);
+        reopened.prepareToPlay (rate, 256);
+        reopened.setStateInformation (state.getData(), (int) state.getSize());
+        settle (reopened);
+        check (reopened.getHitEdits().toString() == proc.getHitEdits().toString() && reopened.getSlices() == proc.getSlices(),
+               "Al reabrir el proyecto: mismos golpes apagados y añadidos, mismos cortes", reopened.getHitEdits().toString());
+    }
+
+    // Analysed again: another engine asks for the whole analysis (a new SampleData of the same sound): kept.
+    {
+        const auto before = proc.getHitEdits().toString();
+        const auto* analysed = proc.getSample().get();
+        set (proc, "engine", 0.0f);
+        settle (proc);
+        set (proc, "engine", 1.0f);
+        settle (proc);
+        for (int k = 0; k < 300 && proc.getSample().get() == analysed; ++k)
+        {
+            juce::Thread::sleep (10);
+            proc.serviceMessageThread();
+        }
+        settle (proc);
+        check (proc.getSample().get() != analysed && proc.getHitEdits().toString() == before && ! hasCut (proc.getSlices(), 3 * seg),
+               "Al analizar de nuevo el sample (otro motor) se conservan",
+               juce::String (proc.getSample().get() != analysed ? "reanalizado, " : "SIN reanálisis, ") + proc.getHitEdits().toString());
+    }
+
+    // Beats (LOOP Normal) in the host at 100: the 4th tone starts where the 3rd slice, read on, reaches it
+    // (3.4 slices of time) instead of at its own hit (3.6 slices: 3 x 1.2).
+    proc.setPlayHead (&host);
+    set (proc, "loopKind", 0.0f);
+    set (proc, "loopAlgo", 1.0f);
+    settle (proc);
+    check (! proc.getBeatCuts().empty() && ! hasCut (proc.getBeatCuts(), 3 * seg), "Beats toma los mismos golpes corregidos",
+           juce::String ((int) proc.getBeatCuts().size()) + " cortes");
+    const auto onsetOf4th = [&] ()
+    {
+        const int total = (int) (2.5 * rate), block = 256;
+        Audio out (2, total), buf (2, block);
+        out.clear();
+        for (int pos = 0; pos < total; pos += block)
+        {
+            juce::MidiBuffer midi;
+            if (pos == 0)
+                midi.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+            buf.clear();
+            proc.processBlock (buf, midi);
+            out.copyFrom (0, pos, buf, 0, 0, std::min (block, total - pos));
+        }
+        {
+            juce::MidiBuffer off, none;
+            off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            for (int k = 0; k < 200; ++k)
+            {
+                buf.clear();
+                proc.processBlock (buf, k == 0 ? off : none);
+            }
+        }
+        // where the 4th tone first reaches half its loudest in the first round
+        const int win = (int) (0.02 * rate), stepAt = (int) (0.001 * rate);     // 50 Hz apart: the 3rd tone (267 Hz away) does not leak in
+        double top = 0.0;
+        for (int at = (int) (0.6 * rate); at + win < (int) (1.2 * rate); at += stepAt)
+            top = std::max (top, toneAmp (out.getReadPointer (0) + at, win, freqs[3], rate));
+        for (int at = (int) (0.6 * rate); at + win < (int) (1.2 * rate); at += stepAt)
+            if (top > 1.0e-3 && toneAmp (out.getReadPointer (0) + at, win, freqs[3], rate) > 0.5 * top)
+                return (at + win / 2) / rate;
+        return -1.0;
+    };
+    const double withOff = onsetOf4th();
+    const auto kept = proc.getHitEdits();
+    proc.setHitEdits (HitEdits());
+    settle (proc);
+    const double withAll = onsetOf4th();
+    proc.setHitEdits (kept);
+    const double slice = 0.25;
+    check (std::abs (withAll - 3.6 * slice) < 0.02 && std::abs (withOff - 3.4 * slice) < 0.02,
+           "Beats a 100 BPM: sin el golpe apagado el 4.º tono no se corta en su golpe (llega con el trozo anterior)",
+           "con el golpe " + juce::String (withAll, 3) + " s (esperado 0,900), apagado " + juce::String (withOff, 3) + " s (esperado 0,850)");
+
+    // SAMPLE and EDICIÓN share the same cuts and the same click: off and back on from either.
+    {
+        const auto shown = proc.getLoopCuts();
+        const int cut = shown.size() > 2 ? shown[2] : -1;
+        proc.toggleHit (cut, true);
+        const bool gone = ! hasCut (proc.getLoopCuts(), cut);
+        proc.toggleHit (cut, false);
+        const bool back = hasCut (proc.getLoopCuts(), cut);
+        check (proc.hitsEditable() && cut > 0 && gone && back, "SAMPLE y EDICIÓN: los mismos cortes, el mismo clic (apaga y vuelve a encender)",
+               juce::String ((int) shown.size()) + " cortes");
+    }
+
+    // A new sample: none.
+    {
+        const auto other = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Golpes otro loop 120bpm.wav");
+        other.deleteFile();
+        Audio quieter (2, n);
+        quieter.copyFrom (0, 0, loop, 0, 0, n);
+        quieter.copyFrom (1, 0, loop, 1, 0, n);
+        quieter.applyGain (0.5f);
+        {
+            std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (other);
+            juce::WavAudioFormat wav;
+            if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+                w->writeFromAudioSampleBuffer (quieter, 0, n);
+        }
+        proc.loadSample (other);        // as the user loads one (the browser, a drop)
+        settle (proc);
+        check (proc.getHitEdits().empty(), "Un sample nuevo empieza sin golpes corregidos", proc.getHitEdits().toString());
+    }
+    proc.setPlayHead (nullptr);
+}
+
+//==============================================================================
+// EDICIÓN, Imán: the grid follows the loop's beats (a loop of 4 beats at 120 BPM: 24000 samples a beat at
+// 48 kHz) or, without a tempo, time; Auto as fine as the zoom leaves room for; each line exactly on a sample;
+// the zoom never moves a selection; a position near a line goes to it; off, positions are as given.
+void auditMagnet()
+{
+    title ("EDICIÓN: imán y rejilla (tiempos del loop, sin tempo, Auto según el zoom, precisión de una muestra)");
+    const double rate = 48000.0;
+    const int beat = 24000, n = 4 * beat;
+    Audio loop (2, n);
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = std::fmod (i / rate, 0.5);
+        const float v = (float) (0.5 * std::exp (-t / 0.05) * std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / rate));
+        loop.setSample (0, i, v);
+        loop.setSample (1, i, v);
+    }
+    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Iman loop 120bpm.wav");
+    file.deleteFile();
+    {
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (loop, 0, n);
+    }
+    ReanimaProcessor proc;
+    proc.setPlayConfigDetails (0, 2, rate, 256);
+    proc.prepareToPlay (rate, 256);
+    proc.loadSampleNow (file);
+    for (int k = 0; k < 600 && proc.isLoading(); ++k)
+    {
+        juce::Thread::sleep (10);
+        proc.serviceMessageThread();
+    }
+    proc.serviceMessageThread();
+    if (auto* p = proc.apvts.getParameter ("playMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 (1.0f));
+    proc.serviceMessageThread();
+
+    EditView view (proc);
+    view.setSize (1000, 300);           // the waveform some 980 px wide
+    view.sampleChanged();
+    view.setSnapsToGrid (true);
+
+    auto g = view.grid();
+    check (g.musical && std::abs (g.beat - beat) < 1.0, "Loop: la rejilla cuenta sus tiempos", juce::String (g.beat, 1) + " muestras por tiempo");
+    check (g.name.contains ("1/8") || g.name.contains ("1/16"), "Auto con todo el loop a la vista (980 px): una división útil", g.name);
+
+    view.setViewForTests (0.0, 0.01);       // x100: under a 16th on screen
+    g = view.grid();
+    check (g.step < beat / 16.0 + 1.0, "Auto al acercar: más fina", g.name + ", paso " + juce::String (g.step, 1));
+
+    view.setViewForTests (0.0, 1.0);
+    view.setGridChoice (7);             // 1/16
+    g = view.grid();
+    check (std::abs (g.step - beat / 4.0) < 1.0e-9 && g.name == "1/16", "Elegida a mano: 1/16 = un cuarto de tiempo", g.name);
+    // A position just past a 16th (by 0.3 % of the file: 288 samples) goes onto it, exactly on its sample.
+    const double target = 5 * beat / 4.0;     // the 5th sixteenth: 30000
+    const double got = view.snapped ((target + 288.0) / n);
+    check (std::abs (got * n - target) < 1.0e-6, "Un borde cerca de una línea va a ella, en la muestra exacta",
+           juce::String (got * n, 3) + " (esperado 30000)");
+    view.setGridChoice (10);            // 1/4T
+    g = view.grid();
+    check (std::abs (g.step - beat * 2.0 / 3.0) < 1.0e-6, "Tresillos: 1/4T = dos tercios de tiempo", juce::String (g.step, 2));
+    const double t3 = view.snapped ((beat * 2.0 / 3.0 + 100.0) / n) * n;
+    check (std::abs (t3 - std::round (beat * 2.0 / 3.0)) < 1.0e-6, "Tresillo: a la muestra más cercana a la línea (16000)", juce::String (t3, 2));
+    view.setGridChoice (0);
+
+    // The zoom does not move a selection.
+    view.selectAll();
+    const double a0 = view.selectionStartForTests(), b0 = view.selectionEndForTests();
+    view.setViewForTests (0.3, 0.05);
+    view.setViewForTests (0.0, 1.0);
+    check (view.selectionStartForTests() == a0 && view.selectionEndForTests() == b0, "El zoom no mueve la selección", "");
+
+    // Off: positions as given.
+    view.setSnapsToGrid (false);
+    check (! view.snapsToGrid(), "Imán apagado: se edita libre", "");
+    // Saved with the project.
+    view.setSnapsToGrid (true);
+    view.setGridChoice (7);
+    {
+        juce::MemoryBlock state;
+        proc.getStateInformation (state);
+        ReanimaProcessor reopened;
+        reopened.setStateInformation (state.getData(), (int) state.getSize());
+        EditView other (reopened);
+        check (other.snapsToGrid() && other.gridChoice() == 7, "Imán y resolución se guardan con el proyecto", "");
+    }
+
+    // Without a tempo: a one-shot (no loop) with no host tempo: time.
+    if (auto* p = proc.apvts.getParameter ("playMode"))
+        p->setValueNotifyingHost (p->convertTo0to1 (0.0f));
+    proc.serviceMessageThread();
+    Audio hit (2, n);
+    for (int i = 0; i < n; ++i)
+    {
+        const float v = (float) (0.5 * std::exp (-i / rate / 0.3) * std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / rate));
+        hit.setSample (0, i, v);
+        hit.setSample (1, i, v);
+    }
+    const auto oneShot = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Iman golpe.wav");
+    oneShot.deleteFile();
+    {
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (oneShot);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (hit, 0, n);
+    }
+    ReanimaProcessor shot;
+    shot.setPlayConfigDetails (0, 2, rate, 256);
+    shot.prepareToPlay (rate, 256);
+    shot.loadSampleNow (oneShot);
+    for (int k = 0; k < 600 && shot.isLoading(); ++k)
+    {
+        juce::Thread::sleep (10);
+        shot.serviceMessageThread();
+    }
+    shot.serviceMessageThread();
+    EditView timeView (shot);
+    timeView.setSize (1000, 300);
+    timeView.sampleChanged();
+    timeView.setSnapsToGrid (true);
+    g = timeView.grid();
+    check (! g.musical && g.step > 0.0 && g.name.endsWith ("ms"), "Sin tempo: rejilla de tiempo", g.name);
+    timeView.setViewForTests (0.0, 0.0005);     // the finest zoom
+    g = timeView.grid();
+    check (g.step <= 0.001 * rate + 1.0e-9, "Sin tempo, al máximo zoom: 1 ms", g.name);
+    file.deleteFile();
+    oneShot.deleteFile();
+}
+
+//==============================================================================
+// TIMBRE por golpe: a loop of 8 noise hits (strong, weak, strong, weak...) at 120 BPM, LOOP Normal at its own
+// tempo. With Por golpe, TIMBRE acts on each hit: Brillo darkens the weak hits against the strong ones, Arco the
+// start of each hit, Apagado the end of each, and Mecanismo strikes at each hit if asked. Without Por golpe each
+// knob does what it did (the hits play alike).
+void auditTimbreHits()
+{
+    title ("TIMBRE por golpe: Brillo, Arco y Apagado en cada golpe; Mecanismo por golpe");
+    const double rate = 48000.0;
+    constexpr int hits = 8;
+    const int seg = (int) (0.25 * rate), n = hits * seg;
+    Audio loop (2, n);
+    juce::Random r (7);
+    for (int k = 0; k < hits; ++k)
+        for (int i = 0; i < seg; ++i)
+        {
+            const float v = (float) ((k % 2 == 0 ? 0.6 : 0.2) * std::exp (-i / rate / 0.06)) * (r.nextFloat() * 2.0f - 1.0f);
+            loop.setSample (0, k * seg + i, v);
+            loop.setSample (1, k * seg + i, v);
+        }
+    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Timbre golpes loop 120bpm.wav");
+    file.deleteFile();
+    {
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (loop, 0, n);
+    }
+    ReanimaProcessor proc;
+    proc.setPlayConfigDetails (0, 2, rate, 128);
+    proc.prepareToPlay (rate, 128);
+    proc.loadSampleNow (file);
+    for (int k = 0; k < 600 && proc.isLoading(); ++k)
+    {
+        juce::Thread::sleep (10);
+        proc.serviceMessageThread();
+    }
+    const auto set = [&] (const char* id, float v)
+    {
+        if (auto* param = proc.apvts.getParameter (id))
+            param->setValueNotifyingHost (param->convertTo0to1 (v));
+    };
+    for (const auto& [id, v] : { std::pair<const char*, float> { "playMode", 1.0f }, { "loopKind", 0.0f }, { "volume", 0.0f }, { "monoBass", 0.0f },
+                                 { "envLock", 1.0f }, { "ampA", 1.0f }, { "ampD", 2000.0f }, { "ampS", 1.0f }, { "ampR", 30.0f },
+                                 { "velBright", 0.0f }, { "bow", 0.0f }, { "relDark", 0.0f }, { "relNoise", 0.0f }, { "sliceSensitivity", 0.5f } })
+        set (id, v);
+    for (int k = 0; k < 30; ++k)
+    {
+        proc.serviceMessageThread();
+        juce::Thread::sleep (5);
+    }
+    // One round of the loop (key held, at full velocity); the high band (over 6 kHz) of each hit's first and last
+    // 60 ms, in dB, hit by hit.
+    struct Round { std::vector<double> early, late, level; };
+    const auto round = [&] (int listen)
+    {
+        proc.engine.listen.store (listen);
+        const int total = n + (int) (0.3 * rate), block = 128;
+        Audio out (2, total), buf (2, block);
+        out.clear();
+        for (int pos = 0; pos < total; pos += block)
+        {
+            juce::MidiBuffer midi;
+            if (pos == 0)
+                midi.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+            if (pos <= n && n < pos + block)
+                midi.addEvent (juce::MidiMessage::noteOff (1, 60), n - pos);
+            buf.clear();
+            proc.processBlock (buf, midi);
+            out.copyFrom (0, pos, buf, 0, 0, std::min (block, total - pos));
+        }
+        for (int k = 0; k < 100; ++k)
+        {
+            juce::MidiBuffer none;
+            buf.clear();
+            proc.processBlock (buf, none);
+        }
+        proc.engine.listen.store (SynthEngine::ListenAll);
+        // high band: the difference of neighbouring samples (rises 6 dB an octave), against the level
+        Round rd;
+        const float* x = out.getReadPointer (0);
+        const int lat = proc.getLatencySamples();
+        const auto band = [&] (int from, int len)
+        {
+            double hi = 0.0, all = 0.0;
+            for (int i = from + 1; i < from + len; ++i)
+            {
+                const double d = x[i] - x[i - 1];
+                hi += d * d;
+                all += (double) x[i] * x[i];
+            }
+            return std::pair<double, double> (hi, all);
+        };
+        const int w = (int) (0.06 * rate);
+        for (int k = 0; k < hits; ++k)
+        {
+            const int at = k * seg + lat + (int) (0.002 * rate);
+            const auto e = band (at, w), l = band (at + seg - w - (int) (0.01 * rate), w);
+            rd.early.push_back (10.0 * std::log10 ((e.first + 1.0e-20) / (e.second + 1.0e-20)));
+            rd.late.push_back (10.0 * std::log10 ((l.first + 1.0e-20) / (l.second + 1.0e-20)));
+            rd.level.push_back (10.0 * std::log10 (e.second / w + 1.0e-20));
+        }
+        return rd;
+    };
+    const auto mean = [] (const std::vector<double>& v, int parity)
+    {
+        double s = 0.0;
+        int c = 0;
+        for (size_t k = 1; k < v.size(); ++k)       // the first hit is the note's start: left out
+            if (parity < 0 || (int) (k % 2) == parity)
+            {
+                s += v[k];
+                ++c;
+            }
+        return s / std::max (1, c);
+    };
+
+    // Brillo: weak (odd) hits against strong (even) ones, Por golpe off and on.
+    set ("velBright", 1.0f);
+    set ("loopHitEnv", 0.0f);
+    proc.serviceMessageThread();
+    const auto off = round (SynthEngine::ListenAll);
+    set ("loopHitEnv", 1.0f);
+    proc.serviceMessageThread();
+    for (int k = 0; k < 10; ++k)
+        proc.serviceMessageThread();
+    const auto on = round (SynthEngine::ListenAll);
+    const double gapOff = mean (off.early, 0) - mean (off.early, 1), gapOn = mean (on.early, 0) - mean (on.early, 1);
+    check (std::abs (gapOff) < 1.5 && gapOn > 3.0, "Brillo por golpe: los golpes flojos suenan más oscuros que los fuertes (sin Por golpe, iguales)",
+           "agudos fuertes-flojos: sin " + juce::String (gapOff, 1) + " dB, con " + juce::String (gapOn, 1) + " dB");
+    set ("velBright", 0.0f);
+
+    // Arco: the start of each hit darker with a slow Ataque.
+    set ("ampA", 80.0f);
+    set ("bow", 0.0f);
+    proc.serviceMessageThread();
+    const auto bow0 = round (SynthEngine::ListenAll);
+    set ("bow", 1.0f);
+    proc.serviceMessageThread();
+    const auto bow1 = round (SynthEngine::ListenAll);
+    const double bowDrop = mean (bow0.early, -1) - mean (bow1.early, -1);
+    check (bowDrop > 3.0, "Arco por golpe: el Ataque de cada golpe más oscuro", juce::String (bowDrop, 1) + " dB menos de agudos al empezar cada golpe");
+    set ("bow", 0.0f);
+    set ("ampA", 1.0f);
+
+    // Apagado: the end of each hit darker as it falls (Decay 60 ms to Sustain 20 %).
+    set ("ampD", 60.0f);
+    set ("ampS", 0.2f);
+    set ("relDark", 0.0f);
+    proc.serviceMessageThread();
+    const auto dark0 = round (SynthEngine::ListenAll);
+    set ("relDark", 1.0f);
+    proc.serviceMessageThread();
+    const auto dark1 = round (SynthEngine::ListenAll);
+    const double lateDrop = mean (dark0.late, -1) - mean (dark1.late, -1), earlyDrop = mean (dark0.early, -1) - mean (dark1.early, -1);
+    check (lateDrop > 4.0 && lateDrop > earlyDrop + 2.0, "Apagado por golpe: cada golpe se oscurece al caer (más al final que al principio)",
+           "al final " + juce::String (lateDrop, 1) + " dB, al principio " + juce::String (earlyDrop, 1) + " dB");
+    set ("relDark", 0.0f);
+    set ("ampD", 2000.0f);
+    set ("ampS", 1.0f);
+
+    // Mecanismo por golpe: only the strike heard (Oír golpe), off and on.
+    set ("mechOn", 1.0f);
+    set ("relNoise", 0.8f);
+    set ("mechPerHit", 0.0f);
+    proc.serviceMessageThread();
+    const auto mech0 = round (SynthEngine::ListenMechanism);
+    set ("mechPerHit", 1.0f);
+    proc.serviceMessageThread();
+    const auto mech1 = round (SynthEngine::ListenMechanism);
+    int struck = 0;
+    for (int k = 1; k < hits; ++k)
+        struck += mech1.level[(size_t) k] > mech0.level[(size_t) k] + 6.0 ? 1 : 0;
+    check (struck >= hits - 2, "Mecanismo por golpe: un golpe de tecla en cada golpe del loop", juce::String (struck) + " de " + juce::String (hits - 1) + " golpes");
+    set ("loopHitEnv", 0.0f);
+    proc.serviceMessageThread();
+    const auto mech2 = round (SynthEngine::ListenMechanism);
+    int without = 0;
+    for (int k = 1; k < hits; ++k)
+        without += mech2.level[(size_t) k] > mech0.level[(size_t) k] + 6.0 ? 1 : 0;
+    check (without == 0, "Sin Por golpe, Mecanismo por golpe no actúa", juce::String (without) + " golpes");
+    file.deleteFile();
+}
+
+//==============================================================================
+// LOOP Ventana: a loop of 8 tones of an eighth each (4 beats at 120 BPM). A window of a beat placed at beat 1
+// plays the 3rd and 4th tones only, round and round, with each algorithm, at the loop's tempo and in a host at
+// 100 BPM; an eighth at beat 2.5 the 6th alone; moved while it plays, no click.
+void auditLoopWindow()
+{
+    title ("LOOP Ventana: sólo suena la parte elegida (1/32 a 4 compases), con cada algoritmo y a otro tempo; moverla no hace clic");
+    const double rate = 48000.0;
+    constexpr int tones = 8;
+    const double freqs[tones] = { 1000.0, 1189.2, 1414.2, 1681.8, 2000.0, 2378.4, 2828.4, 3363.6 };
+    const int seg = (int) (0.25 * rate), n = tones * seg;
+    Audio loop (2, n);
+    for (int k = 0; k < tones; ++k)
+        for (int i = 0; i < seg; ++i)
+        {
+            const double t = i / rate;
+            const float v = (float) (0.3 * std::min (1.0, std::min (t, (seg - i) / rate) / 0.003) * std::sin (2.0 * juce::MathConstants<double>::pi * freqs[k] * t));
+            loop.setSample (0, k * seg + i, v);
+            loop.setSample (1, k * seg + i, v);
+        }
+    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Ventana tonos loop 120bpm.wav");
+    file.deleteFile();
+    {
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (loop, 0, n);
+    }
+    HostAt host;
+    ReanimaProcessor proc;
+    proc.setPlayHead (&host);
+    proc.setPlayConfigDetails (0, 2, rate, 128);
+    proc.prepareToPlay (rate, 128);
+    proc.loadSampleNow (file);
+    for (int k = 0; k < 600 && proc.isLoading(); ++k)
+    {
+        juce::Thread::sleep (10);
+        proc.serviceMessageThread();
+    }
+    const auto set = [&] (const char* id, float v)
+    {
+        if (auto* param = proc.apvts.getParameter (id))
+            param->setValueNotifyingHost (param->convertTo0to1 (v));
+        proc.serviceMessageThread();
+    };
+    for (const auto& [id, v] : { std::pair<const char*, float> { "playMode", 1.0f }, { "loopKind", 0.0f }, { "volume", 0.0f }, { "monoBass", 0.0f },
+                                 { "envLock", 1.0f }, { "ampA", 1.0f }, { "ampS", 1.0f }, { "ampR", 30.0f }, { "loopBeats", 4.0f } })
+        set (id, v);
+    // Which tones sound over the second half of `seconds` held (each window of 20 ms: the loudest tone, if any).
+    const auto play = [&] (double seconds, std::function<void (int)> during = nullptr)
+    {
+        const int total = (int) (seconds * rate), block = 128;
+        Audio out (2, total), buf (2, block);
+        out.clear();
+        for (int pos = 0; pos < total; pos += block)
+        {
+            if (during)
+                during (pos);
+            juce::MidiBuffer midi;
+            if (pos == 0)
+                midi.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+            buf.clear();
+            proc.processBlock (buf, midi);
+            out.copyFrom (0, pos, buf, 0, 0, std::min (block, total - pos));
+        }
+        juce::MidiBuffer off, none;
+        off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+        for (int k = 0; k < 150; ++k)
+        {
+            buf.clear();
+            proc.processBlock (buf, k == 0 ? off : none);
+        }
+        return out;
+    };
+    const auto heard = [&] (const Audio& out, double from)
+    {
+        std::set<int> found;
+        const int w = (int) (0.02 * rate);
+        for (int at = (int) (from * rate); at + w < out.getNumSamples(); at += w)
+        {
+            double best = 0.0;
+            int which = -1;
+            for (int k = 0; k < tones; ++k)
+                if (const double a = toneAmp (out.getReadPointer (0) + at, w, freqs[k], rate); a > best)
+                {
+                    best = a;
+                    which = k;
+                }
+            if (best > 0.03)
+                found.insert (which);
+        }
+        juce::String text;
+        for (const int k : found)
+            text << (k + 1) << " ";
+        return std::pair<std::set<int>, juce::String> (found, text.trim());
+    };
+    const char* names[] = { "Auto", "Beats", "Complex", "Complex Pro", "Rubber Band" };
+
+    // Completo: every tone.
+    set ("loopWinLen", 0.0f);
+    {
+        host.bpm = 120.0;
+        const auto got = heard (play (2.5), 0.3);
+        check (got.first.size() == (size_t) tones, "Completo: suena el loop entero", "tonos " + got.second);
+    }
+    // A beat (1/4) from beat 1: the 3rd and 4th tones, at 120 and at 100, with each algorithm.
+    set ("loopWinLen", 6.0f);       // 1/4
+    set ("loopWinPos", 1.0f);
+    for (const double bpm : { 120.0, 100.0 })
+        for (int algo = 1; algo <= 4; ++algo)
+        {
+            host.bpm = bpm;
+            set ("loopAlgo", (float) algo);
+            if (algo == 4)
+                play (1.0);         // Rubber Band: its render asked for, made in the background
+            for (int k = 0; k < (algo == 4 ? 200 : 2); ++k)
+            {
+                proc.serviceMessageThread();
+                juce::Thread::sleep (algo == 4 ? 10 : 1);
+            }
+            const auto got = heard (play (3.0), 0.5);
+            check (got.first == std::set<int> ({ 2, 3 }), juce::String ("Ventana 1/4 desde el tiempo 2, ") + names[algo] + " a " + juce::String ((int) bpm) + " BPM: sólo los tonos 3 y 4",
+                   "tonos " + got.second);
+        }
+    // An eighth from beat 2.5: the 6th tone alone.
+    host.bpm = 120.0;
+    set ("loopAlgo", 1.0f);
+    set ("loopWinLen", 9.0f);       // 1/8
+    set ("loopWinPos", 2.5f);
+    {
+        const auto got = heard (play (2.0), 0.3);
+        check (got.first == std::set<int> ({ 5 }), "Ventana 1/8 desde 3.2+: sólo el 6.º tono", "tonos " + got.second);
+    }
+    // Moved while it plays (every 0.4 s, a beat further): no click (no step of more than the tone's own over a sample).
+    set ("loopWinLen", 6.0f);
+    set ("loopWinPos", 0.0f);
+    {
+        int moves = 0;
+        const auto out = play (2.4, [&] (int pos)
+        {
+            if (pos > 0 && pos % (int) (0.4 * rate) < 128)
+            {
+                ++moves;
+                set ("loopWinPos", (float) (moves % 4));
+            }
+        });
+        double worst = 0.0;
+        int worstAt = 0;
+        const float* x = out.getReadPointer (0);
+        for (int i = 2; i < out.getNumSamples(); ++i)
+            if (const double c = std::abs ((double) x[i] - 2.0 * x[i - 1] + x[i - 2]); c > worst)      // a corner
+            {
+                worst = c;
+                worstAt = i;
+            }
+        if (std::getenv ("VENTANA_DIAG") != nullptr)
+            for (int i = 2; i < out.getNumSamples(); ++i)
+                if (std::abs ((double) x[i] - 2.0 * x[i - 1] + x[i - 2]) > 0.1)
+                    std::printf ("esquina %.4f s (muestra %d)\n", i / rate, i);
+        const double toneCorner = 0.3 * std::pow (2.0 * juce::MathConstants<double>::pi * 3363.6 / rate, 2.0);
+        check (worst < 2.5 * toneCorner, "Mover la Ventana mientras suena: sin clics", juce::String (moves) + " movimientos, esquina " + juce::String (worst, 4)
+                   + " (tono " + juce::String (toneCorner, 4) + ")");
+    }
+    // With the host's transport (Play): the window loops on the host's beats. A beat from beat 2: in each beat of
+    // the host, its first half is the 3rd tone and its second half the 4th.
+    {
+        struct HostRun : juce::AudioPlayHead
+        {
+            double ppq = 0.0;
+            juce::Optional<PositionInfo> getPosition() const override
+            {
+                PositionInfo i;
+                i.setBpm (120.0);
+                i.setIsPlaying (true);
+                i.setPpqPosition (ppq);
+                return i;
+            }
+        } run;
+        set ("loopWinLen", 6.0f);
+        set ("loopWinPos", 1.0f);
+        set ("loopAlgo", 1.0f);
+        set ("loopPlay", 1.0f);
+        proc.setPlayHead (&run);
+        const int total = (int) (4.0 * rate), block = 128;
+        Audio out (2, total), buf (2, block);
+        juce::MidiBuffer none;
+        for (int pos = 0; pos < total; pos += block)
+        {
+            run.ppq = pos / rate * 2.0;         // 120 BPM: 2 beats a second
+            buf.clear();
+            proc.processBlock (buf, none);
+            out.copyFrom (0, pos, buf, 0, 0, std::min (block, total - pos));
+        }
+        const int lat = proc.getLatencySamples(), w = (int) (0.06 * rate);
+        int right = 0, all = 0;
+        for (double beatAt = 2.0; beatAt < 7.5; beatAt += 1.0)
+            for (const auto [half, tone] : { std::pair<double, int> { 0.05, 2 }, { 0.55, 3 } })
+            {
+                const int at = (int) ((beatAt + half) / 2.0 * rate) + lat;
+                double best = 0.0;
+                int which = -1;
+                for (int k = 0; k < tones; ++k)
+                    if (const double amp = toneAmp (out.getReadPointer (0) + at, w, freqs[k], rate); amp > best)
+                    {
+                        best = amp;
+                        which = k;
+                    }
+                right += which == tone ? 1 : 0;
+                ++all;
+            }
+        check (right == all, "Ventana con Play: sigue los tiempos del DAW (1.ª mitad de cada tiempo, tono 3; 2.ª, tono 4)",
+               juce::String (right) + " de " + juce::String (all));
+        set ("loopPlay", 0.0f);
+    }
+    proc.setPlayHead (nullptr);
+    file.deleteFile();
+}
+
+//==============================================================================
+// The knobs' outer ring: the matrix's modulation as the engine applies it. Macro 1 to the cutoff with no note
+// (the macros alone), velocity to the resonance from the newest note, an LFO moving with a note held, and the
+// values themselves never moved.
+void auditModRings()
+{
+    title ("Aros de modulación: macros sin notas, la última nota, LFO en directo; el valor base no se toca");
+    const double rate = 48000.0;
+    ReanimaProcessor proc;
+    proc.setPlayConfigDetails (0, 2, rate, 256);
+    proc.prepareToPlay (rate, 256);
+    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Aros tono.wav");
+    {
+        Audio tone (2, (int) rate);
+        for (int i = 0; i < tone.getNumSamples(); ++i)
+        {
+            const float v = (float) (0.3 * std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / rate));
+            tone.setSample (0, i, v);
+            tone.setSample (1, i, v);
+        }
+        file.deleteFile();
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (tone, 0, tone.getNumSamples());
+    }
+    proc.loadSampleNow (file);
+    for (int k = 0; k < 600 && proc.isLoading(); ++k)
+    {
+        juce::Thread::sleep (10);
+        proc.serviceMessageThread();
+    }
+    const auto set = [&] (const char* id, float v)
+    {
+        if (auto* param = proc.apvts.getParameter (id))
+            param->setValueNotifyingHost (param->convertTo0to1 (v));
+    };
+    const auto blocks = [&] (int count, juce::MidiBuffer first)
+    {
+        Audio buf (2, 256);
+        juce::MidiBuffer none;
+        for (int b = 0; b < count; ++b)
+        {
+            buf.clear();
+            proc.processBlock (buf, b == 0 ? first : none);
+        }
+    };
+    set ("fltOn", 1.0f);
+    set ("fltFreq", 1000.0f);
+    set ("fltRes", 0.2f);
+    // Slot 1: Macro 1 -> cutoff, 0.5. Slot 2: velocity -> resonance, 0.4.
+    set ("m1Src", (float) P::SrcMacro1);
+    set ("m1Dst", (float) P::DstCutoff);
+    set ("m1Amt", 0.5f);
+    set ("macro1", 0.6f);
+    set ("m2Src", (float) P::SrcVelocity);
+    set ("m2Dst", (float) P::DstRes);
+    set ("m2Amt", 0.4f);
+    blocks (4, {});
+    const float cut = proc.engine.modShown[P::DstCutoff].load(), res = proc.engine.modShown[P::DstRes].load();
+    check (std::abs (cut - 0.3f) < 1.0e-5f && std::abs (res) < 1.0e-6f, "Sin notas: el aro enseña sólo las macros (corte +0,3; velocidad nada)",
+           "corte " + juce::String (cut, 4) + ", resonancia " + juce::String (res, 4));
+    const float shownHz = SynthEngine::modulated (P::FltFreq, proc.paramValue (P::FltFreq), cut);
+    check (std::abs (shownHz - 1000.0f * std::exp2 (1.5f)) < 1.0f, "Corte modulado como lo aplica el motor (60 semitonos por unidad: 1000 Hz -> 2828 Hz)",
+           juce::String (shownHz, 1) + " Hz");
+
+    // Two notes: the ring follows the newest (velocity 0.3 after 1.0).
+    {
+        juce::MidiBuffer a, b;
+        a.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+        blocks (4, a);
+        const float first = proc.engine.modShown[P::DstRes].load();
+        b.addEvent (juce::MidiMessage::noteOn (1, 64, 0.3f), 0);
+        blocks (4, b);
+        const float second = proc.engine.modShown[P::DstRes].load();
+        check (std::abs (first - 0.4f) < 0.01f && std::abs (second - 0.4f * 0.3f) < 0.01f, "Con notas: el aro sigue a la última nota tocada (su velocidad)",
+               juce::String (first, 3) + " y luego " + juce::String (second, 3));
+        juce::MidiBuffer off;
+        off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+        off.addEvent (juce::MidiMessage::noteOff (1, 64), 0);
+        blocks (200, off);
+    }
+
+    // An LFO on the resonance: the ring moves while the note is held.
+    set ("m2Src", (float) P::SrcLfo1);
+    set ("lfo1Rate", 4.0f);
+    {
+        juce::MidiBuffer a;
+        a.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+        Audio buf (2, 256);
+        juce::MidiBuffer none;
+        float lo = 1.0f, hi = -1.0f;
+        for (int b = 0; b < 200; ++b)
+        {
+            buf.clear();
+            proc.processBlock (buf, b == 0 ? a : none);
+            const float m = proc.engine.modShown[P::DstRes].load();
+            lo = std::min (lo, m);
+            hi = std::max (hi, m);
+        }
+        check (lo < -0.3f && hi > 0.3f, "LFO: el aro se mueve en directo (de -0,4 a +0,4)", juce::String (lo, 2) + " a " + juce::String (hi, 2));
+        juce::MidiBuffer off;
+        off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+        blocks (200, off);
+    }
+    check (std::abs (proc.paramValue (P::FltFreq) - 1000.0f) < 0.01f && std::abs (proc.paramValue (P::FltRes) - 0.2f) < 1.0e-4f,
+           "El valor base de los mandos no cambia por modularlos", juce::String (proc.paramValue (P::FltFreq), 1) + " Hz, " + juce::String (proc.paramValue (P::FltRes), 3));
+    // Every destination has a knob, and a knob of none is left alone.
+    int mapped = 0;
+    for (int id = 0; id < P::Count; ++id)
+        mapped += SynthEngine::destOf (id) != P::DstNone ? 1 : 0;
+    check (mapped >= P::NumDests - 1 && SynthEngine::modulated (P::AmpA, 50.0f, 1.0f) == 50.0f, "Cada destino de la matriz tiene su mando; los demás no se tocan",
+           juce::String (mapped) + " mandos para " + juce::String (P::NumDests - 1) + " destinos");
+    file.deleteFile();
+}
+
+//==============================================================================
+// The sample browser: Live's folders read from its Library.cfg (a made-up one: the User Library, a custom Splice
+// download folder and two Places; and this computer's own, if Live is here), and the preview: heard, stopped,
+// the loaded sample untouched.
+void auditBrowser()
+{
+    title ("Explorador de samples: carpetas de Live (Splice incluida) y escucha previa");
+    const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ReanimaExplorador");
+    dir.deleteRecursively();
+    const auto lib = dir.getChildFile ("User Library"), splice = dir.getChildFile ("Mis Splice"), place = dir.getChildFile ("Splice app/Samples");
+    lib.createDirectory();
+    splice.createDirectory();
+    place.createDirectory();
+    const auto cfg = dir.getChildFile ("Library.cfg");
+    cfg.replaceWithText ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Ableton><ContentLibrary><UserLibrary><LibraryProject Id=\"0\">"
+                         "<ProjectPath Value=\"" + lib.getFullPathName() + "\" /></LibraryProject></UserLibrary><UserFolderInfoList>"
+                         "<UserFolderInfo Id=\"1\" Path=\"" + place.getParentDirectory().getFullPathName() + "\" DisplayName=\"Splice\" IconName=\"\" />"
+                         "<UserFolderInfo Id=\"2\" Path=\"" + dir.getChildFile ("no existe").getFullPathName() + "\" DisplayName=\"Perdida\" IconName=\"\" />"
+                         "</UserFolderInfoList><SpliceDownloadFolderModeMember Value=\"Custom\" /><CustomSpliceDownloadPathMember Value=\""
+                         + splice.getFullPathName() + "\" /></ContentLibrary></Ableton>");
+    const auto found = SampleBrowser::liveSources (cfg);
+    juce::String names;
+    for (const auto& s : found)
+        names << s.name << " | ";
+    check (found.size() == 3 && found[0].folder == splice && found[1].folder == place.getParentDirectory() && found[2].folder == lib,
+           "Library.cfg: descargas de Splice (carpeta propia), Places existentes y User Library; sin rutas fijas", names);
+    const auto mine = SampleBrowser::newestLiveLibraryCfg();
+    if (mine.existsAsFile())
+    {
+        const auto here = SampleBrowser::liveSources (mine);
+        juce::String list;
+        for (const auto& s : here)
+            list << s.name << " (" << s.folder.getFullPathName() << ") | ";
+        check (! here.empty(), "Este PC: las carpetas de Live (" + mine.getParentDirectory().getParentDirectory().getFileName() + ")", list);
+    }
+
+    // Preview: a 440 Hz tone heard at -6 dB without a note; stopped; the loaded sample the same.
+    const double rate = 48000.0;
+    const auto tone = dir.getChildFile ("tono.wav");
+    {
+        Audio t (2, (int) rate);
+        for (int i = 0; i < t.getNumSamples(); ++i)
+        {
+            const float v = (float) (0.5 * std::sin (2.0 * juce::MathConstants<double>::pi * 440.0 * i / rate));
+            t.setSample (0, i, v);
+            t.setSample (1, i, v);
+        }
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (tone);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (t, 0, t.getNumSamples());
+    }
+    ReanimaProcessor proc;
+    proc.setPlayConfigDetails (0, 2, rate, 256);
+    proc.prepareToPlay (rate, 256);
+    const auto* before = proc.getSample().get();
+    const bool sent = proc.previewFile (tone);
+    Audio buf (2, 256);
+    juce::MidiBuffer none;
+    double heard = 0.0;
+    for (int b = 0; b < 40; ++b)
+    {
+        buf.clear();
+        proc.processBlock (buf, none);
+        if (b >= 20)
+            heard = std::max (heard, (double) buf.getMagnitude (0, 0, 256));
+    }
+    const bool playing = proc.isPreviewing();
+    proc.stopPreview();
+    double after = 0.0;
+    for (int b = 0; b < 20; ++b)
+    {
+        buf.clear();
+        proc.processBlock (buf, none);
+        if (b >= 5)
+            after = std::max (after, (double) buf.getMagnitude (0, 0, 256));
+    }
+    check (sent && playing && heard > 0.15 && heard < 0.4 && after < 1.0e-6 && proc.getSample().get() == before,
+           "Escucha previa: suena sin nota (-6 dB), se para, y el sample cargado no cambia",
+           "pico " + juce::String (heard, 3) + ", tras parar " + juce::String (after, 6));
+    // Another while one plays: the new one takes over (no pile-up), and the old one is freed on the next.
+    proc.previewFile (tone);
+    for (int b = 0; b < 5; ++b)
+    {
+        buf.clear();
+        proc.processBlock (buf, none);
+    }
+    proc.previewFile (tone);
+    for (int b = 0; b < 5; ++b)
+    {
+        buf.clear();
+        proc.processBlock (buf, none);
+    }
+    check (proc.isPreviewing(), "Escucha previa: un archivo tras otro, sin cortes ni acumulación", "");
+    proc.stopPreview();
+    dir.deleteRecursively();
+}
+
+//==============================================================================
+// The chord: named from the notes held (inversions, sevenths, a fifth alone), its degree in the key, from the
+// sound (a chord through the sidechain), and the progression of the chords played.
+void auditChords()
+{
+    title ("Acordes: por las notas tocadas, por el sonido, su grado y la progresión");
+    struct Case { std::vector<int> notes; const char* name; };
+    const Case cases[] = { { { 60, 64, 67 }, "Do" },          { { 57, 60, 64, 67 }, "Lam7" },     { { 52, 55, 60 }, "Do/Mi" },
+                           { { 55, 59, 62, 65 }, "Sol7" },    { { 60, 64, 67, 69 }, "Do6" },      { { 59, 62, 65 }, "Sidim" },
+                           { { 48, 55 }, "Do5" },              { { 48, 52, 55, 59, 62 }, "Domaj9" }, { { 50, 53, 57, 60 }, "Rem7" },
+                           { { 64, 67, 71, 74 }, "Mim7" },     { { 60, 63, 66, 69 }, "Dodim7" },   { { 62, 67, 69 }, "Resus4" } };
+    int right = 0;
+    juce::String wrong;
+    for (const auto& c : cases)
+    {
+        const auto got = KeyDetect::chordFromNotes (c.notes).name();
+        right += got == juce::String::fromUTF8 (c.name) ? 1 : 0;
+        if (got != juce::String::fromUTF8 (c.name))
+            wrong << c.name << " -> " << got << "; ";
+    }
+    check (right == (int) std::size (cases), "Por las notas: triadas, inversiones (Do/Mi), séptimas, 6, dim, dim7, sus4, 9, quinta sola",
+           juce::String (right) + "/" + juce::String ((int) std::size (cases)) + " " + wrong);
+    const auto deg = [] (std::vector<int> notes, int key) { return KeyDetect::chordFromNotes (notes).degreeIn (key); };
+    check (deg ({ 57, 60, 64, 67 }, 0) == "vi7" && deg ({ 55, 59, 62, 65 }, 0) == "V7" && deg ({ 59, 62, 65 }, 0) == juce::String::fromUTF8 ("vii°")
+               && deg ({ 58, 62, 65 }, 0) == "bVII" && deg ({ 57, 61, 64 }, 9) == "I",
+           "Su grado en la tonalidad: Lam7 = vi7, Sol7 = V7, Sidim = vii° y Sib = bVII en Do; La = I en La", "");
+
+    // From the sound: a chord with a few harmonics a note.
+    const double rate = 48000.0;
+    const auto chordAudio = [&] (std::initializer_list<int> notes, double seconds)
+    {
+        juce::AudioBuffer<float> a (2, (int) (seconds * rate));
+        a.clear();
+        for (const int note : notes)
+        {
+            const double f = 440.0 * std::pow (2.0, (note - 69) / 12.0);
+            for (int i = 0; i < a.getNumSamples(); ++i)
+            {
+                double v = 0.0;
+                for (int h = 1; h <= 4; ++h)
+                    v += std::sin (2.0 * juce::MathConstants<double>::pi * f * h * i / rate) / (h * h);
+                a.addSample (0, i, (float) (0.08 * v));
+                a.addSample (1, i, (float) (0.08 * v));
+            }
+        }
+        return a;
+    };
+    {
+        const auto heard = KeyDetect::chordFromChroma (KeyDetect::fromAudio (chordAudio ({ 57, 60, 64 }, 1.0), rate).chroma);
+        const auto heard7 = KeyDetect::chordFromChroma (KeyDetect::fromAudio (chordAudio ({ 55, 59, 62, 65 }, 1.0), rate).chroma);
+        check (heard.name() == "Lam" && heard7.name() == "Sol7", "Por el sonido: La menor y Sol7", heard.name() + ", " + heard7.name());
+    }
+
+    // The processor: the keys down, the progression, the sidechain's chord.
+    ReanimaProcessor proc;
+    juce::AudioProcessor::BusesLayout layout;
+    layout.inputBuses.add (juce::AudioChannelSet::stereo());
+    layout.outputBuses.add (juce::AudioChannelSet::stereo());
+    proc.setBusesLayout (layout);
+    proc.prepareToPlay (rate, 512);
+    juce::AudioBuffer<float> buf (2, 512);
+    const auto hold = [&] (std::vector<int> notes, std::vector<int> release)
+    {
+        juce::MidiBuffer m;
+        for (const int n : release)
+            m.addEvent (juce::MidiMessage::noteOff (1, n), 0);
+        for (const int n : notes)
+            m.addEvent (juce::MidiMessage::noteOn (1, n, 0.8f), 1);
+        buf.clear();
+        proc.processBlock (buf, m);
+        for (int tick = 0; tick < 3; ++tick)
+            proc.serviceMessageThread();
+    };
+    hold ({ 60, 64, 67 }, {});
+    const auto first = proc.midiChord().name();
+    hold ({ 57, 60, 64 }, { 60, 64, 67 });
+    hold ({ 53, 57, 60 }, { 57, 60, 64 });
+    hold ({ 55, 59, 62 }, { 53, 57, 60 });
+    const auto last = proc.midiChord().name();
+    hold ({}, { 55, 59, 62 });
+    juce::StringArray names, degrees;
+    for (const auto& c : proc.chordProgression())
+    {
+        names.add (c.name());
+        degrees.add (c.degreeIn (0));
+    }
+    check (first == "Do" && last == "Sol" && proc.midiChord().root < 0, "Las teclas pulsadas: Do, luego Sol; al soltar, ninguno", first + ", " + last);
+    check (names.joinIntoString (" ") == "Do Lam Fa Sol" && degrees.joinIntoString (" ") == "I vi IV V", "La progresión: Do Lam Fa Sol = I vi IV V",
+           names.joinIntoString (" ") + " / " + degrees.joinIntoString (" "));
+
+    // The sidechain: F major sounding, no keys down.
+    proc.clearProgression();
+    const auto f = chordAudio ({ 53, 57, 60 }, 2.0);
+    juce::MidiBuffer none;
+    for (int at = 0; at + 512 <= f.getNumSamples(); at += 512)
+    {
+        buf.copyFrom (0, 0, f, 0, at, 512);
+        buf.copyFrom (1, 0, f, 1, at, 512);
+        proc.processBlock (buf, none);
+        if ((at / 512) % 8 == 7)
+            proc.serviceMessageThread();
+    }
+    proc.serviceMessageThread();
+    const auto side = proc.externalChord();
+    const auto prog = proc.chordProgression();
+    check (side.name() == "Fa" && side.confidence >= ReanimaProcessor::chordHeardSure && ! prog.empty() && prog.back().name() == "Fa",
+           "Por la entrada lateral: Fa mayor sonando se reconoce y pasa a la progresión",
+           side.name() + " " + juce::String (juce::roundToInt (side.confidence * 100.0f)) + " %");
+}
+
+//==============================================================================
+// The key: from names (the ways libraries write it), from the sound of a progression in A minor, from the notes
+// played through the processor (a D major scale; three notes say little), and the rules of the key in use: a
+// name applies, a sound only suggests, Fijar sets it by hand.
+void auditKey()
+{
+    title ("Tonalidad: por el nombre, por el sonido (sólo sugerencia), por el MIDI, y la que se usa");
+    struct Case { const char* name; int root; bool minor; };
+    const Case cases[] = { { "SSP_KAT_70_horn_section_soul_G#min.wav", 8, true }, { "OS_6ix_92_vocal_wrongside_A#m.wav", 10, true },
+                           { "MA_HDD_String_Drone_LiquidCourage_Dm.wav", 2, true }, { "NW_WE_95_guitar_loop_glimmer_A.wav", 9, false },
+                           { "synth_Bbmaj.wav", 10, false }, { "Keys 90bpm Fs minor.wav", 6, true }, { "Drum_Loop_122bpm.wav", -1, false },
+                           { "A_Day_In_The_Life_of_a_kick.wav", -1, false } };
+    int right = 0;
+    juce::String wrong;
+    for (const auto& c : cases)
+    {
+        const auto e = KeyDetect::fromName (c.name);
+        const bool ok = e.root == c.root && (c.root < 0 || e.minor == c.minor);
+        right += ok ? 1 : 0;
+        if (! ok)
+            wrong << c.name << " -> " << e.text() << "; ";
+    }
+    check (right == (int) std::size (cases), "Por el nombre: G#min, A#m, Dm, A, Bbmaj, Fs minor; ninguna en un nombre sin tonalidad",
+           juce::String (right) + "/" + juce::String ((int) std::size (cases)) + " " + wrong);
+
+    // A minor: Am, Dm, E, Am, each chord a second, notes with a few harmonics.
+    const double rate = 44100.0;
+    const int n = (int) (4.0 * rate);
+    juce::AudioBuffer<float> prog (1, n);
+    prog.clear();
+    const int chords[4][3] = { { 57, 60, 64 }, { 50, 57, 62 }, { 52, 56, 59 }, { 57, 60, 64 } };
+    for (int c = 0; c < 4; ++c)
+        for (const int note : chords[c])
+        {
+            const double f = 440.0 * std::pow (2.0, (note - 69) / 12.0);
+            for (int i = 0; i < (int) rate; ++i)
+            {
+                const double t = i / rate;
+                double v = 0.0;
+                for (int h = 1; h <= 4; ++h)
+                    v += std::sin (2.0 * juce::MathConstants<double>::pi * f * h * t) / (h * h);
+                prog.addSample (0, c * (int) rate + i, (float) (0.1 * v * std::exp (-t * 1.5)));
+            }
+        }
+    const auto heard = KeyDetect::fromAudio (prog, rate);
+    const bool aMinorOrRelative = (heard.root == 9 && heard.minor) || (heard.root == 0 && ! heard.minor);
+    check (aMinorOrRelative && heard.confidence > 0.2f, "Por el sonido: una progresión en La menor (o su relativa, Do mayor)",
+           heard.text() + ", confianza " + juce::String (juce::roundToInt (heard.confidence * 100.0f)) + " %");
+
+    // The processor: the notes played, and the key in use.
+    ReanimaProcessor proc;
+    proc.setPlayConfigDetails (0, 2, 48000.0, 256);
+    proc.prepareToPlay (48000.0, 256);
+    const auto set = [&] (const char* id, float v)
+    {
+        if (auto* param = proc.apvts.getParameter (id))
+            param->setValueNotifyingHost (param->convertTo0to1 (v));
+    };
+    const auto play = [&] (std::initializer_list<int> notes)
+    {
+        juce::AudioBuffer<float> buf (2, 256);
+        for (const int note : notes)
+        {
+            juce::MidiBuffer m;
+            m.addEvent (juce::MidiMessage::noteOn (1, note, 0.8f), 0);
+            m.addEvent (juce::MidiMessage::noteOff (1, note), 128);
+            buf.clear();
+            proc.processBlock (buf, m);
+        }
+        proc.serviceMessageThread();
+    };
+    set ("keySource", 2.0f);        // MIDI
+    play ({ 62, 66, 69 });
+    const auto few = proc.midiKey();
+    const auto fewInUse = proc.keyInUse();
+    check (few.confidence < ReanimaProcessor::keySure && fewInUse.doubtful, "MIDI: con tres notas es dudosa y no se aplica",
+           few.text() + " " + juce::String (juce::roundToInt (few.confidence * 100.0f)) + " %");
+    play ({ 62, 64, 66, 67, 69, 71, 73, 74, 62, 66, 69, 74, 69, 66, 62, 67, 71, 74, 62, 66, 69 });
+    const auto many = proc.midiKey();
+    const auto inUse = proc.keyInUse();
+    check (many.root == 2 && ! many.minor && many.confidence >= ReanimaProcessor::keySure && ! inUse.doubtful && inUse.root == 2,
+           "MIDI: una escala de Re mayor tocada la da segura y se usa", many.text() + " " + juce::String (juce::roundToInt (many.confidence * 100.0f)) + " %");
+
+    // Fijar: by hand.
+    proc.fixKey (many);
+    const auto fixed = proc.keyInUse();
+    check ((int) proc.paramValue (P::KeySource) == 0 && fixed.root == 2 && ! fixed.minor, "Fijar pasa la tonalidad a mano", "");
+    // State: by hand, saved with the project.
+    {
+        juce::MemoryBlock state;
+        proc.getStateInformation (state);
+        ReanimaProcessor reopened;
+        reopened.setStateInformation (state.getData(), (int) state.getSize());
+        const auto k = reopened.keyInUse();
+        check (k.root == 2 && ! k.minor, "La tonalidad a mano se guarda con el proyecto", "");
+    }
+
+    // The sidechain: an auxiliary input (VST3: kAux, which Live shows in its Sidechain panel), whose sound never
+    // reaches the output, and whose key, after some 20 s of a progression in A minor, is sure and used.
+    {
+        ReanimaProcessor side;
+        const double sr = 48000.0;
+        const int block = 512;
+        juce::AudioProcessor::BusesLayout layout;
+        layout.inputBuses.add (juce::AudioChannelSet::stereo());
+        layout.outputBuses.add (juce::AudioChannelSet::stereo());
+        const bool layoutOk = side.setBusesLayout (layout);
+        side.prepareToPlay (sr, block);
+        auto* ext = side.getVST3ClientExtensions();
+        check (layoutOk && side.hasSidechain() && side.getBus (true, 0) != nullptr && side.getBus (true, 0)->getName() == "Sidechain"
+                   && ext != nullptr && ! ext->getPluginHasMainInput(),
+               "Hay una entrada lateral (Sidechain), auxiliar en VST3", "");
+        juce::AudioProcessor::BusesLayout noInput;
+        noInput.inputBuses.add (juce::AudioChannelSet::disabled());
+        noInput.outputBuses.add (juce::AudioChannelSet::stereo());
+        juce::AudioProcessor::BusesLayout mono = layout;
+        mono.inputBuses.getReference (0) = juce::AudioChannelSet::mono();
+        check (side.checkBusesLayoutSupported (noInput) && side.checkBusesLayoutSupported (mono), "La entrada lateral puede ir apagada o en mono", "");
+        if (auto* param = side.apvts.getParameter ("keySource"))
+            param->setValueNotifyingHost (param->convertTo0to1 (3.0f));
+        // Am, Dm, E, Am, a second each, over and over: notes with a few harmonics, the chords' own ends fading
+        const int chords[4][3] = { { 57, 60, 64 }, { 50, 57, 62 }, { 52, 56, 59 }, { 57, 60, 64 } };
+        juce::AudioBuffer<float> buf (2, block);
+        juce::MidiBuffer none;
+        float leak = 0.0f;
+        double t0 = 0.0;
+        bool earlyDoubtful = false;
+        const int total = (int) (30.0 * sr / block);
+        for (int b = 0; b < total; ++b)
+        {
+            buf.clear();
+            for (int i = 0; i < block; ++i)
+            {
+                const double t = (b * block + i) / sr;
+                const int c = (int) t % 4;
+                const double inChord = t - std::floor (t);
+                double v = 0.0;
+                for (const int note : chords[c])
+                {
+                    const double f = 440.0 * std::pow (2.0, (note - 69) / 12.0);
+                    for (int h = 1; h <= 4; ++h)
+                        v += std::sin (2.0 * juce::MathConstants<double>::pi * f * h * t) / (h * h);
+                }
+                const float s = (float) (0.1 * v * std::exp (-inChord * 1.5));
+                buf.setSample (0, i, s);
+                buf.setSample (1, i, s);
+            }
+            side.processBlock (buf, none);
+            leak = std::max (leak, buf.getMagnitude (0, block));
+            if (b % 16 == 15)
+                side.serviceMessageThread();
+            t0 = (b + 1) * block / sr;
+            if (std::abs (t0 - 5.0) < (double) block / sr)
+                earlyDoubtful = side.keyInUse().doubtful;
+        }
+        side.serviceMessageThread();
+        const auto heardKey = side.externalKey();
+        const auto used = side.keyInUse();
+        check (leak < 1.0e-6f, "El audio de la entrada lateral no sale por Reanima (sin notas: silencio)",
+               juce::String (juce::Decibels::gainToDecibels (leak, -200.0f), 1) + " dB");
+        check (earlyDoubtful, "Audio externo: a los 5 s todavía es dudosa y no se aplica", "");
+        const bool rightKey = (used.root == 9 && used.minor) || (used.root == 0 && ! used.minor);
+        check (rightKey && ! used.doubtful && heardKey.confidence >= ReanimaProcessor::keySure,
+               "Audio externo: tras 30 s de una progresión en La menor la da segura y se usa",
+               heardKey.text() + " " + juce::String (juce::roundToInt (heardKey.confidence * 100.0f)) + " %, "
+                   + juce::String (side.externalSeconds(), 1) + " s escuchados");
+    }
+}
+
+//==============================================================================
+// ARP · SEQ: the step engine on its own (where each note starts and ends, to the sample) and through the plug-in.
+namespace
+{
+struct ArpEvent { juce::int64 at; int note; bool on; int velocity; };
+
+// Runs a player for `seconds`: keys pressed at `pressAt` (samples) and let go at `releaseAt` (-1: never), the DAW
+// playing from ppq 0 at `bpm` when `host`.
+std::vector<ArpEvent> runArp (StepSeq::Player& player, const StepSeq::Settings& s, const StepSeq::Pattern& p, std::initializer_list<int> keys,
+                              double seconds, bool host = true, double bpm = 120.0, juce::int64 pressAt = 0, juce::int64 releaseAt = -1,
+                              std::function<void (juce::int64, juce::MidiBuffer&)> extra = {})
+{
+    const double rate = 48000.0;
+    const int block = 256;
+    std::vector<ArpEvent> events;
+    juce::MidiBuffer in, out;
+    const auto total = (juce::int64) (seconds * rate);
+    for (juce::int64 at = 0; at < total; at += block)
+    {
+        in.clear();
+        if (pressAt >= at && pressAt < at + block)
+            for (const int k : keys)
+                in.addEvent (juce::MidiMessage::noteOn (1, k, (juce::uint8) 90), (int) (pressAt - at));
+        if (releaseAt >= at && releaseAt < at + block)
+            for (const int k : keys)
+                in.addEvent (juce::MidiMessage::noteOff (1, k), (int) (releaseAt - at));
+        if (extra)
+            extra (at, in);
+        player.process (in, out, block, s, p, host, at / rate * bpm / 60.0, bpm);
+        for (const auto meta : out)
+        {
+            const auto m = meta.getMessage();
+            if (m.isNoteOnOrOff())
+                events.push_back ({ at + meta.samplePosition, m.getNoteNumber(), m.isNoteOn(), m.getVelocity() });
+        }
+    }
+    return events;
+}
+
+std::vector<ArpEvent> onsOf (const std::vector<ArpEvent>& e)
+{
+    std::vector<ArpEvent> ons;
+    for (const auto& x : e)
+        if (x.on)
+            ons.push_back (x);
+    return ons;
+}
+
+bool balanced (const std::vector<ArpEvent>& e)
+{
+    std::array<int, 128> n {};
+    for (const auto& x : e)
+        n[(size_t) x.note] += x.on ? 1 : -1;
+    for (const int v : n)
+        if (v != 0)
+            return false;
+    return true;
+}
+}
+
+void auditArp()
+{
+    title ("ARP · SEQ: el motor de pasos (al compás, swing, gate, repeticiones, probabilidad, carriles, Seq, latch) y el plugin");
+    const double rate = 48000.0;
+    StepSeq::Settings s;
+    s.on = true;
+    s.stepBeats = 0.25;             // 1/16 at 120: 6000 samples
+    s.gate = 1.0f;
+    StepSeq::Pattern p;             // 16 on, gate 50 %
+
+    {
+        StepSeq::Player off;
+        off.prepare (rate);
+        StepSeq::Settings none;
+        juce::MidiBuffer in, out;
+        in.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 90), 10);
+        in.addEvent (juce::MidiMessage::pitchWheel (1, 9000), 20);
+        off.process (in, out, 256, none, p, true, 0.0, 120.0);
+        bool same = out.getNumEvents() == in.getNumEvents();
+        for (auto a = in.cbegin(), b = out.cbegin(); same && a != in.cend(); ++a, ++b)
+            same = (*a).samplePosition == (*b).samplePosition && (*a).getMessage().getRawDataSize() == (*b).getMessage().getRawDataSize()
+                && std::memcmp ((*a).data, (*b).data, (size_t) (*a).numBytes) == 0;
+        check (same && ! off.active(), "Apagado: el MIDI pasa tal cual", "");
+    }
+    {
+        StepSeq::Player player;
+        player.prepare (rate);
+        const auto e = runArp (player, s, p, { 60, 64, 67 }, 1.05);
+        const auto ons = onsOf (e);
+        bool times = ons.size() >= 8, notes = times;
+        const int expect[] = { 60, 64, 67, 60, 64, 67, 60, 64 };
+        for (size_t i = 0; i < 8 && times; ++i)
+        {
+            times = ons[i].at == (juce::int64) i * 6000;
+            notes = notes && ons[i].note == expect[i];
+        }
+        juce::int64 length = -1;
+        for (const auto& x : e)
+            if (! x.on && x.note == 60)
+            {
+                length = x.at;
+                break;
+            }
+        check (times && notes, "Arp Arriba, 1/16 a 120: Do-Mi-Sol en las semicorcheas exactas (cada 6000 muestras)",
+               juce::String ((int) ons.size()) + " notas, la 2.ª en " + juce::String (ons.size() > 1 ? (int) ons[1].at : -1));
+        check (length == 3000, "Gate 50 %: cada nota dura media semicorchea", juce::String ((int) length) + " muestras");
+    }
+    {
+        auto sw = s;
+        sw.swing = 1.0f;
+        StepSeq::Player player;
+        player.prepare (rate);
+        const auto ons = onsOf (runArp (player, sw, p, { 60 }, 0.6));
+        check (ons.size() >= 4 && ons[0].at == 0 && ons[1].at == 8000 && ons[2].at == 12000 && ons[3].at == 20000,
+               "Swing 100 %: los pasos pares se retrasan un tercio (tresillo)", ons.size() > 1 ? juce::String ((int) ons[1].at) : juce::String ("-"));
+    }
+    {
+        auto q = p;
+        q.value[StepSeq::Ratchet][0] = 3.0f;
+        q.value[StepSeq::Chance][1] = 0.0f;
+        q.value[StepSeq::Octave][2] = 1.0f;
+        q.value[StepSeq::Velocity][2] = 40.0f;
+        StepSeq::Player player;
+        player.prepare (rate);
+        const auto ons = onsOf (runArp (player, s, q, { 60 }, 0.3));
+        check (ons.size() >= 4 && ons[0].at == 0 && ons[1].at == 2000 && ons[2].at == 4000 && ons[3].at == 12000 && ons[3].note == 72 && ons[3].velocity == 40,
+               "Repetir x3, probabilidad 0 % (paso 2 callado), octava +1 y velocidad 40 (paso 3)",
+               juce::String ((int) ons.size()) + " notas");
+    }
+    {
+        auto q = p;
+        q.value[StepSeq::Chance].fill (0.5f);
+        StepSeq::Player player;
+        player.prepare (rate);
+        player.setSeed (99);
+        const auto ons = onsOf (runArp (player, s, q, { 60 }, 30.0));
+        const double share = ons.size() / 240.0;
+        check (share > 0.42 && share < 0.58, "Probabilidad 50 %: suena alrededor de la mitad de los pasos", juce::String (share * 100.0, 1) + " %");
+    }
+    {
+        // PASO 3 steps long (on, off, off), VELOCIDAD 2 long (127, 30): they drift against each other
+        auto q = p;
+        q.length[StepSeq::On] = 3;
+        q.value[StepSeq::On] = {};
+        q.value[StepSeq::On][0] = 1.0f;
+        q.length[StepSeq::Velocity] = 2;
+        q.value[StepSeq::Velocity][0] = 127.0f;
+        q.value[StepSeq::Velocity][1] = 30.0f;
+        StepSeq::Player player;
+        player.prepare (rate);
+        const auto ons = onsOf (runArp (player, s, q, { 60 }, 0.8));
+        check (ons.size() >= 3 && ons[1].at == 18000 && ons[2].at == 36000 && ons[0].velocity == 127 && ons[1].velocity == 30 && ons[2].velocity == 127,
+               "Carriles de longitud distinta (3 y 2 pasos): polirritmo", ons.size() > 1 ? juce::String ((int) ons[1].at) : juce::String ("-"));
+    }
+    {
+        check (StepSeq::moveInKey (60, 2, 0, false) == 64 && StepSeq::moveInKey (60, 7, 0, false) == 72 && StepSeq::moveInKey (60, -1, 0, false) == 59
+                   && StepSeq::moveInKey (61, 1, 0, false) == 62 && StepSeq::moveInKey (69, 2, 9, true) == 72 && StepSeq::moveInKey (64, -3, 9, true) == 59,
+               "Grados de la tonalidad: Do+2 = Mi, +7 = Do', -1 = Si; en La menor La+2 = Do", "");
+        auto seq = s;
+        seq.seq = true;
+        seq.keyRoot = 2;            // Re mayor
+        auto q = p;
+        q.length[StepSeq::Note] = 4;
+        q.value[StepSeq::Note][1] = 2.0f;
+        q.value[StepSeq::Note][2] = 4.0f;
+        q.value[StepSeq::Note][3] = 7.0f;
+        StepSeq::Player player;
+        player.prepare (rate);
+        const auto ons = onsOf (runArp (player, seq, q, { 62 }, 0.5));
+        check (ons.size() >= 4 && ons[0].note == 62 && ons[1].note == 66 && ons[2].note == 69 && ons[3].note == 74,
+               "Seq en Re mayor desde Re: grados 0, 2, 4, 7 = Re Fa# La Re'", "");
+        StepSeq::Player player2;
+        player2.prepare (rate);
+        const auto up = onsOf (runArp (player2, seq, q, { 64 }, 0.5));
+        check (up.size() >= 4 && up[0].note == 64 && up[1].note == 67 && up[2].note == 71 && up[3].note == 76,
+               "Seq: otra tecla (Mi) transporta la frase dentro de la tonalidad (Mi Sol Si Mi')", "");
+    }
+    {
+        auto free = s;
+        free.sync = false;
+        free.freeBpm = 90.0;
+        StepSeq::Player player;
+        player.prepare (rate);
+        const auto ons = onsOf (runArp (player, free, p, { 60 }, 1.0, false, 120.0, 1234));
+        check (ons.size() >= 3 && ons[0].at == 1234 && ons[1].at == 1234 + 8000 && ons[2].at == 1234 + 16000,
+               "Tempo propio a 90: empieza al pulsar la tecla, una semicorchea cada 8000 muestras", "");
+    }
+    {
+        auto hold = s;
+        hold.latch = true;
+        StepSeq::Player player;
+        player.prepare (rate);
+        const auto e = runArp (player, hold, p, { 60, 67 }, 1.0, true, 120.0, 0, 3000,
+                               [] (juce::int64 at, juce::MidiBuffer& in)
+                               {
+                                   if (at == 30000 - 30000 % 256)
+                                       in.addEvent (juce::MidiMessage::noteOn (1, 62, (juce::uint8) 90), (int) (30000 - at));
+                               });
+        const auto ons = onsOf (e);
+        int afterRelease = 0, newChordOnly = 1;
+        for (const auto& x : ons)
+        {
+            afterRelease += x.at > 3000 && x.at < 30000;
+            if (x.at > 36000 && x.note != 62)
+                newChordOnly = 0;
+        }
+        check (afterRelease >= 3 && newChordOnly == 1, "Latch: sigue al soltar; una tecla nueva empieza otro acorde", juce::String (afterRelease) + " notas tras soltar");
+    }
+    {
+        // let go, the DAW's jump, Arp/Seq off: no note left on
+        StepSeq::Player player;
+        player.prepare (rate);
+        auto e = runArp (player, s, p, { 60, 64 }, 1.0, true, 120.0, 0, 20000);
+        bool ok = balanced (e);
+        StepSeq::Player jumper;
+        jumper.prepare (rate);
+        juce::MidiBuffer in, out;
+        in.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 90), 0);
+        std::vector<ArpEvent> all;
+        auto gate = s;
+        gate.gate = 4.0f;           // long notes, across the jump
+        for (int b = 0; b < 400; ++b)
+        {
+            const double ppq = b < 200 ? b * 256 / rate * 2.0 : 8.0 + (b - 200) * 256 / rate * 2.0;
+            auto st = gate;
+            st.on = b < 380;
+            jumper.process (in, out, 256, st, p, true, ppq, 120.0);
+            in.clear();
+            for (const auto meta : out)
+                if (meta.getMessage().isNoteOnOrOff())
+                    all.push_back ({ b * 256LL + meta.samplePosition, meta.getMessage().getNoteNumber(), meta.getMessage().isNoteOn(), 0 });
+        }
+        ok = ok && balanced (all);
+        check (ok, "Sin notas colgadas: al soltar, cuando el DAW salta, y al apagar Arp/Seq con notas sonando", "");
+    }
+    {
+        StepSeq::Pattern q;
+        juce::Random rng (5);
+        StepSeq::generate (q, -1, 0.7f, rng);
+        q.length[StepSeq::Gate] = 5;
+        const auto back = StepSeq::Pattern::fromString (q.toString());
+        bool inRange = true;
+        for (int l = 0; l < StepSeq::numLanes; ++l)
+            for (int k = 0; k < StepSeq::maxSteps; ++k)
+                inRange = inRange && q.at (l, k) >= StepSeq::laneRange (l).lo && q.at (l, k) <= StepSeq::laneRange (l).hi;
+        check (back == q && StepSeq::Pattern::fromString ("basura") == StepSeq::Pattern() && inRange && q.at (StepSeq::On, 0) > 0.5f,
+               "Generar da valores válidos; el patrón se escribe y se lee igual; un texto roto da el patrón por defecto", "");
+    }
+
+    // Through the plug-in: the pattern saved with the project, the notes played, the MIDI clip.
+    // a steady tone of 2 s (a sample to hear the steps with)
+    const auto toneFile = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("Arp tono C.wav");
+    toneFile.deleteFile();
+    {
+        const int n = (int) (2.0 * rate);
+        juce::AudioBuffer<float> tone (2, n);
+        for (int i = 0; i < n; ++i)
+        {
+            const float v = (float) (0.3 * std::min (1.0, i / 96.0) * std::sin (2.0 * juce::MathConstants<double>::pi * 261.63 * i / rate));
+            tone.setSample (0, i, v);
+            tone.setSample (1, i, v);
+        }
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (toneFile);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (tone, 0, n);
+    }
+    ReanimaProcessor proc;
+    proc.setPlayConfigDetails (0, 2, rate, 256);
+    proc.prepareToPlay (rate, 256);
+    proc.loadSampleNow (toneFile);
+    for (int k = 0; k < 400 && proc.isLoading(); ++k)
+    {
+        juce::Thread::sleep (10);
+        proc.serviceMessageThread();
+    }
+    proc.serviceMessageThread();
+    const auto set = [&] (const char* id, float v)
+    {
+        if (auto* param = proc.apvts.getParameter (id))
+            param->setValueNotifyingHost (param->convertTo0to1 (v));
+    };
+    auto q = StepSeq::Pattern();
+    q.value[StepSeq::Note][1] = 2.0f;
+    q.length[StepSeq::On] = 8;
+    proc.setSeqPattern (q);
+    {
+        juce::MemoryBlock state;
+        proc.getStateInformation (state);
+        ReanimaProcessor reopened;
+        reopened.setStateInformation (state.getData(), (int) state.getSize());
+        check (reopened.seqPattern() == q, "El patrón se guarda con el proyecto", "");
+    }
+    set ("arpOn", 1.0f);
+    set ("arpSync", 1.0f);          // Propio
+    set ("arpBpm", 120.0f);
+    set ("arpRate", 3.0f);          // 1/4: 24000 samples
+    set ("arpGate", 40.0f);         // gate 50 % x 40 %: a fifth of the step
+    set ("ampR", 20.0f);
+    proc.serviceMessageThread();
+    juce::AudioBuffer<float> buf (2, 256);
+    juce::MidiBuffer m;
+    std::vector<float> level;
+    for (int b = 0; b < (int) (2.0 * rate / 256); ++b)
+    {
+        m.clear();
+        if (b == 0)
+            m.addEvent (juce::MidiMessage::noteOn (1, 60, 0.8f), 0);
+        buf.clear();
+        proc.processBlock (buf, m);
+        level.push_back (buf.getRMSLevel (0, 0, 256));
+    }
+    // loud at each beat, and quieter between (the note ends after a fifth of the beat)
+    const auto around = [&] (double from, double to)
+    {
+        float top = 0.0f;
+        for (int b = (int) (from * rate / 256); b < (int) (to * rate / 256) && b < (int) level.size(); ++b)
+            top = std::max (top, level[(size_t) b]);
+        return top;
+    };
+    const float onBeat = around (0.5, 0.56), late = around (0.85, 0.99);
+    check (onBeat > 1.0e-3f && late < onBeat * 0.5f, "En el plugin: Do3 mantenido suena a negras (BPM propio 120), callado entre notas",
+           juce::String (juce::Decibels::gainToDecibels (onBeat), 1) + " dB en el tiempo, " + juce::String (juce::Decibels::gainToDecibels (late), 1) + " dB al final");
+    // the clip: from the last chord held (Do3), 1/4 notes, PASO 8 long: lanes meet again after 16 steps = 4 bars
+    const auto file = proc.writeSeqMidi();
+    juce::MidiFile mf;
+    juce::FileInputStream stream (file);
+    const bool read = stream.openedOk() && mf.readFrom (stream);
+    int count = 0, second = -1;
+    double lastTick = 0.0;
+    if (read && mf.getNumTracks() > 0)
+        for (const auto* e : *mf.getTrack (0))
+            if (e->message.isNoteOn())
+            {
+                if (count == 1)
+                    second = e->message.getNoteNumber();
+                ++count;
+                lastTick = e->message.getTimeStamp();
+            }
+    check (read && count == 16 && second == 64 && file.getFileName().contains ("4 comp"),
+           "Arrastrar MIDI: el clip con las 16 negras de 4 compases, la 2.ª en Mi (+2 grados)",
+           juce::String (count) + " notas, " + file.getFileName() + ", última en el tick " + juce::String (lastTick, 0));
+}
+
+//==============================================================================
 // SLICE through the whole plug-in, as Ableton plays it: a loop of 8 slices, each a tone of its own (so the slice
 // that sounds can be told by its pitch), loaded from a file, MIDI into processBlock. Each key from C3 (MIDI 60,
 // Ableton's numbering) must play its own slice and only it: alone, in a fast run of overlapping notes, with
@@ -4289,9 +5993,785 @@ void auditMaster()
     }
 }
 
+//==============================================================================
+// The four functions from the Color Play research (docs/investigacion_colorplay_2026-11-23.md): LFO Deriva and
+// Suavidad, the filter Armónico, Movimiento in engines B and D, and the sidechain (the matrix's source and Impronta).
+namespace colorplay
+{
+constexpr double rate = 48000.0;
+
+Sample analysed (const Audio& a, const char* name)
+{
+    return SampleAnalysis::analyse (a, rate, name, false, true);
+}
+
+// One note (or none: note < 0) with the sidechain fed block by block; counts allocations during process().
+Audio play (Sample s, const ParamSnapshot& p, int note, double held, double total, const Audio* side = nullptr,
+            long* allocations = nullptr, std::vector<float>* shown = nullptr)
+{
+    SynthEngine e;
+    e.prepare (rate);
+    e.setSample (s);
+    e.prepareFx (p);
+    const int length = (int) (total * rate), off = (int) (held * rate);
+    Audio out (2, length), buf (2, 256);
+    out.clear();
+    long count = 0;
+    for (int pos = 0; pos < length; pos += 256)
+    {
+        const int n = std::min (256, length - pos);
+        juce::MidiBuffer midi;
+        if (note >= 0 && pos == 0)
+            midi.addEvent (juce::MidiMessage::noteOn (1, note, 1.0f), 0);
+        if (note >= 0 && off >= pos && off < pos + n)
+            midi.addEvent (juce::MidiMessage::noteOff (1, note), off - pos);
+        Audio view (buf.getArrayOfWritePointers(), 2, n);
+        if (side != nullptr && pos + n <= side->getNumSamples())
+            e.setSidechain (side->getReadPointer (0, pos), side->getReadPointer (1, pos), n);
+        allocationCount = 0;
+        countingAllocations = true;
+        e.process (view, midi, p, 120.0);
+        countingAllocations = false;
+        count += allocationCount.load();
+        if (shown != nullptr)
+            shown->push_back (e.sideShown.load());
+        out.copyFrom (0, pos, buf, 0, 0, n);
+        out.copyFrom (1, pos, buf, 1, 0, n);
+    }
+    if (allocations != nullptr)
+        *allocations = count;
+    return out;
+}
+
+double rmsDb (const Audio& a, double from, double to)
+{
+    const int i0 = (int) (from * rate), i1 = std::min (a.getNumSamples(), (int) (to * rate));
+    double e = 0.0;
+    for (int i = i0; i < i1; ++i)
+        e += 0.5 * (juce::square ((double) a.getSample (0, i)) + juce::square ((double) a.getSample (1, i)));
+    return toDb (std::sqrt (e / std::max (1, i1 - i0)));
+}
+
+double centroid (const Audio& a, double from, double to)
+{
+    const int i0 = (int) (from * rate), i1 = std::min (a.getNumSamples(), (int) (to * rate));
+    constexpr int order = 12, size = 1 << order;
+    juce::dsp::FFT fft (order);
+    std::vector<float> w ((size_t) size * 2);
+    double num = 0.0, den = 0.0;
+    for (int at = i0; at + size <= i1; at += size / 2)
+    {
+        std::fill (w.begin(), w.end(), 0.0f);
+        for (int i = 0; i < size; ++i)
+            w[(size_t) i] = a.getSample (0, at + i) * (float) (0.5 - 0.5 * std::cos (twoPi * i / size));
+        fft.performFrequencyOnlyForwardTransform (w.data());
+        for (int k = 1; k < size / 2; ++k)
+        {
+            num += (double) w[(size_t) k] * w[(size_t) k] * k * rate / size;
+            den += (double) w[(size_t) k] * w[(size_t) k];
+        }
+    }
+    return den > 0.0 ? num / den : 0.0;
+}
+
+// The pitch in cents against `hz`, every `hop` seconds, from upward zero crossings (interpolated).
+std::vector<double> centsTrack (const Audio& a, double from, double to, double hz, double hop)
+{
+    std::vector<double> crossings;
+    const float* x = a.getReadPointer (0);
+    for (int i = (int) (from * rate) + 1; i < std::min (a.getNumSamples(), (int) (to * rate)); ++i)
+        if (x[i - 1] < 0.0f && x[i] >= 0.0f)
+            crossings.push_back (i - 1 + (double) -x[i - 1] / (double) (x[i] - x[i - 1]));
+    std::vector<double> cents;
+    size_t k = 0;
+    for (double t = from; t + hop <= to; t += hop)
+    {
+        const double a0 = t * rate, a1 = (t + hop) * rate;
+        while (k < crossings.size() && crossings[k] < a0)
+            ++k;
+        size_t j = k;
+        while (j + 1 < crossings.size() && crossings[j + 1] < a1)
+            ++j;
+        if (j > k)
+            cents.push_back (1200.0 * std::log2 ((double) (j - k) * rate / (crossings[j] - crossings[k]) / hz));
+    }
+    return cents;
+}
+
+// Amplitude of harmonic h of f0 over one second from `from` (left channel).
+double harmonicDb (const Audio& a, double f0, int h, double from)
+{
+    return toDb (toneAmp (a.getReadPointer (0, (int) (from * rate)), (int) rate, f0 * h, rate));
+}
+
+Audio noise (double seconds, unsigned seed, float amp = 0.3f)
+{
+    juce::Random r ((juce::int64) seed);
+    Audio b (2, (int) (seconds * rate));
+    for (int i = 0; i < b.getNumSamples(); ++i)
+    {
+        const float v = amp * (r.nextFloat() * 2.0f - 1.0f);
+        b.setSample (0, i, v);
+        b.setSample (1, i, v);
+    }
+    return b;
+}
+
+// A tone whose highs die faster than its body: a struck string, darkening as it sounds.
+Audio darkening (double hz, double seconds)
+{
+    Audio b (2, (int) (seconds * rate));
+    for (int i = 0; i < b.getNumSamples(); ++i)
+    {
+        const double t = i / rate;
+        double v = 0.0;
+        for (int h = 1; h <= 16; ++h)
+            v += std::sin (twoPi * hz * h * t) / h * std::exp (-t * 0.25 * h);
+        const double attack = std::min (1.0, t / 0.004);
+        b.setSample (0, i, (float) (0.35 * attack * v));
+        b.setSample (1, i, (float) (0.35 * attack * v));
+    }
+    return b;
+}
+
+ParamSnapshot defaults (const SampleData& s, int engine)
+{
+    auto p = paramsFor (s);
+    p[P::Engine] = (float) engine;
+    return p;
+}
+} // namespace colorplay
+
+void auditColorPlay()
+{
+    using namespace colorplay;
+    title ("Color Play · LFO Deriva y Suavidad");
+    {
+        const auto s = analysed (tone (220.0, 6.0, rate), "tono 220");
+        auto p = defaults (*s, P::EngineRebuild);
+        p[P::Lfo1Shape] = (float) P::Drift;
+        p[P::Lfo1Rate] = 1.0f;
+        p[P::Lfo1Smooth] = 0.5f;
+        p[P::M1Src] = (float) P::SrcLfo1;
+        p[P::M1Dst] = (float) P::DstFine;
+        p[P::M1Amt] = 0.2f;            // ±20 cents
+        long allocations = 0;
+        const auto y = play (s, p, 60, 5.0, 5.2, nullptr, &allocations);
+        const auto cents = centsTrack (y, 0.2, 4.8, 220.0, 0.05);
+        double peak = 0.0, jump = 0.0, mean = 0.0, sq = 0.0;
+        for (size_t i = 0; i < cents.size(); ++i)
+        {
+            peak = std::max (peak, std::abs (cents[i]));
+            if (i > 0)
+                jump = std::max (jump, std::abs (cents[i] - cents[i - 1]));
+            mean += cents[i];
+            sq += cents[i] * cents[i];
+        }
+        const double sd = std::sqrt (std::max (0.0, sq / (double) cents.size() - juce::square (mean / (double) cents.size())));
+        check (peak <= 23.0, "Deriva en Tono fino al 20 %: no pasa de ±20 cents", juce::String (peak, 1) + " cents");
+        check (sd >= 2.0, "Deriva: la afinación se mueve de verdad", "desviación " + juce::String (sd, 1) + " cents");
+        check (jump <= 6.0, "Deriva: sin saltos (cada 50 ms)", juce::String (jump, 2) + " cents");
+        check (allocations == 0, "Deriva: sin memoria nueva en el hilo de audio", juce::String (allocations));
+
+        // Suavidad on Deriva: less quick wobble (cents moved from one 50 ms to the next).
+        const auto wobble = [&] (float smooth)
+        {
+            auto q = p;
+            q[P::Lfo1Smooth] = smooth;
+            const auto c = centsTrack (play (s, q, 60, 5.0, 5.2), 0.2, 4.8, 220.0, 0.05);
+            double d = 0.0;
+            for (size_t i = 1; i < c.size(); ++i)
+                d += std::abs (c[i] - c[i - 1]);
+            return d / std::max<size_t> (1, c.size() - 1);
+        };
+        const double rough = wobble (0.0), smooth = wobble (1.0);
+        check (smooth < rough * 0.8, "Suavidad en Deriva quita el temblor rápido",
+               juce::String (rough, 2) + " → " + juce::String (smooth, 2) + " cents por paso");
+
+        // Suavidad on a square: rounder steps of the volume.
+        const auto steps = [&] (float smooth)
+        {
+            auto q = defaults (*s, P::EngineRebuild);
+            q[P::Lfo1Shape] = (float) P::Square;
+            q[P::Lfo1Rate] = 2.0f;
+            q[P::Lfo1Smooth] = smooth;
+            q[P::M1Src] = (float) P::SrcLfo1;
+            q[P::M1Dst] = (float) P::DstVolume;
+            q[P::M1Amt] = 0.25f;
+            const auto z = play (s, q, 60, 3.0, 3.2);
+            double worst = 0.0, prev = rmsDb (z, 0.3, 0.305);
+            for (double t = 0.305; t < 2.8; t += 0.005)
+            {
+                const double now = rmsDb (z, t, t + 0.005);
+                worst = std::max (worst, std::abs (now - prev));
+                prev = now;
+            }
+            return worst;
+        };
+        const double hard = steps (0.0), soft = steps (0.8);
+        check (soft < hard * 0.5, "Suavidad redondea los saltos de una cuadrada", db (hard) + " → " + db (soft) + " cada 5 ms");
+    }
+
+    title ("Color Play · filtro Armónico");
+    {
+        const auto s = analysed (pluck (110.0, 3.0, rate), "pluck 110");
+        const auto base = defaults (*s, P::EngineRebuild);
+        const auto off = play (s, base, 60, 2.5, 2.6);
+        const auto with = [&] (float gain, float morph, float region, float centre)
+        {
+            auto q = base;
+            q[P::FltOn] = 1.0f;
+            q[P::FltType] = (float) P::Harmonic;
+            q[P::FltFreq] = centre;
+            q[P::FltHarmGain] = gain;
+            q[P::FltHarmRegion] = region;
+            q[P::FltMorph] = morph;
+            q[P::FltRes] = 0.5f;
+            return q;
+        };
+        long allocations = 0;
+        const auto up = play (s, with (12.0f, 0.5f, 3.0f, 700.0f), 60, 2.5, 2.6, nullptr, &allocations);
+        const auto down = play (s, with (-12.0f, 0.5f, 3.0f, 700.0f), 60, 2.5, 2.6);
+        const double h1 = harmonicDb (off, 110.0, 1, 0.3), h6 = harmonicDb (off, 110.0, 6, 0.3);
+        const double upH1 = harmonicDb (up, 110.0, 1, 0.3), upH6 = harmonicDb (up, 110.0, 6, 0.3);
+        const double downH1 = harmonicDb (down, 110.0, 1, 0.3), downH6 = harmonicDb (down, 110.0, 6, 0.3);
+        check ((upH6 - upH1) - (h6 - h1) >= 6.0, "Armónico +12 dB realza los armónicos de su región",
+               "6º frente a la fundamental: " + db ((upH6 - upH1) - (h6 - h1)));
+        check ((downH6 - downH1) - (h6 - h1) <= -6.0, "Armónico -12 dB atenúa los armónicos de su región",
+               db ((downH6 - downH1) - (h6 - h1)));
+        check (downH1 >= h1 - 0.5, "Armónico nunca baja la fundamental", db (downH1 - h1));
+        const double lvl = rmsDb (off, 0.05, 2.4), lvlUp = rmsDb (up, 0.05, 2.4), lvlDown = rmsDb (down, 0.05, 2.4);
+        check (std::abs (lvlUp - lvl) <= 1.5 && std::abs (lvlDown - lvl) <= 3.0, "Armónico mantiene el volumen",
+               "+12: " + db (lvlUp - lvl) + ", -12: " + db (lvlDown - lvl));
+        check (allocations == 0, "Armónico: sin memoria nueva en el hilo de audio", juce::String (allocations));
+
+        // Odd against even.
+        const auto odd = play (s, with (12.0f, 0.0f, 6.0f, 500.0f), 60, 2.5, 2.6);
+        const auto even = play (s, with (12.0f, 1.0f, 6.0f, 500.0f), 60, 2.5, 2.6);
+        const double ref = harmonicDb (off, 110.0, 3, 0.3) - harmonicDb (off, 110.0, 4, 0.3);
+        const double oddR = harmonicDb (odd, 110.0, 3, 0.3) - harmonicDb (odd, 110.0, 4, 0.3);
+        const double evenR = harmonicDb (even, 110.0, 3, 0.3) - harmonicDb (even, 110.0, 4, 0.3);
+        check (oddR - ref >= 6.0 && evenR - ref <= -6.0, "Pares/impares: 0 % realza los impares, 100 % los pares",
+               "3º frente al 4º: impares " + db (oddR - ref) + ", pares " + db (evenR - ref));
+
+        // Noise played on a key: tuned.
+        const auto ns = analysed (noise (3.0, 7), "ruido");
+        auto nq = defaults (*ns, P::EngineRebuild);
+        const auto noiseOff = play (ns, nq, 45, 2.5, 2.6);
+        nq[P::FltOn] = 1.0f;
+        nq[P::FltType] = (float) P::Harmonic;
+        nq[P::FltFreq] = 1000.0f;
+        nq[P::FltHarmGain] = 24.0f;
+        nq[P::FltHarmRegion] = 8.0f;
+        nq[P::FltRes] = 0.9f;
+        const auto noiseOn = play (ns, nq, 45, 2.5, 2.6);
+        const auto tonalDb = [] (const Audio& a)
+        {
+            double on = 1.0e-20, between = 1.0e-20;
+            for (int h = 1; h <= 20; ++h)
+            {
+                on += juce::square (toneAmp (a.getReadPointer (0, (int) (0.5 * rate)), (int) rate, 110.0 * h, rate));
+                between += juce::square (toneAmp (a.getReadPointer (0, (int) (0.5 * rate)), (int) rate, 110.0 * (h + 0.5), rate));
+            }
+            return 10.0 * std::log10 (on / between);
+        };
+        const double t0 = tonalDb (noiseOff), t1 = tonalDb (noiseOn);
+        check (t1 - t0 >= 10.0, "Armónico afina un ruido en la nota tocada (La1)", "armónicos frente a lo de en medio: " + db (t1 - t0));
+
+        // A glide with Armónico: no clicks more than without it.
+        const auto glide = [&] (bool harmonicOn)
+        {
+            auto q = harmonicOn ? with (12.0f, 0.5f, 4.0f, 1000.0f) : base;
+            q[P::PolyMode] = (float) P::Legato;
+            q[P::Glide] = 150.0f;
+            q[P::FltKey] = 1.0f;
+            SynthEngine e;
+            e.prepare (rate);
+            e.setSample (s);
+            e.prepareFx (q);
+            Audio out (2, (int) (2.0 * rate)), buf (2, 256);
+            for (int pos = 0; pos < out.getNumSamples(); pos += 256)
+            {
+                juce::MidiBuffer midi;
+                if (pos == 0) midi.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+                if (pos == 25600) midi.addEvent (juce::MidiMessage::noteOn (1, 67, 1.0f), 0);
+                if (pos == 25600) midi.addEvent (juce::MidiMessage::noteOff (1, 60), 1);
+                e.process (buf, midi, q, 120.0);
+                out.copyFrom (0, pos, buf, 0, 0, 256);
+                out.copyFrom (1, pos, buf, 1, 0, 256);
+            }
+            // A click: the second difference far above its own level over the 10 ms around it.
+            const float* x = out.getReadPointer (0);
+            const int n = out.getNumSamples(), w = (int) (0.01 * rate);
+            std::vector<double> d2 ((size_t) n, 0.0), cum ((size_t) n + 1, 0.0);
+            for (int i = 2; i < n; ++i)
+                d2[(size_t) i] = x[i] - 2.0 * x[i - 1] + x[i - 2];
+            for (int i = 0; i < n; ++i)
+                cum[(size_t) i + 1] = cum[(size_t) i] + d2[(size_t) i] * d2[(size_t) i];
+            double worst = 0.0;
+            for (int i = (int) (0.05 * rate); i < n - w; ++i)
+            {
+                const double around = std::sqrt ((cum[(size_t) (i + w)] - cum[(size_t) (i - w)]) / (2.0 * w)) + 1.0e-9;
+                worst = std::max (worst, std::abs (d2[(size_t) i]) / around);
+            }
+            return worst;
+        };
+        const double gOff = glide (false), gOn = glide (true);
+        check (gOn <= std::max (8.0, gOff * 1.5), "Armónico en un glide: sin clics",
+               "pico de la 2ª diferencia frente a su entorno: " + juce::String (gOff, 2) + " → " + juce::String (gOn, 2));
+    }
+
+    title ("Color Play · Movimiento (motores B y D)");
+    {
+        const auto s = analysed (darkening (220.0, 5.0), "tono que se oscurece");
+        for (const int engine : { P::EngineReenvelope, P::EngineHybrid })
+        {
+            const char* name = engine == P::EngineReenvelope ? "B" : "D";
+            auto p = defaults (*s, engine);
+            p[P::SustainType] = (float) P::SustainHold;
+            p[P::AmpS] = 1.0f;
+            p[P::SustainMotion] = 0.0f;
+            const auto still = play (s, p, 60, 6.0, 6.3);
+            p[P::SustainMotion] = 1.0f;
+            long allocations = 0;
+            const auto moving = play (s, p, 60, 6.0, 6.3, nullptr, &allocations);
+            const double hand = (s->early.start - s->onset) / rate;
+            const double a0 = hand + 0.3, a1 = std::min (5.5, hand + 3.5);
+            const double stillDrop = centroid (still, a1 - 0.3, a1 + 0.3) / centroid (still, a0 - 0.1, a0 + 0.3);
+            const double moveDrop = centroid (moving, a1 - 0.3, a1 + 0.3) / centroid (moving, a0 - 0.1, a0 + 0.3);
+            check (moveDrop < stillDrop * 0.9, juce::String ("Movimiento en ") + name + ": el sostenido se oscurece como el sample",
+                   "centroide al final / al principio: quieto " + juce::String (stillDrop, 2) + ", con Movimiento " + juce::String (moveDrop, 2)
+                   + " (mano a " + juce::String (hand, 2) + " s)");
+            const double dl = rmsDb (moving, hand + 0.5, 5.8) - rmsDb (still, hand + 0.5, 5.8);
+            check (std::abs (dl) <= 1.5, juce::String ("Movimiento en ") + name + ": el volumen no cambia", db (dl));
+            double jump = 0.0, prev = rmsDb (moving, hand + 0.1, hand + 0.11);
+            for (double t = hand + 0.11; t < 5.8; t += 0.01)
+            {
+                const double now = rmsDb (moving, t, t + 0.01);
+                jump = std::max (jump, std::abs (now - prev));
+                prev = now;
+            }
+            check (jump <= 3.0, juce::String ("Movimiento en ") + name + ": sin saltos de nivel (cada 10 ms)", db (jump));
+            check (allocations == 0, juce::String ("Movimiento en ") + name + ": sin memoria nueva en el hilo de audio", juce::String (allocations));
+        }
+    }
+
+    title ("Color Play · Sidechain: fuente de la matriz");
+    {
+        // A steady bright tone (a sawtooth of 110 Hz), so that only the filter changes its colour.
+        Audio saw (2, (int) (5.0 * rate));
+        for (int i = 0; i < saw.getNumSamples(); ++i)
+        {
+            double v = 0.0;
+            for (int h = 1; h <= 40; ++h)
+                v += std::sin (twoPi * 110.0 * h * i / rate) / h;
+            saw.setSample (0, i, (float) (0.25 * v));
+            saw.setSample (1, i, (float) (0.25 * v));
+        }
+        const auto s = analysed (saw, "sierra 110");
+        auto p = defaults (*s, P::EngineRebuild);
+        p[P::FltOn] = 1.0f;
+        p[P::FltType] = (float) P::LP;
+        p[P::FltFreq] = 300.0f;
+        // Bursts of noise: 100 ms on, 400 ms off.
+        Audio side (2, (int) (4.0 * rate));
+        juce::Random r (3);
+        for (int i = 0; i < side.getNumSamples(); ++i)
+        {
+            const bool on = std::fmod (i / rate, 0.5) < 0.1;
+            const float v = on ? 0.3f * (r.nextFloat() * 2.0f - 1.0f) : 0.0f;
+            side.setSample (0, i, v);
+            side.setSample (1, i, v);
+        }
+        const auto plain = play (s, p, 60, 3.8, 3.8, &side);
+        auto q = p;
+        q[P::M1Src] = (float) P::SrcSidechain;
+        q[P::M1Dst] = (float) P::DstCutoff;
+        q[P::M1Amt] = 0.6f;
+        std::vector<float> shown;
+        long allocations = 0;
+        const auto opened = play (s, q, 60, 3.8, 3.8, &side, &allocations, &shown);
+        const auto bright = [] (const Audio& a, bool burst)
+        {
+            double sum = 0.0;
+            int count = 0;
+            for (double t = 1.0; t < 3.5; t += 0.5)
+            {
+                const double from = burst ? t + 0.02 : t + 0.3;
+                sum += centroid (a, from, from + 0.09);
+                ++count;
+            }
+            return sum / count;
+        };
+        const double during = bright (opened, true), after = bright (opened, false);
+        double shownOn = 0.0, shownOff = 0.0;
+        int nOn = 0, nOff = 0;
+        for (size_t b = 0; b < shown.size(); ++b)
+        {
+            const double t = std::fmod ((double) b * 256.0 / rate, 0.5);
+            if (t > 0.02 && t < 0.09) { shownOn += shown[b]; ++nOn; }
+            if (t > 0.3 && t < 0.39) { shownOff += shown[b]; ++nOff; }
+        }
+        // Against the same note without the source (its own sustain changes colour too): how much brighter.
+        const double openDuring = during / bright (plain, true), openAfter = after / bright (plain, false);
+        check (openDuring > openAfter * 1.15 && openDuring > 1.2, "La fuente Sidechain abre el filtro con los golpes de la pista lateral",
+               "brillo frente a sin fuente: con golpe x" + juce::String (openDuring, 2) + ", sin golpe x" + juce::String (openAfter, 2) + "; fuente "
+               + juce::String (shownOn / std::max (1, nOn), 2) + " / " + juce::String (shownOff / std::max (1, nOff), 2));
+        bool range = true;
+        for (const float v : shown)
+            range = range && v >= 0.0f && v <= 1.0f;
+        check (range, "La fuente Sidechain se queda entre 0 y 1");
+        check (allocations == 0, "Sidechain: sin memoria nueva en el hilo de audio", juce::String (allocations));
+        const auto none = play (s, q, 60, 3.8, 3.8, nullptr);
+        bool same = true;
+        for (int i = 0; i < none.getNumSamples() && same; ++i)
+            same = none.getSample (0, i) == plain.getSample (0, i);
+        check (same, "Sin entrada lateral, la fuente Sidechain no mueve nada (idéntico al sonido sin ella)");
+    }
+
+    title ("Color Play · Impronta");
+    {
+        const auto shaped = [] (int mode, const Audio* side, const Audio& in, long* allocations = nullptr)
+        {
+            ParamSnapshot p {};
+            for (int i = 0; i < P::Count; ++i)
+                p[(size_t) i] = P::defs()[(size_t) i].def;
+            p[(size_t) P::fxType (0)] = (float) Fx::Impronta;
+            p[(size_t) P::fxOn (0)] = 1.0f;
+            p[(size_t) P::fxMix (0)] = 1.0f;
+            const auto& spec = Fx::spec (Fx::Impronta);
+            for (int k = 0; k < (int) spec.params.size(); ++k)
+                p[(size_t) P::fxParam (0, k)] = Fx::toNorm (spec.params[(size_t) k], spec.params[(size_t) k].def);
+            p[(size_t) P::fxParam (0, 0)] = Fx::toNorm (spec.params[0], (float) mode);
+            p[(size_t) P::fxParam (0, 1)] = Fx::toNorm (spec.params[1], 1.0f);
+            FxRack fx;
+            fx.prepare (rate);
+            fx.ensureModules (p);
+            Audio out (in);
+            long count = 0;
+            for (int pos = 0; pos < out.getNumSamples(); pos += 256)
+            {
+                const int n = std::min (256, out.getNumSamples() - pos);
+                Audio view (out.getArrayOfWritePointers(), 2, pos, n);
+                if (side != nullptr)
+                    fx.setSidechain (side->getReadPointer (0, pos), side->getReadPointer (1, pos), n);
+                else
+                    fx.setSidechain (nullptr, nullptr, 0);
+                allocationCount = 0;
+                countingAllocations = true;
+                fx.process (view, p, 120.0);
+                countingAllocations = false;
+                count += allocationCount.load();
+            }
+            if (allocations != nullptr)
+                *allocations = count;
+            return out;
+        };
+        // Reanima's side: noise tilted down 3 dB an octave (pink-like), as most sounds are.
+        Audio in (noise (3.0, 11, 0.2f));
+        {
+            float b0 = 0, b1 = 0, b2 = 0;
+            for (int i = 0; i < in.getNumSamples(); ++i)
+            {
+                const float w = in.getSample (0, i);
+                b0 = 0.99765f * b0 + w * 0.0990460f;
+                b1 = 0.96300f * b1 + w * 0.2965164f;
+                b2 = 0.57000f * b2 + w * 1.0526913f;
+                const float pink = 0.5f * (b0 + b1 + b2 + w * 0.1848f);
+                in.setSample (0, i, pink);
+                in.setSample (1, i, pink);
+            }
+        }
+        // Highs (2 to 12 kHz) against lows (100 Hz to 1 kHz), in dB.
+        const auto tilt = [] (const Audio& a)
+        {
+            constexpr int order = 13, size = 1 << order;
+            juce::dsp::FFT fft (order);
+            std::vector<float> w ((size_t) size * 2);
+            double hi = 1.0e-20, lo = 1.0e-20;
+            for (int at = (int) (0.5 * rate); at + size <= (int) (2.9 * rate); at += size)
+            {
+                std::fill (w.begin(), w.end(), 0.0f);
+                for (int i = 0; i < size; ++i)
+                    w[(size_t) i] = a.getSample (0, at + i) * (float) (0.5 - 0.5 * std::cos (twoPi * i / size));
+                fft.performFrequencyOnlyForwardTransform (w.data());
+                for (int k = 1; k < size / 2; ++k)
+                {
+                    const double hz = k * rate / size, pw = (double) w[(size_t) k] * w[(size_t) k];
+                    if (hz >= 2000.0 && hz <= 12000.0) hi += pw;
+                    else if (hz >= 100.0 && hz <= 1000.0) lo += pw;
+                }
+            }
+            return 10.0 * std::log10 (hi / lo);
+        };
+        const auto maxDiff = [] (const Audio& a, const Audio& b)
+        {
+            float d = 0.0f;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < a.getNumSamples(); ++i)
+                    d = std::max (d, std::abs (a.getSample (ch, i) - b.getSample (ch, i)));
+            return d;
+        };
+        check (maxDiff (shaped (0, nullptr, in), in) == 0.0f, "Impronta sin entrada lateral deja el sonido igual (bit a bit)");
+        Audio silent (2, in.getNumSamples());
+        silent.clear();
+        check (maxDiff (shaped (0, &silent, in), in) < 1.0e-6f, "Impronta Color con la pista lateral en silencio deja el sonido igual");
+
+        // A dark and a bright sidechain.
+        Audio dark (noise (3.0, 5, 0.3f)), light (noise (3.0, 6, 0.3f));
+        {
+            Dsp::Biquad lp, hp;
+            lp.set (Dsp::Biquad::LowPass, rate, 400.0f, 0.707f);
+            hp.set (Dsp::Biquad::HighPass, rate, 4000.0f, 0.707f);
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                lp.reset();
+                hp.reset();
+                for (int i = 0; i < dark.getNumSamples(); ++i)
+                {
+                    dark.setSample (ch, i, lp.process (0, dark.getSample (ch, i)));
+                    light.setSample (ch, i, hp.process (0, light.getSample (ch, i)));
+                }
+            }
+        }
+        long allocations = 0;
+        const auto byDark = shaped (0, &dark, in, &allocations), byLight = shaped (0, &light, in);
+        const double c0 = tilt (in), cd = tilt (byDark), cl = tilt (byLight);
+        check (cd < c0 - 10.0 && cl > c0 + 10.0, "Impronta Color: una pista oscura oscurece, una brillante abre",
+               "agudos frente a graves: " + db (c0) + " → oscura " + db (cd) + ", brillante " + db (cl));
+        const double l0 = rmsDb (in, 0.5, 2.9), ld = rmsDb (byDark, 1.0, 2.9), ll = rmsDb (byLight, 1.0, 2.9);
+        check (std::abs (ld - l0) <= 1.5 && std::abs (ll - l0) <= 1.5, "Impronta Color cambia el timbre, no el volumen",
+               "oscura " + db (ld - l0) + ", brillante " + db (ll - l0));
+        check (allocations == 0, "Impronta: sin memoria nueva en el hilo de audio", juce::String (allocations));
+        const double vocSilent = rmsDb (shaped (1, &silent, in), 1.0, 2.9);
+        check (vocSilent <= l0 - 40.0, "Impronta Vocoder: la pista lateral en silencio calla el sonido", db (vocSilent - l0));
+        Audio quiet (2, in.getNumSamples());
+        quiet.clear();
+        const double invQuiet = rmsDb (shaped (2, &light, quiet), 1.0, 2.9), invPlaying = rmsDb (shaped (2, &light, in), 1.0, 2.9);
+        check (invPlaying - invQuiet >= 30.0, "Impronta Invertido: suena la pista lateral cuando Reanima suena",
+               "con notas " + db (invPlaying) + ", sin notas " + db (invQuiet));
+    }
+}
+
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI init;
+
+    if (argc > 3 && juce::String (argv[1]) == "estres")
+    {
+        // estres <file> <out prefix> [id=value ...] [notes=N] [gap=ms] [held=s] [block=64] [rate=48000] [spread=12] [wav=1]:
+        // many notes in quick succession through the whole processor, against the same notes each rendered alone
+        // (a sum of them is what a voice that nothing disturbs would give). Per 20 ms: the residual against that
+        // sum in dB, the voices sounding, and the time each block took against its real-time budget.
+        const juce::File in (juce::String::fromUTF8 (argv[2]));
+        const juce::String prefix = juce::String::fromUTF8 (argv[3]);
+        int notes = 24, block = 64, spread = 12, firstKey = 0;
+        double gapMs = 40.0, held = 0.6, rate = 48000.0;
+        bool writeWav = false, fresh = false;
+        std::vector<std::pair<juce::String, float>> sets { { "volume", -24.0f }, { "variation", 0.0f }, { "monoBass", 0.0f } };
+        for (int a = 4; a < argc; ++a)
+        {
+            const juce::String s (argv[a]);
+            const auto key = s.upToFirstOccurrenceOf ("=", false, false);
+            const auto value = s.fromFirstOccurrenceOf ("=", false, false);
+            if (key == "notes") notes = value.getIntValue();
+            else if (key == "gap") gapMs = value.getDoubleValue();
+            else if (key == "held") held = value.getDoubleValue();
+            else if (key == "block") block = value.getIntValue();
+            else if (key == "rate") rate = value.getDoubleValue();
+            else if (key == "spread") spread = value.getIntValue();
+            else if (key == "key") firstKey = value.getIntValue();
+            else if (key == "wav") writeWav = value.getIntValue() != 0;
+            else if (key == "fresh") fresh = value.getIntValue() != 0;
+            else sets.push_back ({ key, value.getFloatValue() });
+        }
+        std::vector<int> pitch ((size_t) notes);
+        std::vector<int> onAt ((size_t) notes), offAt ((size_t) notes);
+        juce::Random r (1234);
+        // every note on a key of its own (a key played again would be another test: the same key's note-off),
+        // shuffled over 60 +- spread, wider when there are more notes than keys
+        std::vector<int> keys;
+        for (int k = -std::max (spread, notes / 2 + 1); k <= std::max (spread, notes / 2 + 1); ++k)
+            keys.push_back (60 + k);
+        for (int k = (int) keys.size() - 1; k > 0; --k)
+            std::swap (keys[(size_t) k], keys[(size_t) r.nextInt (k + 1)]);
+        for (int k = 0; k < notes; ++k)
+        {
+            pitch[(size_t) k] = firstKey > 0 ? firstKey + k : keys[(size_t) k % keys.size()];
+            onAt[(size_t) k] = (int) std::lround (k * gapMs * 0.001 * rate);
+            offAt[(size_t) k] = onAt[(size_t) k] + (int) std::lround (held * rate);
+        }
+        const int total = offAt.back() + (int) (2.5 * rate);
+
+        auto makeProc = [&] (ReanimaProcessor& proc)
+        {
+            proc.engine.keySeeds.store (true);
+            proc.setPlayConfigDetails (0, 2, rate, block);
+            proc.prepareToPlay (rate, block);
+            proc.loadSampleNow (in);
+            for (int k = 0; k < 1500 && proc.isLoading(); ++k)
+            {
+                juce::Thread::sleep (10);
+                proc.serviceMessageThread();
+            }
+            proc.serviceMessageThread();
+            for (const auto& [id, v] : sets)
+            {
+                if (auto* param = proc.apvts.getParameter (id))
+                    param->setValueNotifyingHost (param->convertTo0to1 (v));
+                else
+                    std::printf ("sin parámetro %s\n", id.toRawUTF8());
+            }
+            for (int k = 0; k < (std::getenv ("ESTRES_ESPERA") != nullptr ? 2000 : 300); ++k)       // analysis an engine may still ask for, the Rubber Band render
+            {
+                proc.serviceMessageThread();
+                juce::Thread::sleep (5);
+            }
+        };
+        // which: -1 all notes, else that note alone. times: per block seconds (all notes only).
+        auto render = [&] (ReanimaProcessor& proc, int which, juce::AudioBuffer<float>& out, std::vector<double>* times, std::vector<int>* voices)
+        {
+            out.setSize (2, total);
+            out.clear();
+            juce::AudioBuffer<float> buf (2, block);
+            for (int pos = 0; pos < total; pos += block)
+            {
+                const int n = std::min (block, total - pos);
+                juce::MidiBuffer m;
+                for (int k = 0; k < notes; ++k)
+                {
+                    if (which >= 0 && k != which)
+                        continue;
+                    if (onAt[(size_t) k] >= pos && onAt[(size_t) k] < pos + n)
+                        m.addEvent (juce::MidiMessage::noteOn (1, pitch[(size_t) k], 0.9f), onAt[(size_t) k] - pos);
+                    if (offAt[(size_t) k] >= pos && offAt[(size_t) k] < pos + n)
+                        m.addEvent (juce::MidiMessage::noteOff (1, pitch[(size_t) k]), offAt[(size_t) k] - pos);
+                }
+                buf.setSize (2, n, false, false, true);
+                buf.clear();
+                const auto t0 = juce::Time::getHighResolutionTicks();
+                proc.processBlock (buf, m);
+                const auto t1 = juce::Time::getHighResolutionTicks();
+                if (times != nullptr)
+                    times->push_back (juce::Time::highResolutionTicksToSeconds (t1 - t0));
+                if (voices != nullptr)
+                {
+                    int count = 0;
+                    for (auto& ph : proc.engine.playheads)
+                        count += ph.load() >= 0.0f ? 1 : 0;
+                    voices->push_back (count);
+                }
+                out.copyFrom (0, pos, buf, 0, 0, n);
+                out.copyFrom (1, pos, buf, 1, 0, n);
+            }
+            // drain: the next run starts from silence
+            for (int k = 0; k < (int) (3.0 * rate) / block; ++k)
+            {
+                juce::MidiBuffer m;
+                buf.setSize (2, block, false, false, true);
+                buf.clear();
+                proc.processBlock (buf, m);
+            }
+        };
+
+        ReanimaProcessor proc;
+        makeProc (proc);
+        juce::AudioBuffer<float> all, sum (2, total), one;
+        sum.clear();
+        std::vector<double> times;
+        std::vector<int> voices;
+        for (int k = 0; k < notes; ++k)
+        {
+            if (fresh)
+            {
+                ReanimaProcessor alone;      // a processor of its own for each note: nothing carried from the last one
+                makeProc (alone);
+                render (alone, k, one, nullptr, nullptr);
+            }
+            else
+                render (proc, k, one, nullptr, nullptr);
+            for (int ch = 0; ch < 2; ++ch)
+                sum.addFrom (ch, 0, one, ch, 0, total);
+        }
+        render (proc, -1, all, &times, &voices);
+
+        const double budget = block / rate;
+        if (std::getenv ("ESTRES_PICOS") != nullptr)
+            for (size_t b = 0; b < times.size(); ++b)
+                if (times[b] > 0.8 * budget)
+                    std::printf ("pico %.3f s %.0f%% (%d voces)\n", b * block / rate, 100.0 * times[b] / budget, voices[b]);
+        int over = 0;
+        double worstT = 0.0, meanT = 0.0;
+        for (auto t : times)
+        {
+            over += t > budget ? 1 : 0;
+            worstT = std::max (worstT, t);
+            meanT += t;
+        }
+        meanT /= std::max<size_t> (1, times.size());
+
+        // residual per 20 ms where the sum has sound
+        const int win = (int) (0.02 * rate);
+        double worstDb = -300.0, worstAt = 0.0, firstBadAt = -1.0;
+        int worstVoices = 0, firstBadVoices = 0;
+        double totalRef = 0.0, totalRes = 0.0, peak = 0.0;
+        for (int w = 0; w + win <= total; w += win)
+        {
+            double ref = 0.0, res = 0.0;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = w; i < w + win; ++i)
+                {
+                    const double a = sum.getSample (ch, i), b = all.getSample (ch, i);
+                    ref += a * a;
+                    res += (a - b) * (a - b);
+                    peak = std::max (peak, std::abs (b));
+                }
+            totalRef += ref;
+            totalRes += res;
+            if (ref < 1.0e-9 * win)
+                continue;
+            const double db = 10.0 * std::log10 ((res + 1.0e-20) / ref);
+            const int v = voices[(size_t) std::min ((int) voices.size() - 1, w / block)];
+            if (db > worstDb)
+            {
+                worstDb = db;
+                worstAt = w / rate;
+                worstVoices = v;
+            }
+            if (firstBadAt < 0.0 && db > -30.0)
+            {
+                firstBadAt = w / rate;
+                firstBadVoices = v;
+            }
+        }
+        int maxVoices = 0;
+        for (auto v : voices)
+            maxVoices = std::max (maxVoices, v);
+        std::printf ("%s | voces max %d | residuo total %.1f dB, peor %.1f dB a %.2f s (%d voces), primero > -30 dB: %s | pico %.2f dBFS | "
+                     "CPU bloque media %.0f%% peor %.0f%%, %d de %d bloques sobre el tiempo real\n",
+                     in.getFileName().toRawUTF8(), maxVoices, 10.0 * std::log10 ((totalRes + 1.0e-20) / (totalRef + 1.0e-20)), worstDb, worstAt, worstVoices,
+                     firstBadAt < 0.0 ? "nunca" : (juce::String (firstBadAt, 2) + " s (" + juce::String (firstBadVoices) + " voces)").toRawUTF8(),
+                     20.0 * std::log10 (peak + 1.0e-20), 100.0 * meanT / budget, 100.0 * worstT / budget, over, (int) times.size());
+        if (writeWav)
+        {
+            juce::AudioBuffer<float> res (2, total);
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                res.copyFrom (ch, 0, all, ch, 0, total);
+                res.addFrom (ch, 0, sum, ch, 0, total, -1.0f);
+            }
+            for (const auto& [name, b] : { std::pair<const char*, juce::AudioBuffer<float>*> { "_todas.wav", &all }, { "_suma.wav", &sum }, { "_residuo.wav", &res } })
+            {
+                const juce::File f (prefix + name);
+                f.deleteFile();
+                std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (f);
+                juce::WavAudioFormat wav;
+                if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (32)))
+                    w->writeFromAudioSampleBuffer (*b, 0, total);
+            }
+        }
+        return 0;
+    }
 
     if (argc > 4 && juce::String (argv[1]) == "procloop")
     {
@@ -4447,12 +6927,104 @@ int main (int argc, char* argv[])
         return failures == 0 ? 0 : 1;
     }
 
+    if (argc > 1 && juce::String (argv[1]) == "iman")
+    {
+        juce::ScopedJuceInitialiser_GUI gui;
+        auditMagnet();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "pestanas")
+    {
+        ReanimaProcessor proc;
+        proc.prepareToPlay (48000.0, 512);
+        std::unique_ptr<juce::AudioProcessorEditor> ed (proc.createEditor());
+        ed->setSize (1180, 760);
+        std::function<juce::TabbedComponent* (juce::Component&)> find = [&] (juce::Component& c) -> juce::TabbedComponent*
+        {
+            for (auto* ch : c.getChildren())
+            {
+                if (auto* t = dynamic_cast<juce::TabbedComponent*> (ch))
+                    return t;
+                if (auto* t = find (*ch))
+                    return t;
+            }
+            return nullptr;
+        };
+        auto* tabs = find (*ed);
+        for (int t = 0; t < tabs->getNumTabs(); ++t)
+        {
+            std::printf ("pestaña %d\n", t);
+            tabs->setCurrentTabIndex (t);
+            ed->createComponentSnapshot (ed->getLocalBounds());
+            for (int k = 0; k < 20; ++k)
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (10);
+        }
+        std::printf ("bien\n");
+        return 0;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "arp")
+    {
+        auditArp();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "tonalidad")
+    {
+        auditKey();
+        auditChords();
+    auditArp();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "explorador")
+    {
+        auditBrowser();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "colorplay")
+    {
+        auditColorPlay();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "aros")
+    {
+        auditModRings();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "ventana")
+    {
+        auditLoopWindow();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "timbre")
+    {
+        auditTimbreHits();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "golpes")
+    {
+        auditHitEdits();
+        auditOnsetOnTail();
+        std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "loops")
     {
         auditLoops();
         auditSliceMidi();
         auditTransport();
         auditSliceEdit();
+        auditHitEdits();
+        auditOnsetOnTail();
+        auditMagnet();
+        auditTimbreHits();
+        auditLoopWindow();
         auditRubber();
         std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
         return failures == 0 ? 0 : 1;
@@ -4491,6 +7063,16 @@ int main (int argc, char* argv[])
     auditSliceMidi();
     auditTransport();
     auditSliceEdit();
+    auditHitEdits();
+    auditOnsetOnTail();
+    auditMagnet();
+    auditTimbreHits();
+    auditLoopWindow();
+    auditModRings();
+    auditBrowser();
+    auditKey();
+    auditChords();
+    auditArp();
     auditRubber();
     auditMaster();
     auditParameters();

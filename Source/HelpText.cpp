@@ -78,7 +78,33 @@ const char* controlHelp (int index)
         case LoopPlay:      return "Normal: el loop suena solo con el Play del DAW, alineado al compás (su principio en el compás 1), y se para al parar. Sigue los saltos y cambios de tempo. Mientras suena, las teclas solo cambian su tono, sin reiniciarlo. Apagado, suena mientras mantienes una tecla.";
         case SliceThru:     return "Slice: cada tecla toca desde su trozo hasta el final del sample, en vez de pararse en el corte siguiente (como poner la aguja en ese punto del disco). Varias teclas siguen sonando a la vez; repetir una tecla la reinicia.";
         case SliceFade:     return "Slice: el fundido antes del final de cada trozo (con Thru, antes del final del sample), para que un trozo cortado en mitad de un sonido no chasquee. De serie 2 ms: no se oye y no toca los golpes. Súbelo si oyes un clic al final de trozos largos; en 0 no hay fundido.";
-        case LoopHitEnv:    return "Envolvente y Env 2 (pestaña FILTRO) por golpe.\nNormal: vuelven a empezar en cada golpe del loop (sin cortes), así Ataque, Decay y Sustain dan forma a cada golpe y el filtro se abre con cada uno. Los golpes son los cortes de Slice; Sensibilidad decide cuántos.\nSlice: cada trozo lleva su envolvente entera y suelta con Release al levantar la tecla.\nApagado: la envolvente actúa sobre el loop entero.";
+        case LoopHitEnv:    return "Envolvente, Env 2 (pestaña FILTRO) y TIMBRE por golpe.\nNormal: vuelven a empezar en cada golpe del loop (sin cortes), así Ataque, Decay y Sustain dan forma a cada golpe y el filtro se abre con cada uno. En TIMBRE, Arco oscurece el Ataque de cada golpe, Apagado oscurece cada golpe según cae y Brillo deja más oscuros los golpes más flojos. Los golpes son los cortes de Slice; Sensibilidad decide cuántos, y en la forma de onda puedes apagar o añadir golpes.\nSlice: cada trozo lleva su envolvente entera y suelta con Release al levantar la tecla.\nApagado: la envolvente actúa sobre el loop entero.";
+        case LoopWinLen:    return "LOOP Normal: toca sólo una parte del loop, de 1/32 a 4 compases (con tresillos y puntillos), en bucle y a tempo. Completo: el loop entero. Posición dice dónde empieza; también puedes arrastrar la ventana sobre la forma de onda.";
+        case LoopWinPos:    return "Dónde empieza la Ventana, en tiempos desde el principio del loop. Arrastrando la ventana en la forma de onda se pega a semicorcheas (con Alt, libre).";
+        case FltHarmGain:   return "Filtro Armónico: cuánto sube (+) o baja (-) los armónicos de la nota dentro de la región. La fundamental nunca baja, lo que hay entre armónicos (ruido, golpe) pasa igual y el volumen se mantiene. La matriz lo mueve con «Drive filtro».";
+        case FltHarmRegion: return "Filtro Armónico: anchura de la zona que se trabaja, en octavas alrededor de Frecuencia. Estrecha toca un grupo de armónicos (un formante, un brillo); ancha, todos. Frecuencia mueve la zona y sigue a Keytrack, Env 2 y el follower.";
+        case SustainMotion: return "Motores B y D con Sostenido: la nota mantenida cambia de color como lo hacía el sample en ese momento (un piano que se oscurece, una cuerda que se abre), en lugar de quedarse en un color fijo. Sólo cambia el timbre, nunca el volumen. A 0 suena como antes.";
+        case ScSens:        return "Sube o baja la señal lateral antes de seguirla. Con una pista floja, súbela; si la fuente se queda en 100 %, bájala.";
+        case ScAttack:      return "Rapidez con la que la fuente Sidechain sube cuando la señal lateral sube.";
+        case ScRelease:     return "Rapidez con la que la fuente Sidechain baja cuando la señal lateral baja.";
+        case ScResponse:    return "Qué sigue la fuente Sidechain de la matriz.\nNivel: el volumen de la pista lateral.\nGraves, Medios, Agudos: sólo esa zona (un bombo, una voz, unos platos).\nBrillo: lo brillante que es el sonido, sea cual sea su volumen.";
+        case GrainCoherent: return "Motor E: coloca cada grano a un número entero de periodos de la nota y a intervalos regulares, para que los granos se sumen en fase. La nota suena entera y limpia (en un bajo, la nube se queda en ruido sin esto) a cambio de menos «nube». Sólo con samples que tienen nota, y en los granos sin Pitch aleat. ni Al revés.";
+        case ArpOn:       return "Enciende el arpegiador / secuenciador: las teclas que pulsas ya no suenan tal cual; los pasos tocan notas con ellas, a ritmo.";
+        case ArpMode:     return "Arp: cada paso toca la siguiente nota del acorde que mantienes (según Estilo y Octavas). Seq: cada paso toca la nota de su carril NOTA, en grados de la tonalidad, contada desde la tecla que pulsas (la tecla transporta la frase).";
+        case ArpStyle:    return "El orden del arpegio: hacia arriba, hacia abajo, arriba y abajo, abajo y arriba, en el orden en que pulsaste, al azar, o el acorde entero en cada paso.";
+        case SeqDir:      return "Cómo recorre Seq sus carriles: adelante, hacia atrás, de ida y vuelta, o un paso al azar cada vez.";
+        case ArpRate:     return "La duración de cada paso, en figuras: 1/16 es una semicorchea. El punto alarga la mitad; la T es de tresillo.";
+        case ArpOctaves:  return "Arp: el acorde se repite en esta cantidad de octavas hacia arriba.";
+        case ArpSwing:    return "Retrasa los pasos pares: 0 % recto, 100 % tresillo (shuffle).";
+        case ArpGate:     return "Alarga o acorta todas las notas a la vez, sobre el GATE de cada paso. Más de 100 % solapa una nota con la siguiente.";
+        case ArpLatch:    return "Las notas siguen sonando al soltar las teclas, hasta que pulses otro acorde.";
+        case ArpSync:     return "DAW: los pasos van al tempo del proyecto y, con el transporte en marcha, cuadrados con sus compases. Propio: al BPM propio de abajo, empezando al pulsar la tecla.";
+        case ArpBpm:      return "El tempo cuando Tempo está en Propio.";
+        case ArpDensity:  return "Cuántos pasos quedan encendidos al pulsar Generar (o el dado del carril PASO).";
+        case KeySource:     return "De dónde sale la tonalidad que usan el arpegiador y el secuenciador. A mano: la que elijas. Sample: la estimada del sample cargado (por su nombre si lo dice, si no por su sonido). MIDI: la estimada de las notas que tocas. Audio externo: la estimada del audio que le llega a Reanima por su entrada lateral (en Ableton, el panel Sidechain del dispositivo: elige ahí la pista); necesita unos 20 s de música con notas. Una estimación por debajo del 60 % de confianza no se aplica sola: se queda la anterior y la verás como dudosa; con Fijar la pasas a mano.";
+        case KeyRoot:       return "La tónica de la tonalidad a mano.";
+        case KeyScale:      return "La escala de la tonalidad a mano: mayor o menor (natural).";
+        case MechPerHit:    return "Con Por golpe en un loop: Mecanismo da también su golpe de tecla en cada golpe del loop, más fuerte en los golpes fuertes. Apagado, suena sólo al pulsar y soltar la tecla.";
         case GrainBlend:    return "Motores B y D: cuánta parte granular hay al final del fundido. Por debajo del 100 % sigue sonando también el sample original.";
         case EnvLock:       return "Candado cerrado: al cargar otro sample, la envolvente se queda como la tienes. Abierto: toma los valores detectados en el sample nuevo.";
         case EnvMode:       return "Remodelar: tu ADSR cambia la forma del sample y conserva sus altibajos; con los valores detectados suena igual que el original.\nSintetizador: el sample se vuelve un tono continuo y plano, y la ADSR lo modela desde cero, como en un Minimoog o un Prophet. Al elegirlo, los mandos pasan a valores típicos de sinte.\nLa forma de onda dibuja el resultado. Motores A a D.";
@@ -122,13 +148,13 @@ const char* controlHelp (int index)
         case MonoOut:       return "Suma los dos canales en uno, después de los efectos. Apagado, el estéreo queda tal cual. Sirve para comprobar cómo suena en mono o para que ocupe el centro.";
 
         case FltOn:         return "Enciende el filtro de cada voz.";
-        case FltType:       return "Tipo de filtro.\nLowpass: deja pasar los graves.\nHighpass: deja pasar los agudos.\nBandpass y Notch: una banda sí o no.\nMorph: pasa por todos.\nDJ: grave a un lado, agudo al otro.\nComb y Vowel: resonancias y vocales.";
+        case FltType:       return "Tipo de filtro.\nLowpass: deja pasar los graves.\nHighpass: deja pasar los agudos.\nBandpass y Notch: una banda sí o no.\nMorph: pasa por todos.\nDJ: grave a un lado, agudo al otro.\nComb y Vowel: resonancias y vocales.\nArmónico: resonancias en los armónicos de la nota tocada: realza, atenúa o cambia su equilibrio sin perder afinación ni cuerpo. También afina ruidos y texturas.";
         case FltSlope:      return "Lo pronunciado que es el corte: 12 dB suave, 24 dB marcado.";
         case FltCircuit:    return "Carácter del filtro. Clean es limpio; los demás añaden saturación y color analógico.";
         case FltFreq:       return "Frecuencia de corte del filtro.";
         case FltRes:        return "Realce alrededor de la frecuencia de corte. Muy alta llega a silbar.";
         case FltDrive:      return "Saturación a la entrada del filtro. No actúa con el circuito Clean.";
-        case FltMorph:      return "En Morph mueve entre tipos de filtro; en DJ, entre grave y agudo; en Vowel, entre vocales; en Comb cambia el signo de la resonancia.";
+        case FltMorph:      return "En Morph mueve entre tipos de filtro; en DJ, entre grave y agudo; en Vowel, entre vocales; en Comb cambia el signo de la resonancia. En Armónico es Pares/impares: a 0 % sólo trabaja los impares (sonido hueco, de clarinete), a 50 % todos y a 100 % sólo los pares.";
         case FltKey:        return "Hace que el corte siga la nota tocada. A 100 % sube una octava por octava.";
         case FltEnvAmt:     return "Cuánto mueve Env 2 la frecuencia de corte, hacia arriba o hacia abajo.";
         case FltFollow:     return "Cuánto mueve el corte el propio volumen del sonido.";
@@ -162,8 +188,9 @@ const char* lfoHelp (int part)
         case 0:  return "Velocidad del LFO en hercios.";
         case 1:  return "Sincroniza el LFO con el tempo del proyecto. La velocidad pasa a marcarla División.";
         case 2:  return "Duración de un ciclo del LFO cuando Sync está encendido.";
-        case 3:  return "Forma de la onda del LFO. S&H da un valor aleatorio en cada ciclo.";
-        default: return "Encendido, cada nota reinicia el LFO. Apagado, todas las notas siguen un LFO que no se detiene.";
+        case 3:  return "Forma de la onda del LFO. S&H da un valor aleatorio en cada ciclo. Deriva da un movimiento lento y aleatorio, distinto en cada nota, como la afinación de un instrumento real, una cinta o un sintetizador analógico: con poca cantidad en «Tono fino» o en el filtro, da vida sin notarse.";
+        case 4:  return "Encendido, cada nota reinicia el LFO. Apagado, todas las notas siguen un LFO que no se detiene.";
+        default: return "Suaviza el LFO. En Deriva quita el temblor rápido y deja sólo la deriva lenta. En las demás formas redondea esquinas y saltos (a 0 % la forma queda como siempre).";
     }
 }
 
@@ -171,8 +198,8 @@ const char* matrixHelp (int part)
 {
     switch (part)
     {
-        case 0:  return "Qué modula: un LFO, una envolvente, la fuerza de la nota, la nota tocada, la rueda de modulación, el aftertouch, una macro o un valor aleatorio por nota.";
-        case 1:  return "Qué se modula. Spray, Grano y Transitorio no actúan en el motor A.";
+        case 0:  return "Qué modula: un LFO, una envolvente, la fuerza de la nota, la nota tocada, la rueda de modulación, el aftertouch, una macro, un valor aleatorio por nota o la señal lateral (Sidechain, ajustes a la derecha).";
+        case 1:  return "Qué se modula. Spray, Grano y Transitorio no actúan en el motor A. Tono fino mueve la afinación ±100 cents (para derivas sutiles).";
         default: return "Cuánta modulación se aplica y en qué sentido. A 0 no hay ninguna.";
     }
 }
@@ -241,6 +268,7 @@ juce::String forFxType (int type)
         case Fx::SplitLH:    return P::u8 ("Divide el sonido en graves y agudos. Los efectos siguientes sólo procesan las bandas marcadas.");
         case Fx::SplitLMH:   return P::u8 ("Divide el sonido en graves, medios y agudos. Los efectos siguientes sólo procesan las bandas marcadas.");
         case Fx::SplitMS:    return P::u8 ("Divide el sonido en centro y lados. Los efectos siguientes sólo procesan lo marcado.");
+        case Fx::Impronta:   return P::u8 ("Colorea el sonido con el espectro de la pista lateral (sidechain): sus graves, medios y agudos moldean el timbre de Reanima. Sin señal lateral el sonido pasa igual. Usa Profundidad en vez de la mezcla.");
         default:             return P::u8 ("Elige un efecto para esta ranura.");
     }
 }
@@ -304,6 +332,14 @@ juce::String forFxParam (int type, int k)
                             "Los efectos siguientes procesan los medios.", "Los efectos siguientes procesan los agudos." };
 
         t[Fx::SplitMS] = { "Nivel del centro.", "Nivel de los lados.", "Los efectos siguientes procesan el centro.", "Los efectos siguientes procesan los lados." };
+
+        t[Fx::Impronta] = { "Color: sólo el timbre sigue a la pista lateral, el volumen no cambia. Vocoder: también el volumen. Invertido: suena la pista lateral, con el timbre y el volumen de tus notas.",
+                            "Cuánto se marca el color de la pista lateral.", "Sube o baja la pista lateral antes de escucharla.",
+                            "Rapidez con la que el color sigue a la pista cuando sube.", "Rapidez con la que el color vuelve cuando la pista baja.",
+                            "Número de bandas: más bandas, más detalle (vocal, formantes); menos, un color más amplio.",
+                            "Inclina el color hacia los graves (-) o los agudos (+).",
+                            "Desplaza el color hacia arriba o hacia abajo respecto al sonido (formantes más agudos o más graves).",
+                            "Frecuencia de la banda más grave.", "Frecuencia de la banda más aguda." };
 
         return t;
     }();

@@ -168,6 +168,18 @@ std::vector<TypeSpec> buildSpecs()
         toggle ("Procesar medios", true),
         toggle ("Procesar agudos", true) } };
 
+    t[Impronta] = { "Impronta", 1.0f, {
+        choice ("Respuesta", "Color|Vocoder|Invertido"),
+        knob ("Profundidad", 0, 1, 0.7f),
+        knob ("Sensibilidad", -24, 24, 0, "dB"),
+        knob ("Ataque", 1, 300, 10, "ms", 30),
+        knob ("Release", 10, 2000, 200, "ms", 250),
+        choice ("Bandas", "8|12|16|24", 2),
+        sym ("Inclinación", 12, 0, "dB"),
+        sym ("Desplazar", 24, 0, "st"),
+        knob ("Desde", 30, 500, 80, "Hz", 120),
+        knob ("Hasta", 2000, 18000, 12000, "Hz", 8000) } };
+
     t[SplitMS] = { "Splitter M/S", 1.0f, {
         knob ("Nivel mid", -24, 12, 0, "dB"),
         knob ("Nivel side", -24, 12, 0, "dB"),
@@ -1083,6 +1095,239 @@ public:
 private:
     juce::dsp::LinkwitzRileyFilter<float> xover;
 };
+
+//==============================================================================
+// Impronta: the sidechain's spectrum laid on Reanima's sound (CP2 of docs/investigacion_colorplay_2026-11-23.md).
+// The sound coming in is split into bands (from Desde to Hasta, spaced evenly in octaves) and each band's level
+// is followed with Ataque and Release; a chain of bell filters on the same bands then gives Reanima's sound that
+// shape. A bell at 0 dB passes the sound bit for bit, so with nothing coming in the sound is left as it was.
+//   Color:     only the shape (each band against the mean of all), never the level (what the bells add or take
+//              overall is given back): the timbre moves with the sidechain, the volume stays, and silence in the
+//              sidechain leaves the sound untouched.
+//   Vocoder:   the shape and the level: the sound follows the sidechain's loudness too (0 dB at -12 dBFS).
+//   Invertido: the roles swapped: the sidechain is heard, with the shape and level of Reanima's notes.
+// Profundidad scales the shape (and, in Vocoder and Invertido, the level following); Inclinación tilts it towards the
+// lows or the highs; Desplazar moves it up or down against the sound it colours (formants up or down).
+class ImprontaModule final : public Module
+{
+public:
+    void setSidechain (const float* l, const float* r) override
+    {
+        sideL = l;
+        sideR = r;
+    }
+
+    void prepare (double sr, int) override
+    {
+        sampleRate = sr;
+        configured = { -1, 0.0f, 0.0f };
+        reset();
+    }
+
+    void reset() override
+    {
+        for (auto& b : analysis)
+            b.reset();
+        for (auto& ch : bellIc1) ch.fill (0.0f);
+        for (auto& ch : bellIc2) ch.fill (0.0f);
+        env.fill (0.0f);
+        bellDb.fill (0.0f);
+        broadDb = 0.0f;
+        totalEnv = 0.0f;
+        powerIn = powerOut = 0.0f;
+        keep = 1.0f;
+    }
+
+    void process (float* L, float* R, int n, const float* norm, double) override
+    {
+        const int mode = (int) value (Impronta, 0, norm);
+        const float depth = value (Impronta, 1, norm);
+        const float sens = dbToGain (value (Impronta, 2, norm));
+        const float atk = 1.0f - std::exp (-1.0f / (value (Impronta, 3, norm) * 0.001f * (float) sampleRate));
+        const float rel = 1.0f - std::exp (-1.0f / (value (Impronta, 4, norm) * 0.001f * (float) sampleRate));
+        static constexpr int bandChoices[] = { 8, 12, 16, 24 };
+        const int bands = bandChoices[juce::jlimit (0, 3, (int) value (Impronta, 5, norm))];
+        const float tilt = value (Impronta, 6, norm);
+        const float shiftSt = value (Impronta, 7, norm);
+        const float lowHz = value (Impronta, 8, norm);
+        const float highHz = std::max (lowHz * 4.0f, value (Impronta, 9, norm));
+        configure (bands, lowHz, highHz);
+
+        // Nothing connected (the standalone application, or no track chosen): the sound passes as it is.
+        if (sideL == nullptr)
+            return;
+        const bool inverted = mode == 2;
+        const float shiftBands = shiftSt / 12.0f * bandsPerOctave;
+
+        for (int done = 0; done < n;)
+        {
+            const int num = std::min (block, n - done);
+            float* l = L + done;
+            float* r = R + done;
+            const float* sl = sideL + done;
+            const float* sr = (sideR != nullptr ? sideR : sideL) + done;
+
+            // The bands of what gives the shape: the sidechain, or Reanima's sound in Invertido.
+            for (int i = 0; i < num; ++i)
+            {
+                const float x = inverted ? 0.5f * (l[i] + r[i]) : 0.5f * (sl[i] + sr[i]) * sens;
+                const float ax = std::abs (x);
+                totalEnv += (ax - totalEnv) * (ax > totalEnv ? atk : rel);
+                for (int b = 0; b < numBands; ++b)
+                {
+                    const float e = std::abs (analysis[(size_t) b].process (0, x));
+                    auto& v = env[(size_t) b];
+                    v += (e - v) * (e > v ? atk : rel);
+                }
+            }
+
+            // The shape: each band's level against the mean of all of them, in dB.
+            std::array<float, maxBands> levelDb {};
+            float mean = 0.0f;
+            for (int b = 0; b < numBands; ++b)
+            {
+                levelDb[(size_t) b] = Dsp::gainToDb (env[(size_t) b] * 1.4142f + 1.0e-9f);
+                mean += levelDb[(size_t) b];
+            }
+            mean /= (float) numBands;
+            const float totalDb = Dsp::gainToDb (totalEnv * 1.4142f + 1.0e-9f);
+            // Under -70 dB there is no shape to read: it fades to flat over the 10 dB above.
+            const float present = juce::jlimit (0.0f, 1.0f, (totalDb + 70.0f) / 10.0f);
+
+            for (int b = 0; b < numBands; ++b)
+            {
+                // Desplazar: band b takes the shape found shiftBands lower (a shift up moves the shape up).
+                const float at = juce::jlimit (0.0f, (float) (numBands - 1), (float) b - shiftBands);
+                const int i0 = std::min (numBands - 2, (int) at);
+                const float frac = at - (float) i0;
+                const float lv = numBands > 1 ? levelDb[(size_t) i0] + frac * (levelDb[(size_t) i0 + 1] - levelDb[(size_t) i0]) : levelDb[0];
+                const float pos = numBands > 1 ? (float) b / (float) (numBands - 1) * 2.0f - 1.0f : 0.0f;
+                float db = juce::jlimit (-36.0f, 24.0f, lv - mean) * present * depth + tilt * pos;
+                target[(size_t) b] = juce::jlimit (-40.0f, 18.0f, db * overlapScale);
+            }
+            // Vocoder and Invertido: the level of what gives the shape too (0 dB at -12 dBFS, at most 60 dB down).
+            const float broadTarget = mode == 0 ? 0.0f : depth * juce::jlimit (-60.0f, 0.0f, totalDb + 12.0f);
+
+            // The bells move to their new gains over the block: a gain is only a mix of the filter's band, so a
+            // change never makes the filter ring or click.
+            const float smooth = 1.0f - std::exp (-(float) num / (0.004f * (float) sampleRate));
+            for (int b = 0; b < numBands; ++b)
+            {
+                bellDb[(size_t) b] += (target[(size_t) b] - bellDb[(size_t) b]) * smooth;
+                setBell (b, bellDb[(size_t) b]);
+            }
+            const float broadFrom = dbToGain (broadDb);
+            broadDb += (broadTarget - broadDb) * smooth;
+            const float broadTo = dbToGain (broadDb);
+            // Color keeps the level: what the bells add or take overall is given back (followed over some 300 ms,
+            // at most 12 dB), so only the balance of the bands changes.
+            const float keepFrom = keep;
+            if (mode == 0 && powerIn > 1.0e-12f && powerOut > 1.0e-14f)
+                keep = juce::jlimit (0.25f, 4.0f, std::sqrt (powerIn / powerOut));
+            else if (mode != 0)
+                keep = 1.0f;
+            double in = 0.0, out = 0.0;
+
+            for (int i = 0; i < num; ++i)
+            {
+                const float g = (broadFrom + (broadTo - broadFrom) * (float) (i + 1) / (float) num)
+                              * (keepFrom + (keep - keepFrom) * (float) (i + 1) / (float) num);
+                float yl = inverted ? sl[i] : l[i];
+                float yr = inverted ? sr[i] : r[i];
+                in += (double) yl * yl + (double) yr * yr;
+                for (int b = 0; b < numBands; ++b)
+                {
+                    yl = bell (0, b, yl);
+                    yr = bell (1, b, yr);
+                }
+                out += (double) yl * yl + (double) yr * yr;
+                l[i] = yl * g;
+                r[i] = yr * g;
+            }
+            const float powerCoef = 1.0f - std::exp (-(float) num / (0.3f * (float) sampleRate));
+            powerIn += ((float) (in / num) - powerIn) * powerCoef;
+            powerOut += ((float) (out / num) - powerOut) * powerCoef;
+            done += num;
+        }
+    }
+
+private:
+    static constexpr int maxBands = 24, block = 16;
+
+    struct Config { int bands; float low, high; bool operator!= (const Config& o) const { return bands != o.bands || low != o.low || high != o.high; } };
+
+    void configure (int bands, float low, float high)
+    {
+        const Config c { bands, low, high };
+        if (! (c != configured))
+            return;
+        configured = c;
+        numBands = bands;
+        const float octaves = std::log2 (high / low);
+        bandsPerOctave = (float) (bands - 1) / octaves;
+        const float bw = 1.0f / bandsPerOctave;                         // each band's width, in octaves
+        q = std::sqrt (std::exp2 (bw)) / (std::exp2 (bw) - 1.0f);
+        for (int b = 0; b < bands; ++b)
+        {
+            centre[(size_t) b] = std::min ((float) sampleRate * 0.45f, low * std::exp2 ((float) b / bandsPerOctave));
+            analysis[(size_t) b].set (Dsp::Biquad::BandPass, sampleRate, centre[(size_t) b], q);
+            analysis[(size_t) b].reset();
+            gCoef[(size_t) b] = std::tan (Dsp::pi * centre[(size_t) b] / (float) sampleRate);
+            setBell (b, bellDb[(size_t) b]);
+        }
+
+        // Neighbouring bells overlap: one dB asked of every band gives more than one. Measured on the analog
+        // prototype at a middle band's centre, the shape is scaled back by that much.
+        const int mid = bands / 2;
+        double sum = 0.0;
+        const double A = std::pow (10.0, 1.0 / 40.0);
+        for (int b = 0; b < bands; ++b)
+        {
+            const double w = (double) centre[(size_t) mid] / (double) centre[(size_t) b];
+            const double re = 1.0 - w * w;
+            const double num = re * re + juce::square (w * A / q), den = re * re + juce::square (w / (A * q));
+            sum += 10.0 * std::log10 (num / den);
+        }
+        overlapScale = (float) juce::jlimit (0.25, 1.0, 1.0 / std::max (1.0, sum));
+    }
+
+    // Andrew Simper's state-variable bell: the same response boosting or cutting, and no state change with the gain.
+    void setBell (int b, float db) noexcept
+    {
+        const float A = std::pow (10.0f, db / 40.0f);
+        const float g = gCoef[(size_t) b];
+        const float k = 1.0f / (q * A);
+        const float a1 = 1.0f / (1.0f + g * (g + k));
+        bellA1[(size_t) b] = a1;
+        bellA2[(size_t) b] = g * a1;
+        bellA3[(size_t) b] = g * g * a1;
+        bellM1[(size_t) b] = k * (A * A - 1.0f);
+    }
+
+    float bell (int ch, int b, float x) noexcept
+    {
+        auto& ic1 = bellIc1[(size_t) ch][(size_t) b];
+        auto& ic2 = bellIc2[(size_t) ch][(size_t) b];
+        const float v3 = x - ic2;
+        const float v1 = bellA1[(size_t) b] * ic1 + bellA2[(size_t) b] * v3;
+        const float v2 = ic2 + bellA2[(size_t) b] * ic1 + bellA3[(size_t) b] * v3;
+        ic1 = 2.0f * v1 - ic1;
+        ic2 = 2.0f * v2 - ic2;
+        return x + bellM1[(size_t) b] * v1;
+    }
+
+    double sampleRate = 48000.0;
+    const float* sideL = nullptr;
+    const float* sideR = nullptr;
+    Config configured { -1, 0.0f, 0.0f };
+    int numBands = 16;
+    float bandsPerOctave = 2.0f, q = 2.0f, overlapScale = 1.0f, broadDb = 0.0f, totalEnv = 0.0f;
+    float powerIn = 0.0f, powerOut = 0.0f, keep = 1.0f;
+    std::array<Dsp::Biquad, maxBands> analysis {};
+    std::array<float, maxBands> centre {}, gCoef {}, env {}, bellDb {}, target {};
+    std::array<float, maxBands> bellA1 {}, bellA2 {}, bellA3 {}, bellM1 {};
+    std::array<std::array<float, maxBands>, 2> bellIc1 {}, bellIc2 {};
+};
 } // namespace
 
 std::unique_ptr<Module> create (int type)
@@ -1101,6 +1346,7 @@ std::unique_ptr<Module> create (int type)
         case Filter:     return std::make_unique<FilterModule>();
         case Bode:       return std::make_unique<BodeModule>();
         case Utility:    return std::make_unique<UtilityModule>();
+        case Impronta:   return std::make_unique<ImprontaModule>();
         default:         return {};
     }
 }
@@ -1314,6 +1560,11 @@ void FxRack::processChain (int chain, float* L, float* R, int n, const ParamSnap
             scratch.copyFrom (1, 0, R, n);
         }
 
+        if (type == Fx::Impronta)
+        {
+            const bool side = sideL != nullptr && sideStart + n <= sideLen;
+            module->setSidechain (side ? sideL + sideStart : nullptr, side && sideR != nullptr ? sideR + sideStart : nullptr);
+        }
         module->process (L, R, n, norm, bpm);
 
         if (blend)
@@ -1361,6 +1612,7 @@ void FxRack::process (juce::AudioBuffer<float>& buffer, const ParamSnapshot& p, 
     for (int start = 0; start < total; start += rackBlock)
     {
         const int n = std::min (rackBlock, total - start);
+        sideStart = start;
         processBlock (buffer.getWritePointer (0, start), buffer.getWritePointer (1, start), n, p, bpm, busOn, mainOn);
     }
 
