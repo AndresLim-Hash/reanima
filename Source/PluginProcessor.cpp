@@ -1479,6 +1479,11 @@ void ReanimaProcessor::finishLoad (Load& load)
     {
         if (load.file.existsAsFile())
             loadError = "No se pudo leer el archivo de audio.";
+        // A project whose sample is neither inside it nor where it was (moved, renamed, another computer): said, with
+        // where it was looked for. Before, nothing was said and the instance simply had no sample.
+        else if (load.file != juce::File())
+            loadError = juce::String::fromUTF8 ("No se encuentra el sample de este proyecto:\n") + load.file.getFullPathName()
+                      + juce::String::fromUTF8 ("\n\nLos ajustes se han conservado. Carga el archivo de nuevo (o arrástralo) para que suene.");
         sendChangeMessage();
         return;
     }
@@ -2205,9 +2210,10 @@ void ReanimaProcessor::getStateInformation (juce::MemoryBlock& destData)
         state.setProperty ("sampleEdited", edited, nullptr);
     }
 
+    // Every digit a float needs (with 2 decimals, a project opened again had its drawn curve moved by up to 0.005 dB).
     juce::StringArray curve;
     for (const auto& point : droneCurve)
-        curve.add (juce::String (point.load(), 2));
+        curve.add (juce::String::formatted ("%.9g", (double) point.load()));
     state.setProperty ("droneCurve", curve.joinIntoString (","), nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);

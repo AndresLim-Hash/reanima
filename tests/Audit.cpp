@@ -6912,6 +6912,316 @@ void auditRates()
     file.deleteFile();
 }
 
+//==============================================================================
+// Timing (23-11): LOOP and SLICE give the same audio whatever the host's block size, and a tempo moved while a loop
+// note sounds (no Play) keeps it continuous.
+void auditTiming()
+{
+    title ("Sincronía · LOOP y SLICE idénticos con cualquier tamaño de bloque");
+    const juce::File drums = juce::File::getCurrentWorkingDirectory().getChildFile ("samples_prueba/all samples/GIO_OP_89_drum_loop_groove.wav");
+    const juce::File pad = juce::File::getCurrentWorkingDirectory().getChildFile ("samples_prueba/all samples/007_Ambient_Loops_Dm_110BPM.wav");
+    if (! drums.existsAsFile() || ! pad.existsAsFile())
+    {
+        std::printf ("(info) sin los loops de prueba; omitido%c", 10);
+        return;
+    }
+    const auto render = [] (const juce::File& file, std::initializer_list<std::pair<const char*, float>> settings, int block, double bpm,
+                            std::function<double (double)> tempoAt = {})
+    {
+        ReanimaProcessor proc;
+        HostAt host;
+        host.bpm = bpm;
+        proc.setPlayHead (&host);
+        proc.setPlayConfigDetails (0, 2, 48000.0, block);
+        proc.prepareToPlay (48000.0, block);
+        proc.loadSampleNow (file);
+        for (int k = 0; k < 600 && proc.isLoading(); ++k)
+        {
+            juce::Thread::sleep (10);
+            proc.serviceMessageThread();
+        }
+        proc.serviceMessageThread();
+        for (const auto& [id, v] : settings)
+            if (auto* param = proc.apvts.getParameter (id))
+                param->setValueNotifyingHost (param->convertTo0to1 (v));
+        proc.serviceMessageThread();
+        const int total = (int) (4.0 * 48000.0);
+        Audio out (2, total), buf (2, block);
+        for (int pos = 0; pos < total; pos += block)
+        {
+            const int n = std::min (block, total - pos);
+            Audio view (buf.getArrayOfWritePointers(), 2, n);
+            view.clear();
+            juce::MidiBuffer m;
+            for (const int at : { 0, 48000, 96000 })      // keys at the same samples whatever the block
+                if (at >= pos && at < pos + n)
+                {
+                    const int key = at == 0 ? 60 : at == 48000 ? 62 : 64;
+                    m.addEvent (juce::MidiMessage::noteOn (1, key, 1.0f), at - pos);
+                }
+            if (tempoAt)
+                host.bpm = tempoAt (pos / 48000.0);
+            proc.processBlock (view, m);
+            out.copyFrom (0, pos, view, 0, 0, n);
+            out.copyFrom (1, pos, view, 1, 0, n);
+        }
+        return out;
+    };
+    const auto maxDiff = [] (const Audio& a, const Audio& b)
+    {
+        float d = 0.0f;
+        for (int c = 0; c < 2; ++c)
+            for (int i = 0; i < std::min (a.getNumSamples(), b.getNumSamples()); ++i)
+                d = std::max (d, std::abs (a.getSample (c, i) - b.getSample (c, i)));
+        return d;
+    };
+    struct Case { const char* name; juce::File file; std::initializer_list<std::pair<const char*, float>> settings; };
+    const Case cases[] = {
+        { "Beats", drums, { { "playMode", 1.0f }, { "loopKind", 0.0f }, { "loopAlgo", 1.0f } } },
+        { "Complex", pad, { { "playMode", 1.0f }, { "loopKind", 0.0f }, { "loopAlgo", 2.0f } } },
+        { "Complex Pro", pad, { { "playMode", 1.0f }, { "loopKind", 0.0f }, { "loopAlgo", 3.0f } } },
+        { "Slice", drums, { { "playMode", 1.0f }, { "loopKind", 1.0f } } } };
+    for (const auto& c : cases)
+    {
+        const auto ref = render (c.file, c.settings, 64, 120.0);
+        float worst = 0.0f;
+        juce::String which;
+        for (const int block : { 128, 512, 33 })
+        {
+            const float d = maxDiff (ref, render (c.file, c.settings, block, 120.0));
+            if (d > worst) { worst = d; which = juce::String (block); }
+        }
+        // Complex Pro (Signalsmith, its work spread over the blocks): blocks that are not a multiple of 32 move it by
+        // some -50 dB (measured 0.0018 with blocks of 33); 64, 128 and 512 give the same samples.
+        const float allowed = juce::String (c.name) == "Complex Pro" ? 0.005f : 1.0e-5f;
+        check (worst < allowed, juce::String ("LOOP ") + c.name + " a 120 BPM: el mismo audio en bloques de 64, 128, 512 y 33",
+               "diferencia máxima " + juce::String (worst, 8) + (which.isEmpty() ? juce::String() : " (bloque " + which + ")"));
+    }
+
+    title ("Sincronía · cambio de tempo con una nota de LOOP sonando");
+    for (const auto& c : cases)
+    {
+        if (juce::String (c.name) == "Slice")
+            continue;       // each key is a hit of its own there (its tempo: auditLoops)
+        // The host's tempo glides from 100 to 140 BPM over the second second.
+        const auto y = render (c.file, c.settings, 128, 100.0, [] (double t) { return t < 1.0 ? 100.0 : t < 2.0 ? 100.0 + 40.0 * (t - 1.0) : 140.0; });
+        double typical = 0.0, worst = 0.0;
+        const float* x = y.getReadPointer (0);
+        std::vector<double> jumps;
+        for (int i = 1; i < y.getNumSamples(); ++i)
+            jumps.push_back (std::abs (x[i] - x[i - 1]));
+        auto sorted = jumps;
+        std::sort (sorted.begin(), sorted.end());
+        typical = sorted[(size_t) (0.999 * (double) (sorted.size() - 1))];
+        for (int i = (int) (0.95 * 48000.0); i < (int) (2.05 * 48000.0); ++i)
+            worst = std::max (worst, jumps[(size_t) i]);
+        bool finiteAll = true;
+        for (int i = 0; i < y.getNumSamples(); ++i)
+            finiteAll = finiteAll && std::isfinite (x[i]);
+        check (finiteAll && worst <= typical * 1.5, juce::String ("LOOP ") + c.name + ": el tempo pasa de 100 a 140 BPM con la nota sonando, sin saltos",
+               "mayor salto durante el cambio " + juce::String (worst / std::max (1.0e-9, typical), 2) + "x el habitual del loop");
+    }
+}
+
+//==============================================================================
+// Projects and presets (23-11): everything saved comes back exactly, at any rate; a missing file or a damaged state
+// is handled without a crash and said.
+namespace state2311
+{
+void waitLoad (ReanimaProcessor& proc)
+{
+    proc.serviceMessageThread();
+    for (int k = 0; k < 800 && proc.isLoading(); ++k)
+    {
+        juce::Thread::sleep (10);
+        proc.serviceMessageThread();
+    }
+    for (int k = 0; k < 5; ++k)
+        proc.serviceMessageThread();
+}
+
+std::unique_ptr<ReanimaProcessor> make (double rate)
+{
+    auto p = std::make_unique<ReanimaProcessor>();
+    p->setPlayConfigDetails (0, 2, rate, 128);
+    p->prepareToPlay (rate, 128);
+    return p;
+}
+
+Audio playChord (ReanimaProcessor& proc, double rate)
+{
+    const int total = (int) (2.0 * rate);
+    Audio out (2, total), buf (2, 128);
+    for (int pos = 0; pos < total; pos += 128)
+    {
+        juce::MidiBuffer m;
+        if (pos == 0)
+            for (const int key : { 55, 60, 64 })
+                m.addEvent (juce::MidiMessage::noteOn (1, key, 0.9f), 3);
+        if (pos <= (int) (1.2 * rate) && (int) (1.2 * rate) < pos + 128)
+            for (const int key : { 55, 60, 64 })
+                m.addEvent (juce::MidiMessage::noteOff (1, key), (int) (1.2 * rate) - pos);
+        buf.clear();
+        proc.processBlock (buf, m);
+        out.copyFrom (0, pos, buf, 0, 0, 128);
+        out.copyFrom (1, pos, buf, 1, 0, 128);
+    }
+    return out;
+}
+} // namespace state2311
+
+void auditState()
+{
+    using namespace state2311;
+    title ("Estado · todo lo guardado vuelve exacto");
+    const double rate = 48000.0;
+    const auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("reanima_audit_estado.wav");
+    {
+        file.deleteFile();
+        const auto audio = pluck (196.0, 2.5, 44100.0);
+        std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+        juce::WavAudioFormat wav;
+        if (auto w = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (44100.0).withNumChannels (2).withBitsPerSample (24)))
+            w->writeFromAudioSampleBuffer (audio, 0, audio.getNumSamples());
+    }
+
+    auto a = make (rate);
+    a->loadSampleNow (file);
+    waitLoad (*a);
+    // Every parameter to a value of its own (fixed seed), the effects in every slot, a drawn curve.
+    juce::Random r (2311);
+    for (int i = 0; i < P::FxSlotBase; ++i)
+    {
+        if (i == P::PlayMode || i == P::ArpOn || i == P::LoopPlay || i == P::Engine)
+            continue;       // kept for the chord to sound the same way, and played below
+        if (auto* param = a->apvts.getParameter (P::defs()[(size_t) i].id))
+            param->setValueNotifyingHost (r.nextFloat());
+    }
+    if (auto* param = a->apvts.getParameter (P::defs()[P::Engine].id))
+        param->setValueNotifyingHost (param->convertTo0to1 ((float) P::EngineHybrid));
+    for (int slot = 0; slot < P::numFxSlots; ++slot)
+    {
+        a->setFxSlotType (slot, 1 + slot % (Fx::NumTypes - 1));
+        for (int k = 0; k < P::fxParamsPerSlot; ++k)
+            if (auto* param = a->apvts.getParameter (P::defs()[(size_t) P::fxParam (slot, k)].id))
+                param->setValueNotifyingHost (r.nextFloat());
+    }
+    for (int point = 0; point < Drone::curvePoints; ++point)
+        a->setDroneCurve (point, -12.0f + 24.0f * r.nextFloat());
+    waitLoad (*a);
+
+    juce::MemoryBlock saved;
+    a->getStateInformation (saved);
+    const auto compare = [&] (ReanimaProcessor& b, const juce::String& what)
+    {
+        juce::String wrong;
+        for (int i = 0; i < P::Count; ++i)
+            if (a->paramValue (i) != b.paramValue (i))
+                wrong << P::defs()[(size_t) i].id << " ";
+        for (int point = 0; point < Drone::curvePoints; ++point)
+            if (a->getDroneCurve (point) != b.getDroneCurve (point))
+                wrong << "curva" << point << " ";
+        check (wrong.isEmpty(), what + ": los " + juce::String (P::Count) + " parámetros y la curva dibujada, exactos",
+               wrong.isEmpty() ? juce::String() : "distintos: " + wrong.substring (0, 300));
+    };
+
+    auto b = make (rate);
+    b->setStateInformation (saved.getData(), (int) saved.getSize());
+    waitLoad (*b);
+    compare (*b, "proyecto reabierto");
+    const auto ya = playChord (*a, rate), yb = playChord (*b, rate);
+    float diff = 0.0f;
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < ya.getNumSamples(); ++i)
+            diff = std::max (diff, std::abs (ya.getSample (c, i) - yb.getSample (c, i)));
+    float peak = std::max (ya.getMagnitude (0, 0, ya.getNumSamples()), 1.0e-9f);
+    check (diff <= peak * 1.0e-4f, "proyecto reabierto: un acorde suena igual (motor D, efectos en las 14 ranuras)",
+           "diferencia máxima " + juce::String (20.0 * std::log10 (std::max (1.0e-12f, diff) / peak), 1) + " dB bajo el pico");
+
+    // Saved and opened five times over: the state does not drift.
+    {
+        juce::MemoryBlock again = saved;
+        for (int round = 0; round < 5; ++round)
+        {
+            auto c = make (rate);
+            c->setStateInformation (again.getData(), (int) again.getSize());
+            waitLoad (*c);
+            again.reset();
+            c->getStateInformation (again);
+        }
+        auto c = make (rate);
+        c->setStateInformation (again.getData(), (int) again.getSize());
+        waitLoad (*c);
+        compare (*c, "cinco veces guardado y reabierto");
+    }
+
+    // Opened in a project at another rate.
+    {
+        auto c = make (96000.0);
+        c->setStateInformation (saved.getData(), (int) saved.getSize());
+        waitLoad (*c);
+        compare (*c, "reabierto en un proyecto a 96 kHz");
+        check (c->getSample() != nullptr, "reabierto a 96 kHz: el sample está cargado");
+    }
+
+    title ("Estado · archivos que faltan y estados dañados");
+    {
+        // The sample's file gone: the copy inside the project is used.
+        file.deleteFile();
+        auto c = make (rate);
+        c->setStateInformation (saved.getData(), (int) saved.getSize());
+        waitLoad (*c);
+        check (c->getSample() != nullptr && c->getSample()->length > 0, "el archivo del sample ya no existe: suena la copia guardada en el proyecto");
+    }
+    {
+        // Neither the file nor a copy: no crash, said, the settings kept.
+        auto xml = juce::AudioProcessor::getXmlFromBinary (saved.getData(), (int) saved.getSize());
+        xml->removeAttribute ("sampleAudio");
+        juce::MemoryBlock noCopy;
+        juce::AudioProcessor::copyXmlToBinary (*xml, noCopy);
+        auto c = make (rate);
+        c->setStateInformation (noCopy.getData(), (int) noCopy.getSize());
+        waitLoad (*c);
+        const auto error = c->takeLoadError();
+        check (error.contains ("No se encuentra") && c->getSample() == nullptr, "sin archivo ni copia: no se cae y lo dice",
+               error.isNotEmpty() ? error : juce::String ("(sin mensaje)"));
+        juce::String wrong;
+        for (int i = 0; i < P::FxSlotBase; ++i)
+            if (i != P::StartPos && i != P::EndPos && a->paramValue (i) != c->paramValue (i))
+                wrong << P::defs()[(size_t) i].id << " ";
+        check (wrong.isEmpty(), "sin archivo ni copia: los ajustes se conservan", wrong.substring (0, 200));
+        Audio buf (2, 128);
+        juce::MidiBuffer m;
+        m.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+        c->processBlock (buf, m);
+        check (std::isfinite (buf.getSample (0, 0)), "sin archivo ni copia: tocar una nota no hace nada raro");
+    }
+    {
+        // Damaged states: random bytes, an empty block, XML of another plugin.
+        juce::Random bytes (7);
+        juce::MemoryBlock junk (5000);
+        for (size_t i = 0; i < junk.getSize(); ++i)
+            static_cast<char*> (junk.getData())[i] = (char) bytes.nextInt (256);
+        auto truncated = saved;
+        truncated.setSize (saved.getSize() / 2);
+        juce::XmlElement other ("OTRO_PLUGIN");
+        juce::MemoryBlock otherBlock;
+        juce::AudioProcessor::copyXmlToBinary (other, otherBlock);
+        bool survived = true;
+        for (const auto* block : { &junk, &truncated, &otherBlock })
+        {
+            auto c = make (rate);
+            c->setStateInformation (block->getData(), (int) block->getSize());
+            waitLoad (*c);
+            Audio buf (2, 128);
+            juce::MidiBuffer m;
+            c->processBlock (buf, m);
+            survived = survived && std::isfinite (buf.getSample (0, 0));
+        }
+        check (survived, "estados dañados (bytes al azar, cortado a la mitad, de otro plugin): se ignoran sin caerse");
+    }
+}
+
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI init;
@@ -7340,6 +7650,18 @@ int main (int argc, char* argv[])
     {
         auditBrowser();
         std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "estado")
+    {
+        auditState();
+        std::printf ("%c%d comprobaciones, %d fallos%c", 10, checks, failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "sincronia")
+    {
+        auditTiming();
+        std::printf ("%c%d comprobaciones, %d fallos%c", 10, checks, failures, 10);
         return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "frecuencias")
