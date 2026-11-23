@@ -13,6 +13,7 @@
 #include "HelpText.h"
 #include "EditPage.h"
 #include "SampleBrowser.h"
+#include "FactoryPresets.h"
 #include <atomic>
 #include <cstdio>
 #include <set>
@@ -7222,6 +7223,102 @@ void auditState()
     }
 }
 
+//==============================================================================
+// Factory presets (23-11): each one, on a real sample, plays a chord: finite, under the output's ceiling, not silent,
+// its effects of real types and its values inside their ranges.
+void auditFactoryPresets()
+{
+    title ("Presets de fábrica: cada uno suena, dentro de sus límites");
+    const juce::File sample = juce::File::getCurrentWorkingDirectory().getChildFile ("samples_prueba/all samples/RKU_CTM_Piano_One_Shot_Drama_C.wav");
+    if (! sample.existsAsFile())
+    {
+        std::printf ("(info) sin el sample de prueba; omitido%c", 10);
+        return;
+    }
+    const double rate = 48000.0;
+    ReanimaProcessor proc;
+    HostAt host;
+    host.bpm = 120.0;
+    proc.setPlayHead (&host);
+    proc.setPlayConfigDetails (0, 2, rate, 256);
+    proc.prepareToPlay (rate, 256);
+    proc.loadSampleNow (sample);
+    proc.serviceMessageThread();
+    juce::String silent, loud, broken, outOfRange;
+    double quietest = 0.0, loudest = -200.0;
+    const int count = (int) Factory::presets().size();
+    for (int i = 0; i < count; ++i)
+    {
+        proc.applyFactoryPreset (i);
+        for (int k = 0; k < 400 && proc.isLoading(); ++k)
+        {
+            juce::Thread::sleep (10);
+            proc.serviceMessageThread();
+        }
+        proc.serviceMessageThread();
+        for (int id = 0; id < P::Count; ++id)
+        {
+            const auto& d = P::defs()[(size_t) id];
+            const float v = proc.paramValue (id);
+            if (! std::isfinite (v) || (d.kind == P::Def::Float && (v < d.min - 1.0e-4f || v > d.max + 1.0e-4f)))
+                outOfRange << ReanimaProcessor::factoryPresetName (i) << ":" << d.id << " ";
+        }
+        for (int slot = 0; slot < P::numFxSlots; ++slot)
+        {
+            const int type = (int) proc.paramValue (P::fxType (slot));
+            if (type < 0 || type >= Fx::NumTypes)
+                outOfRange << ReanimaProcessor::factoryPresetName (i) << ": efecto " << type << " ";
+        }
+        // A chord held 1.5 s, then 1 s of release.
+        const int total = (int) (2.5 * rate);
+        float peak = 0.0f;
+        double energy = 0.0;
+        bool finiteAll = true;
+        Audio buf (2, 256);
+        for (int pos = 0; pos < total; pos += 256)
+        {
+            juce::MidiBuffer m;
+            if (pos == 0)
+                for (const int key : { 48, 55, 60, 64 })
+                    m.addEvent (juce::MidiMessage::noteOn (1, key, 0.8f), 0);
+            if (pos <= (int) (1.5 * rate) && (int) (1.5 * rate) < pos + 256)
+                for (const int key : { 48, 55, 60, 64 })
+                    m.addEvent (juce::MidiMessage::noteOff (1, key), (int) (1.5 * rate) - pos);
+            buf.clear();
+            proc.processBlock (buf, m);
+            for (int c = 0; c < 2; ++c)
+                for (int s = 0; s < 256; ++s)
+                {
+                    const float v = buf.getSample (c, s);
+                    finiteAll = finiteAll && std::isfinite (v);
+                    peak = std::max (peak, std::abs (v));
+                    energy += (double) v * v;
+                }
+        }
+        // Silence before the next one, so no tail carries over.
+        juce::MidiBuffer none;
+        for (int k = 0; k < (int) (3.0 * rate / 256); ++k)
+        {
+            buf.clear();
+            proc.processBlock (buf, none);
+        }
+        const double rms = 10.0 * std::log10 (energy / (2.0 * total) + 1.0e-20);
+        quietest = std::min (quietest, rms);
+        loudest = std::max (loudest, rms);
+        if (! finiteAll)
+            broken << ReanimaProcessor::factoryPresetName (i) << "; ";
+        if (peak > 0.97f)
+            loud << ReanimaProcessor::factoryPresetName (i) << " (" << juce::String (peak, 3) << "); ";
+        if (rms < -60.0)
+            silent << ReanimaProcessor::factoryPresetName (i) << " (" << juce::String (rms, 1) << " dB); ";
+    }
+    check (outOfRange.isEmpty(), "los " + juce::String (count) + " presets: valores dentro de su rango y efectos de tipos reales", outOfRange.substring (0, 300));
+    check (broken.isEmpty(), "los " + juce::String (count) + " presets: sin NaN ni infinitos con un acorde", broken.substring (0, 300));
+    check (loud.isEmpty(), "los " + juce::String (count) + " presets: bajo el techo de salida (-0,3 dBFS)", loud.substring (0, 300));
+    check (silent.isEmpty(), "los " + juce::String (count) + " presets: ninguno mudo (más de -60 dB con un acorde)",
+           silent.isEmpty() ? "nivel medio entre " + juce::String (quietest, 1) + " y " + juce::String (loudest, 1) + " dBFS" : silent.substring (0, 300));
+}
+
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI init;
@@ -7650,6 +7747,12 @@ int main (int argc, char* argv[])
     {
         auditBrowser();
         std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "presets")
+    {
+        auditFactoryPresets();
+        std::printf ("%c%d comprobaciones, %d fallos%c", 10, checks, failures, 10);
         return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "estado")
