@@ -75,6 +75,7 @@ public:
         harmFirst = 1;
         powerIn = powerOut = 0.0f;
         harmComp = harmCompTarget = 1.0f;
+        cacheF0 = -1.0f;        // the next setHarmonic works everything out
         resetOversampling();
     }
 
@@ -171,6 +172,26 @@ public:
         const float half = std::max (0.25f, regionOct * 0.5f);
         const float centre = juce::jlimit (20.0f, limit, harmCentre);
 
+        // A held note with nothing moving asks for the same resonances every block: their weights and coefficients (five
+        // transcendental functions each, 32 of them, every 32 samples, every voice) are kept, and only the ramps towards
+        // the same targets are made again: the same numbers, without working them out.
+        if (f0 == cacheF0 && gainDb == cacheGain && half == cacheHalf && centre == cacheCentre && harmRes == cacheRes
+            && morph == cacheMorph && harmCount > 0)
+        {
+            for (int j = 0; j < maxHarmonics; ++j)
+                harmStep[(size_t) j] = (harmTarget[(size_t) j] - harmGain[(size_t) j]) / (float) rampLength;
+            harmRamp = rampLength;
+            if (compensateLevel && powerIn > 1.0e-10f)
+                harmCompTarget = juce::jlimit (0.25f, 1.41f, std::sqrt ((powerIn + 1.0e-12f) / (powerOut + 1.0e-12f)));
+            return;
+        }
+        cacheF0 = f0;
+        cacheGain = gainDb;
+        cacheHalf = half;
+        cacheCentre = centre;
+        cacheRes = harmRes;
+        cacheMorph = morph;
+
         int lo = std::max (1, (int) std::ceil (centre * std::exp2 (-half) / f0));
         int hi = std::min ((int) std::floor (centre * std::exp2 (half) / f0), (int) std::floor (limit / f0));
         bool cutLow = false, cutHigh = false;
@@ -261,6 +282,7 @@ public:
                 harmA1[j] = 1.0f;
                 harmA2[j] = harmA3[j] = harmK[j] = 0.0f;
             }
+            harmTarget[(size_t) j] = target;
             harmStep[(size_t) j] = (target - harmGain[(size_t) j]) / (float) rampLength;
         }
         harmRamp = rampLength;
@@ -684,6 +706,8 @@ private:
     alignas (16) float harmA1[maxHarmonics] {}, harmA2[maxHarmonics] {}, harmA3[maxHarmonics] {}, harmK[maxHarmonics] {};
     alignas (16) std::array<float, maxHarmonics> harmGain {};
     alignas (16) std::array<float, maxHarmonics> harmStep {};
+    std::array<float, maxHarmonics> harmTarget {};
+    float cacheF0 = -1.0f, cacheGain = 0.0f, cacheHalf = 0.0f, cacheCentre = 0.0f, cacheRes = 0.0f, cacheMorph = 0.0f;
     int harmFirst = 1, harmCount = 0, harmPadded = 0, harmRamp = 0;
     float harmCentre = 1000.0f, harmRes = 0.2f;
     float powerIn = 0.0f, powerOut = 0.0f, powerCoef = 1.0e-4f, compCoef = 1.0e-3f, harmComp = 1.0f, harmCompTarget = 1.0f;
