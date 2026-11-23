@@ -331,10 +331,40 @@ struct SincTable
         const float blend = f - (float) ph;
         const float* a = table.data() + offset[(size_t) cut] + (size_t) ph * (size_t) n;
         const float* b = a + n;
+#if defined (__SSE2__) || defined (_M_X64)
+        // Four at a time (every length is a multiple of 4): the same sub, mul and add as below, bit for bit.
+        const __m128 w = _mm_set1_ps (blend);
+        for (int m = 0; m < n; m += 4)
+        {
+            const __m128 va = _mm_loadu_ps (a + m);
+            _mm_storeu_ps (out + m, _mm_add_ps (va, _mm_mul_ps (w, _mm_sub_ps (_mm_loadu_ps (b + m), va))));
+        }
+#else
         for (int m = 0; m < n; ++m)
             out[m] = a[m] + blend * (b[m] - a[m]);
+#endif
     }
 };
+
+// SincTable::cutFor for a read: its log2 for every sample read was 4-5 % of the time of engines B, D and E (the
+// granular and sustain reads), for a step that changes once a block at most. The last two steps asked for (a note
+// reads its original and its sustain source at different steps) are kept with their cut: the same result, exactly.
+inline int cutForRead (double step) noexcept
+{
+    if (step <= 1.0)
+        return 0;
+    thread_local double lastStep[2] { -1.0, -1.0 };
+    thread_local int lastCut[2] { 0, 0 };
+    thread_local int newest = 0;
+    if (step == lastStep[newest])
+        return lastCut[newest];
+    if (step == lastStep[1 - newest])
+        return lastCut[1 - newest];
+    newest = 1 - newest;
+    lastStep[newest] = step;
+    lastCut[newest] = SincTable::cutFor (step);
+    return lastCut[newest];
+}
 
 const SincTable& sinc()
 {
@@ -350,7 +380,7 @@ const SincTable& sinc()
 inline void readBandLimited (const float* a, const float* b, double pos, int len, double step, float* coefs, float& outA, float& outB) noexcept
 {
     const auto& t = sinc();
-    const int cut = SincTable::cutFor (std::abs (step));
+    const int cut = cutForRead (std::abs (step));
     const int taps = t.taps[(size_t) cut], back = taps / 2 - 1;
     const double fl = Dsp::floorFast (pos);
     const int at = (int) fl;
@@ -383,7 +413,7 @@ inline void readBandLimited (const float* a, const float* b, double pos, int len
 inline void readBandLimitedWrap (const float* a, const float* b, double pos, int len, double step, float* coefs, float& outA, float& outB) noexcept
 {
     const auto& t = sinc();
-    const int cut = SincTable::cutFor (std::abs (step));
+    const int cut = cutForRead (std::abs (step));
     const int taps = t.taps[(size_t) cut], back = taps / 2 - 1;
     const double fl = Dsp::floorFast (pos);
     const int at = (int) fl;
@@ -1453,6 +1483,7 @@ public:
     int getNote() const noexcept { return note; }
     juce::uint32 getOrder() const noexcept { return order; }
     float getPitch() const noexcept { return pitch; }
+    float fadeLevel() const noexcept { return fadeGain; }       // 1 down to 0 while fading out
     void stopImmediately() noexcept
     {
         active = false;
@@ -2033,6 +2064,7 @@ private:
 
         // Sustain source (engines B and D).
         float srcMix = 0.0f;
+        float mixAt = -1.0f, mixCos = 1.0f, mixSin = 0.0f;  // cos and sin of srcMix * pi/2, for the srcMix they were made at
         float grainCoh = -1.0f, srcCoh = -1.0f;      // the grains' level correction, as applied (moves per sample)
         double srcPos = 0.0;
         LoopGrains srcGrains;
@@ -2803,6 +2835,12 @@ private:
                 const float u = uArr[(size_t) i];
                 float l = 0.0f, r = 0.0f;
                 float ml = 0.0f, mr = 0.0f;         // the source's part, under Movimiento
+                if (ln.srcMix != ln.mixAt)
+                {
+                    ln.mixAt = ln.srcMix;
+                    ln.mixCos = std::cos (ln.srcMix * pi * 0.5f);
+                    ln.mixSin = std::sin (ln.srcMix * pi * 0.5f);
+                }
                 ln.grainCoh += grainCohStep;
                 ln.srcCoh += srcCohStep;
                 const float grainCoherence = ln.grainCoh, sourceCoherence = ln.srcCoh;
@@ -2825,7 +2863,7 @@ private:
                     // Where the sample is louder than its model (a hit, a bump) it is not raised
                     // over the curve: the boost is only for what the sample lacks, as in engine A.
                     const float limit = std::max (1.0f, u / de);
-                    const float g = std::min ({ maxBoost, ln.ratio, limit }) * (wp.on ? 1.0f : grainCoherence) * std::cos (ln.srcMix * pi * 0.5f);
+                    const float g = std::min ({ maxBoost, ln.ratio, limit }) * (wp.on ? 1.0f : grainCoherence) * ln.mixCos;
                     l = bl * g;
                     r = br * g;
                 }
@@ -2870,7 +2908,7 @@ private:
                     if (ln.srcMix >= 1.0f)
                         ln.ratio = ratio;
                     // Never above the curve: the loop's own level says how far it can be raised.
-                    const float g = std::min ({ maxBoost, ratio, std::max (1.0f, u / src.level) }) * breathGain * std::sin (ln.srcMix * pi * 0.5f);
+                    const float g = std::min ({ maxBoost, ratio, std::max (1.0f, u / src.level) }) * breathGain * ln.mixSin;
                     if (moving)
                     {
                         ml = xl * g;
@@ -5156,12 +5194,22 @@ Voice* SynthEngine::allocateVoice()
         if (! v->isActive())
             return v.get();
 
-    Voice* oldest = voices.front().get();
+    // None free (more than the spares' worth of notes within one 4 ms fade: a big chord on the pedal, a glissando, a
+    // fast arpeggio): the one stopped at once is the quietest of those already fading out, the furthest into its fade.
+    // Before, the oldest was stopped whatever it was doing, and the oldest could still be sounding in full: a click.
+    Voice* chosen = nullptr;
     for (auto& v : voices)
-        if (v->getOrder() < oldest->getOrder())
-            oldest = v.get();
-    oldest->stopImmediately();
-    return oldest;
+        if (v->isFading() && (chosen == nullptr || v->fadeLevel() < chosen->fadeLevel()))
+            chosen = v.get();
+    if (chosen == nullptr)
+    {
+        chosen = voices.front().get();
+        for (auto& v : voices)
+            if (v->getOrder() < chosen->getOrder())
+                chosen = v.get();
+    }
+    chosen->stopImmediately();
+    return chosen;
 }
 
 void SynthEngine::noteOn (int note, float velocity, const ParamSnapshot& p, int channel)

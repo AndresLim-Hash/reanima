@@ -642,7 +642,9 @@ int main()
 
     // --- Mechanism ------------------------------------------------------------
     {
-        const char* names[] = { "Piano", "Pick", "Bow", "Key", "Breath", "From the sample" };
+        // Every type (the "Real" ones came later: with 6 names here the loop read past the list, found by ASan).
+        const char* names[Mechanism::NumTypes] = { "Piano", "Pick", "Bow", "Key", "Breath", "From the sample", "Real piano", "Real pick",
+                                                   "Real bow", "Real breath", "Real guitar" };
         auto q = defaultsFor (*pluck);
         q[P::AmpR] = 40.0f;
         const auto dry = play (pluck, q, 60, 0.6, 1.2);

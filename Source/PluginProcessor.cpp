@@ -37,6 +37,12 @@ ReanimaProcessor::~ReanimaProcessor()
 {
     masterReference.clear();        // a key estimate still on its way finds no processor
     stopTimer();
+    // A Rubber Band render still running (seconds on a long loop) is told to give up and waited for here, while the
+    // members it writes to still exist: left to the pool's own destructor it was cut after 5 s, or wrote into a
+    // processor already half gone (removing the plugin while it rendered).
+    rubberCancel = true;
+    rubberPool.removeAllJobs (true, 60000);
+    delete rubberDone.exchange (nullptr);
     delete previewMail.exchange (nullptr);
     delete previewTrash.exchange (nullptr);
     delete previewPlaying;
@@ -67,7 +73,9 @@ double ReanimaProcessor::getTailLengthSeconds() const
 void ReanimaProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     sideRate.store (sampleRate);
-    sideCopy.setSize (2, std::max (4096, samplesPerBlock));
+    // Room for the blocks of an export too: some hosts render offline in blocks far larger than they announced
+    // (with 4096, a bounce in blocks of 8192 played Impronta and the Sidechain source without their sidechain).
+    sideCopy.setSize (2, std::max (65536, samplesPerBlock));
     arp.prepare (sampleRate);
     arpMidi.ensureSize (8192);
     engine.prepare (sampleRate);
@@ -119,7 +127,9 @@ void ReanimaProcessor::timerCallback()
 // The loop stretched offline by Rubber Band R3 for one tempo and pitch: three rounds, the middle one kept, its
 // seam closed. Runs on the background thread (and offline renders wait for it).
 // start, length: the part of the file that loops (the whole loop, or the Ventana).
-std::unique_ptr<RubberRender> makeRubberRender (std::shared_ptr<const SampleData> data, int start, int length, double tempo, double pitch)
+// cancel (may be null): checked between the chunks of the render, which then gives up (returns null).
+std::unique_ptr<RubberRender> makeRubberRender (std::shared_ptr<const SampleData> data, int start, int length, double tempo, double pitch,
+                                               const std::atomic<bool>* cancel = nullptr)
 {
     using RB = RubberBand::RubberBandStretcher;
     const auto& buf = data->loopAudio.getNumSamples() >= data->length ? data->loopAudio : data->audio;
@@ -143,6 +153,8 @@ std::unique_ptr<RubberRender> makeRubberRender (std::shared_ptr<const SampleData
     int got = 0;
     for (int pos = 0; pos < total; pos += 8192)
     {
+        if (cancel != nullptr && cancel->load (std::memory_order_relaxed))
+            return {};
         const int n = std::min (8192, total - pos);
         const float* p[2] = { inL.data() + pos, inR.data() + pos };
         rb.process (p, (size_t) n, pos + n >= total);
@@ -169,6 +181,7 @@ std::unique_ptr<RubberRender> makeRubberRender (std::shared_ptr<const SampleData
     render->tempo = tempo;
     render->pitch = pitch;
     render->sample = data.get();
+    render->owner = data;
     render->loopLength = length;
     render->loopStart = start;
     return render;
@@ -180,9 +193,19 @@ std::unique_ptr<RubberRender> makeRubberRender (std::shared_ptr<const SampleData
 void ReanimaProcessor::serviceRubber()
 {
     const juce::ScopedLock lock (rubberLock);
-    const double now = juce::Time::getMillisecondCounterHiRes();
+    // A replaced render is freed once the audio thread has played half a second past its replacement (a voice fades
+    // out of the one it was reading over 60 ms). Counted in audio played, not in time: with the host's processing
+    // stopped mid-fade, a second of clock time freed a render a voice would still read when it started again.
+    const auto played = audioSamplesDone.load (std::memory_order_acquire);
+    const auto grace = (juce::int64) (0.5 * std::max (8000.0, getSampleRate()));
     for (auto it = rubberRetired.begin(); it != rubberRetired.end();)
-        it = now - it->second > 1000.0 ? rubberRetired.erase (it) : it + 1;
+        it = played - it->second > grace ? rubberRetired.erase (it) : it + 1;
+    // Another sample: its render no longer plays (and its sample, which it keeps alive, can go).
+    if (rubberCurrent != nullptr && rubberCurrent->sample != uiSample.get())
+    {
+        engine.rubberReady.store (nullptr, std::memory_order_release);
+        rubberRetired.push_back ({ std::move (rubberCurrent), played });
+    }
     if (auto* done = rubberDone.exchange (nullptr))
     {
         std::unique_ptr<RubberRender> fresh (done);
@@ -190,7 +213,7 @@ void ReanimaProcessor::serviceRubber()
         {
             engine.rubberReady.store (fresh.get(), std::memory_order_release);
             if (rubberCurrent != nullptr)
-                rubberRetired.push_back ({ std::move (rubberCurrent), now });
+                rubberRetired.push_back ({ std::move (rubberCurrent), played });
             rubberCurrent = std::move (fresh);
         }
     }
@@ -210,7 +233,7 @@ void ReanimaProcessor::serviceRubber()
     rubberBusy = true;
     rubberPool.addJob ([this, data, tempo, pitch, start, length]
     {
-        delete rubberDone.exchange (makeRubberRender (data, start, length, tempo, pitch).release());
+        delete rubberDone.exchange (makeRubberRender (data, start, length, tempo, pitch, &rubberCancel).release());
         rubberBusy = false;
     });
 }
@@ -856,6 +879,7 @@ void ReanimaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     mixPreview (buffer);
     measureOutput (buffer);     // the meter shows the level before the output stage: 0 dB is where saturation starts
     saturateOutput (buffer);
+    audioSamplesDone.fetch_add (buffer.getNumSamples(), std::memory_order_release);
 }
 
 void ReanimaProcessor::serviceKey()
@@ -947,10 +971,13 @@ void ReanimaProcessor::serviceKey()
             loader.addJob ([self, data]
             {
                 const auto heard = KeyDetect::fromAudio (data->audio, data->sampleRate);
-                juce::MessageManager::callAsync ([self, data, heard]
+                // The message only knows the sample, it does not keep it: holding the analysis (tens of MB) until the
+                // message thread delivered it piled them up where that thread was busy or not running.
+                const std::weak_ptr<const SampleData> which = data;
+                juce::MessageManager::callAsync ([self, which, heard]
                 {
                     if (auto* p = self.get())
-                        if (p->uiSample == data)
+                        if (const auto still = which.lock(); still != nullptr && p->uiSample == still)
                         {
                             const juce::ScopedLock sl (p->keyLock);
                             p->sampleKeyEstimate = heard;
@@ -1161,14 +1188,17 @@ bool ReanimaProcessor::previewFile (const juce::File& file)
 
 void ReanimaProcessor::mixPreview (juce::AudioBuffer<float>& buffer) noexcept
 {
-    if (auto* fresh = previewMail.exchange (nullptr, std::memory_order_acq_rel))
+    // A new clip is taken only when the one playing can be handed back (the message thread empties the trash before
+    // each new clip): with the trash still full, putting the old one there lost the clip already in it (never freed).
+    // Until then the new one waits in its mail for a block.
+    PreviewClip* fresh = nullptr;
+    if (previewMail.load (std::memory_order_acquire) != nullptr
+        && (previewPlaying == nullptr || previewTrash.load (std::memory_order_acquire) == nullptr))
+        fresh = previewMail.exchange (nullptr, std::memory_order_acq_rel);
+    if (fresh != nullptr)
     {
         if (previewPlaying != nullptr)
-        {
-            // handed back to the message thread (it empties this before each new clip)
-            if (auto* left = previewTrash.exchange (previewPlaying, std::memory_order_acq_rel))
-                previewTrash.store (left, std::memory_order_release);     // never: kept rather than freed here
-        }
+            previewTrash.store (previewPlaying, std::memory_order_release);     // handed back: freed on the message thread
         previewPlaying = fresh;
         previewPos = 0.0;
         previewGain = 1.0f;
@@ -1938,6 +1968,23 @@ void ReanimaProcessor::pushStep (Step step)
     history.resize ((size_t) historyPos);
     history.push_back (std::move (step));
     if (history.size() > maxSteps)
+        history.erase (history.begin());
+    // Each edit of the audio keeps a whole copy of the sample: 100 edits of a 2-minute stereo file held over 4 GB. The
+    // oldest steps go while the copies the history alone keeps pass 512 MB (the last step is always kept).
+    const auto audioHeld = [this]
+    {
+        std::vector<const juce::AudioBuffer<float>*> seen;
+        size_t bytes = 0;
+        for (const auto& st : history)
+            for (const auto* a : { st.audioBefore.get(), st.audioAfter.get() })
+                if (a != nullptr && std::find (seen.begin(), seen.end(), a) == seen.end())
+                {
+                    seen.push_back (a);
+                    bytes += (size_t) a->getNumChannels() * (size_t) a->getNumSamples() * sizeof (float);
+                }
+        return bytes;
+    };
+    while (history.size() > 1 && audioHeld() > (size_t) 512 * 1024 * 1024)
         history.erase (history.begin());
     historyPos = (int) history.size();
 }

@@ -261,7 +261,7 @@ int main (int argc, char* argv[])
                 host.set (P::FltOn, 1.0f);
                 allocs = frees = bytes = 0;
                 for (int circuit = 0; circuit < 5; ++circuit)
-                    for (int type = 0; type < 8; ++type)
+                    for (int type = 0; type <= P::Harmonic; ++type)
                     {
                         host.set (P::FltCircuit, (float) circuit);
                         host.set (P::FltType, (float) type);
@@ -269,7 +269,37 @@ int main (int argc, char* argv[])
                         host.play ("filter", 12, { 48, 60 }, P::FltFreq, 100.0f, 12000.0f);
                     }
                 host.set (P::FltOn, 0.0f);
-                report ("filter, 5 circuits x 8 types, cutoff automated", allocs, frees, bytes);
+                report ("filter, 5 circuits x 9 types (Armonico included), cutoff automated", allocs, frees, bytes);
+
+                // Movimiento (B and D held), LFO Deriva with Suavidad on Tono fino, the Sidechain source on the cutoff.
+                allocs = frees = bytes = 0;
+                host.set (P::SustainType, 1.0f);
+                host.set (P::SustainMotion, 1.0f);
+                host.set (P::Lfo1Shape, (float) P::Drift);
+                host.set (P::Lfo1Smooth, 0.5f);
+                host.set (P::M1Src, (float) P::SrcLfo1);
+                host.set (P::M1Dst, (float) P::DstFine);
+                host.set (P::M1Amt, 0.3f);
+                host.set (P::M2Src, (float) P::SrcSidechain);
+                host.set (P::M2Dst, (float) P::DstCutoff);
+                host.set (P::M2Amt, 0.5f);
+                host.set (P::FltOn, 1.0f);
+                for (const int engine : { 1, 3 })
+                {
+                    host.set (P::Engine, (float) engine);
+                    host.messageThread();
+                    host.play ("movimiento warm-up", 4, {});
+                    host.play ("movimiento", blocks, { 48, 60, 67 }, P::SustainMotion, 0.0f, 1.0f);
+                }
+                host.set (P::Engine, 0.0f);
+                host.set (P::SustainType, 0.0f);
+                host.set (P::SustainMotion, 0.0f);
+                host.set (P::Lfo1Shape, 0.0f);
+                host.set (P::M1Src, 0.0f);
+                host.set (P::M2Src, 0.0f);
+                host.set (P::FltOn, 0.0f);
+                host.messageThread();
+                report ("Movimiento in B and D, LFO Deriva, Sidechain source", allocs, frees, bytes);
 
                 // Every effect type in the first slot (made on the message thread, then played).
                 for (int type = 1; type < Fx::NumTypes; ++type)

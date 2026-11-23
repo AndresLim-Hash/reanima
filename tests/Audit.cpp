@@ -6553,6 +6553,149 @@ void auditColorPlay()
     }
 }
 
+//==============================================================================
+// The technical audit of 23-11 (docs/auditoria_tecnica_2026-11-23.md): what its fixes promise.
+void auditTechnical()
+{
+    title ("Técnica · latencia declarada frente a la real");
+    for (const double rate : rates)
+    {
+        MasterStage stage;
+        stage.prepare (rate, 64);
+        const int n = 4096;
+        std::vector<float> l ((size_t) n, 0.0f), r ((size_t) n, 0.0f);
+        l[100] = r[100] = 0.1f;     // well under the knee: the stage is linear there
+        for (int pos = 0; pos < n; pos += 64)
+            stage.process (l.data() + pos, r.data() + pos, 64);
+        int at = 0;
+        for (int i = 0; i < n; ++i)
+            if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) at]))
+                at = i;
+        check (at - 100 == stage.latency(), "etapa de salida a " + juce::String (rate / 1000.0, 1) + " kHz: el retardo real es el declarado",
+               "pico " + juce::String (at - 100) + " muestras, declarado " + juce::String (stage.latency()) + " ("
+               + juce::String (1000.0 * stage.latency() / rate, 2) + " ms)");
+    }
+
+    title ("Técnica · robo de voces sin cortes");
+    {
+        // 32 notes held (all the voices), then a burst of new ones in one block, nearly silent (velocity 0.01): what
+        // jumps is the old notes being cut. Up to the 8 spare voices each stolen note fades out over 4 ms; beyond them
+        // the furthest into its fade is stopped at once (a known limit: docs/auditoria_tecnica_2026-11-23.md).
+        const auto s = SampleAnalysis::analyse (tone (220.0, 4.0, 48000.0), 48000.0, "tono", false, true);
+        auto p = paramsFor (*s);
+        p[P::SustainType] = (float) P::SustainHold;
+        p[P::AmpS] = 1.0f;
+        p[P::VelAmp] = 1.0f;
+        const auto jump = [&] (int burst)
+        {
+            SynthEngine e;
+            e.prepare (48000.0);
+            e.setSample (s);
+            e.prepareFx (p);
+            Audio out (2, 48000), buf (2, 64);
+            out.clear();
+            for (int pos = 0; pos < out.getNumSamples(); pos += 64)
+            {
+                juce::MidiBuffer midi;
+                if (pos == 0)
+                    for (int k = 0; k < 32; ++k)
+                        midi.addEvent (juce::MidiMessage::noteOn (1, 36 + k, 0.5f), k);
+                if (pos == 24000)
+                    for (int k = 0; k < burst; ++k)
+                        midi.addEvent (juce::MidiMessage::noteOn (1, 70 + k, 0.01f), k);
+                e.process (buf, midi, p, 120.0);
+                out.copyFrom (0, pos, buf, 0, 0, 64);
+                out.copyFrom (1, pos, buf, 1, 0, 64);
+            }
+            double before = 0.0, after = 0.0;
+            const float* x = out.getReadPointer (0);
+            for (int i = 12000; i < 23900; ++i)
+                before = std::max (before, (double) std::abs (x[i] - x[i - 1]));
+            for (int i = 23990; i < 24600; ++i)
+                after = std::max (after, (double) std::abs (x[i] - x[i - 1]));
+            return after / before;
+        };
+        const double eight = jump (8), many = jump (24);
+        check (eight <= 1.5, "8 notas nuevas de golpe sobre 32 voces: todas las robadas se apagan en 4 ms, sin cortes",
+               "salto mayor entre muestras x" + juce::String (eight, 2) + " del acorde estable");
+        std::printf ("(info) 24 notas nuevas de golpe sobre 32 voces: salto x%.2f (las que pasan de las 8 de reserva se cortan)%c", many, 10);
+    }
+
+    title ("Técnica · cambiar de motor con una nota sonando (informativo)");
+    {
+        const auto s = SampleAnalysis::analyse (pluck (220.0, 3.0, 48000.0), 48000.0, "pluck", false, true);
+        for (const int to : { 1, 2, 3, 4, 5 })
+        {
+            auto p = paramsFor (*s);
+            p[P::SustainType] = (float) P::SustainHold;
+            p[P::AmpS] = 1.0f;
+            SynthEngine e;
+            e.prepare (48000.0);
+            e.setSample (s);
+            e.prepareFx (p);
+            Audio out (2, 48000), buf (2, 64);
+            for (int pos = 0; pos < out.getNumSamples(); pos += 64)
+            {
+                juce::MidiBuffer midi;
+                if (pos == 0)
+                    midi.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+                if (pos == 24000)
+                    p[P::Engine] = (float) to;
+                e.process (buf, midi, p, 120.0);
+                out.copyFrom (0, pos, buf, 0, 0, 64);
+                out.copyFrom (1, pos, buf, 1, 0, 64);
+            }
+            double before = 0.0, at = 0.0;
+            const float* x = out.getReadPointer (0);
+            for (int i = 12000; i < 23900; ++i)
+                before = std::max (before, (double) std::abs (x[i] - x[i - 1]));
+            for (int i = 23990; i < 24300; ++i)
+                at = std::max (at, (double) std::abs (x[i] - x[i - 1]));
+            double eBefore = 0.0, eAfter = 0.0;
+            for (int i = 18000; i < 23900; ++i)
+                eBefore += (double) x[i] * x[i];
+            for (int i = 30000; i < 35900; ++i)
+                eAfter += (double) x[i] * x[i];
+            std::printf ("(info) motor A -> %c con la nota sonando: salto mayor x%.2f del de antes; nivel despues %.1f dB%c", "ABCDEF"[to],
+                         at / std::max (1.0e-9, before), 10.0 * std::log10 ((eAfter + 1.0e-20) / (eBefore + 1.0e-20)), 10);
+        }
+    }
+
+    title ("Técnica · cerrar el plugin con un render de Rubber Band en marcha");
+    {
+        const juce::File loop = juce::File::getCurrentWorkingDirectory().getChildFile ("samples_prueba/all samples/OSS_TL_82_drum_loop_full_pusherman.wav");
+        if (! loop.existsAsFile())
+            std::printf ("(info) sin el loop de prueba; omitido\n");
+        else
+        {
+            auto proc = std::make_unique<ReanimaProcessor>();
+            proc->setPlayConfigDetails (0, 2, 48000.0, 256);
+            proc->prepareToPlay (48000.0, 256);
+            proc->loadSampleNow (loop);
+            proc->serviceMessageThread();
+            for (const auto& [id, v] : std::initializer_list<std::pair<int, float>> { { P::PlayMode, (float) P::PlayLoop },
+                                                                                      { P::LoopAlgo, (float) P::LoopRubberBand } })
+                if (auto* param = proc->apvts.getParameter (P::defs()[(size_t) id].id))
+                    param->setValueNotifyingHost (param->convertTo0to1 (v));
+            juce::AudioBuffer<float> b (2, 256);
+            for (int k = 0; k < 40; ++k)
+            {
+                juce::MidiBuffer midi;
+                if (k == 0)
+                    midi.addEvent (juce::MidiMessage::noteOn (1, 63, 1.0f), 0);
+                proc->processBlock (b, midi);
+                if (k % 8 == 7)
+                    proc->serviceMessageThread();       // asks for the render
+            }
+            proc->serviceMessageThread();
+            const double t0 = juce::Time::getMillisecondCounterHiRes();
+            proc.reset();
+            const double ms = juce::Time::getMillisecondCounterHiRes() - t0;
+            check (ms < 3000.0, "el plugin se cierra sin esperar al render entero", juce::String (ms, 0) + " ms");
+        }
+    }
+}
+
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI init;
@@ -6981,6 +7124,12 @@ int main (int argc, char* argv[])
     {
         auditBrowser();
         std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "tecnica")
+    {
+        auditTechnical();
+        std::printf ("%c%d comprobaciones, %d fallos%c", 10, checks, failures, 10);
         return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "colorplay")

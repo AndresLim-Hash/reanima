@@ -190,6 +190,25 @@ void fullChain (ReanimaProcessor& proc)
     setId (proc, "lfo3Rate", 5.0f);
 }
 
+// fullChain and, on top, the functions of 23-11: the filter Armónico, Movimiento, LFO 1 Deriva on Tono fino, the
+// Sidechain source on the cutoff and Impronta in the first slot (the sidechain silent: the host gives none here).
+void fullChainNew (ReanimaProcessor& proc)
+{
+    fullChain (proc);
+    setId (proc, "fx0Type", (float) Fx::Impronta);
+    setId (proc, "fltType", (float) P::Harmonic);
+    setId (proc, "fltHarmGain", 9.0f);
+    setId (proc, "sustainMotion", 1.0f);
+    setId (proc, "lfo1Shape", (float) P::Drift);
+    setId (proc, "lfo1Smooth", 0.5f);
+    setId (proc, "m1Src", (float) P::SrcLfo1);
+    setId (proc, "m1Dst", (float) P::DstFine);
+    setId (proc, "m1Amt", 0.2f);
+    setId (proc, "m8Src", (float) P::SrcSidechain);
+    setId (proc, "m8Dst", (float) P::DstCutoff);
+    setId (proc, "m8Amt", 0.3f);
+}
+
 double processMemoryMB()
 {
    #if JUCE_WINDOWS
@@ -382,7 +401,7 @@ Events chords (double seconds, double every)
     return e;
 }
 
-std::unique_ptr<ReanimaProcessor> fresh (const juce::File& sample, double rate, int block, int engine, bool full, bool sostenido)
+std::unique_ptr<ReanimaProcessor> fresh (const juce::File& sample, double rate, int block, int engine, int full, bool sostenido)
 {
     auto proc = std::make_unique<ReanimaProcessor>();
     useHostTempo (*proc);
@@ -395,8 +414,10 @@ std::unique_ptr<ReanimaProcessor> fresh (const juce::File& sample, double rate, 
         setId (*proc, "sustainType", 1.0f);
     if (engine == 0)
         setId (*proc, "grainMix", 0.5f);     // A's Textura: grains over the reconstruction
-    if (full)
+    if (full == 1)
         fullChain (*proc);
+    else if (full == 2)
+        fullChainNew (*proc);
     settle (*proc);
     juce::AudioBuffer<float> b (2, block);
     juce::MidiBuffer none;
@@ -425,13 +446,26 @@ int suite (int argc, char* argv[])
             for (int ci = 0; ci < engines.length(); ++ci)
             {
                 const int engine = engines[ci] - '0';
-                for (int full = 0; full < 2; ++full)
+                // SUITE_CONFIGS=012: base, todo, todo + the functions of 23-11 (default: 01)
+                const juce::String configs = std::getenv ("SUITE_CONFIGS") != nullptr ? juce::String (std::getenv ("SUITE_CONFIGS")) : juce::String ("01");
+                for (int ki = 0; ki < configs.length(); ++ki)
                 {
-                    const juce::String config = juce::String::charToString ("ABCDEF"[engine]) + (full ? " todo" : " base");
-                    auto proc = fresh (sample, rate, block, engine, full == 1, true);
+                    const int full = configs[ki] - '0';
+                    const juce::String config = juce::String::charToString ("ABCDEF"[engine]) + (full == 2 ? " nuevo" : full == 1 ? " todo" : " base");
+                    auto proc = fresh (sample, rate, block, engine, full, true);
                     report (label.toRawUTF8(), rate, block, config.toRawUTF8(), "4 voces largas 8 s", play (*proc, rate, block, held ({ 55, 60, 64, 67 }, 0.1, 8.1), 10));
                     report (label.toRawUTF8(), rate, block, config.toRawUTF8(), "improvisa poly 4", play (*proc, rate, block, improvise (4, 0.1, 3.0, 0.25, 20, 7), 23));
                     report (label.toRawUTF8(), rate, block, config.toRawUTF8(), "acordes 0.5 s", play (*proc, rate, block, chords (15, 0.5), 16));
+                    // The target of 23-11: 32 voices at once (64 samples, 48 kHz), held 6 s, the notes 2 ms apart.
+                    {
+                        Events e;
+                        for (int k = 0; k < 32; ++k)
+                        {
+                            e.push_back ({ 0.1 + 0.002 * k, 36 + k, true });
+                            e.push_back ({ 6.1, 36 + k, false });
+                        }
+                        report (label.toRawUTF8(), rate, block, config.toRawUTF8(), "32 voces 6 s", play (*proc, rate, block, e, 8));
+                    }
                 }
             }
         }
@@ -439,7 +473,7 @@ int suite (int argc, char* argv[])
     // Preset changes while playing (every factory preset once), and the long session.
     {
         const juce::File sample (juce::String::fromUTF8 (argv[6]));
-        auto proc = fresh (sample, 48000.0, block, 0, false, false);
+        auto proc = fresh (sample, 48000.0, block, 0, 0, false);
         int nextPreset = 0;
         const int presets = (int) Factory::presets().size();
         report ("presets", 48000.0, block, "todos", "cambio cada 0.4 s", play (*proc, 48000.0, block, chords (0.4 * presets, 0.4), 0.4 * presets + 1.0,
@@ -454,7 +488,7 @@ int suite (int argc, char* argv[])
         const double minutes = std::getenv ("SUITE_LONG") != nullptr ? std::atof (std::getenv ("SUITE_LONG")) : 0.0;
         if (minutes > 0.0)
         {
-            auto longProc = fresh (sample, 48000.0, block, 0, true, true);
+            auto longProc = fresh (sample, 48000.0, block, 0, 1, true);
             const double before = processMemoryMB();
             Result total;
             for (int m = 0; m < (int) minutes; ++m)
@@ -503,7 +537,7 @@ int profile (int argc, char* argv[])
     const double rate = argc > 7 ? std::atof (argv[7]) : 48000.0;
     const int repeat = argc > 8 ? std::atoi (argv[8]) : 3;
     const int block = 64;
-    auto proc = fresh (sample, rate, block, engine, full, true);
+    auto proc = fresh (sample, rate, block, engine, full ? 1 : 0, true);
     if (const char* preset = std::getenv ("PRESET"))
     {
         proc->applyFactoryPreset (std::atoi (preset));
@@ -539,6 +573,77 @@ int main (int argc, char* argv[])
     juce::ScopedJuceInitialiser_GUI juce;
     if (juce::String (argv[1]) == "suite" && argc > 6)
         return suite (argc, argv);
+    if (juce::String (argv[1]) == "memoria" && argc > 2)
+    {
+        // memoria <sample>: what one instance takes, step by step (private memory of the process).
+        const double start = processMemoryMB();
+        std::printf ("proceso al empezar: %.1f MB\n", start);
+        auto proc = std::make_unique<ReanimaProcessor>();
+        proc->setPlayConfigDetails (0, 2, 48000.0, 64);
+        proc->prepareToPlay (48000.0, 64);
+        settle (*proc);
+        double last = processMemoryMB();
+        const auto step = [&last] (const char* what)
+        {
+            const double now = processMemoryMB();
+            std::printf ("%-48s %+8.1f MB  (total %.1f MB)\n", what, now - last, now);
+            last = now;
+        };
+        step ("instancia vacía (motor A)");
+        proc->loadSampleNow (juce::File (juce::String::fromUTF8 (argv[2])));
+        settle (*proc);
+        step ("con el sample cargado y analizado");
+        juce::AudioBuffer<float> b (2, 64);
+        juce::MidiBuffer none;
+        for (int e = 1; e <= 5; ++e)
+        {
+            setId (*proc, "engine", (float) e);
+            settle (*proc);
+            for (int k = 0; k < 20; ++k)
+                proc->processBlock (b, none);
+            settle (*proc);
+            step ((juce::String ("motor ") + "ABCDEF"[e] + " elegido").toRawUTF8());
+        }
+        setId (*proc, "playMode", 1.0f);
+        settle (*proc);
+        step ("LOOP elegido (estiradores)");
+        fullChain (*proc);
+        settle (*proc);
+        step ("cadena completa de efectos");
+        proc.reset();
+        step ("instancia destruida");
+        // Made and destroyed again, four times: memory that keeps growing is a leak (what stays the same is shared).
+        const int rounds = std::getenv ("MEM_ROUNDS") != nullptr ? std::atoi (std::getenv ("MEM_ROUNDS")) : 4;
+        for (int round = 0; round < rounds; ++round)
+        {
+            // MEM_WHAT: s sample, f engine F, l LOOP, x effects (default all), to find where a leak is.
+            const juce::String what = std::getenv ("MEM_WHAT") != nullptr ? juce::String (std::getenv ("MEM_WHAT")) : juce::String ("sflx");
+            auto again = std::make_unique<ReanimaProcessor>();
+            again->setPlayConfigDetails (0, 2, 48000.0, 64);
+            again->prepareToPlay (48000.0, 64);
+            if (what.containsChar ('s'))
+                again->loadSampleNow (juce::File (juce::String::fromUTF8 (argv[2])));
+            settle (*again);
+            if (what.containsChar ('f'))
+                setId (*again, "engine", 5.0f);
+            if (what.containsChar ('l'))
+                setId (*again, "playMode", 1.0f);
+            if (what.containsChar ('x'))
+                fullChain (*again);
+            settle (*again);
+            again.reset();
+            // What a host's message thread does between two instances (MEM_DISPATCH=1): messages posted are delivered.
+            if (std::getenv ("MEM_DISPATCH") != nullptr)
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (300);
+            step ("otra instancia completa, creada y destruida");
+        }
+        // Two at once: what a second instance adds.
+        auto one = std::make_unique<ReanimaProcessor>();
+        one->setPlayConfigDetails (0, 2, 48000.0, 64);
+        one->prepareToPlay (48000.0, 64);
+        step ("una instancia vacía más (sin destruir)");
+        return 0;
+    }
     if (juce::String (argv[1]) == "profile" && argc > 6)
         return profile (argc, argv);
     const int engine = argc > 2 ? std::atoi (argv[2]) : 0;

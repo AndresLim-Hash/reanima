@@ -18,6 +18,9 @@ struct RubberRender
     int length = 0;                         // samples (the loop's length over the tempo)
     double tempo = 1.0, pitch = 1.0;
     const SampleData* sample = nullptr;
+    // The sample it was made from, kept alive with it: otherwise a later sample could be made where this one was
+    // freed, and `sample` would match it (the render of one loop played, and never made again, for another).
+    std::shared_ptr<const SampleData> owner;
     int loopLength = 0, loopStart = 0;      // the part of the file rendered (Ventana)
 };
 class FxRack;

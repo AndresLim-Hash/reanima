@@ -400,8 +400,10 @@ private:
     juce::ThreadPool rubberPool { juce::ThreadPoolOptions{}.withNumberOfThreads (1).withThreadName ("Reanima Rubber Band") };
     std::atomic<RubberRender*> rubberDone { nullptr };
     std::atomic<bool> rubberBusy { false };
+    std::atomic<bool> rubberCancel { false };      // the processor is going: a render under way gives up
     std::unique_ptr<RubberRender> rubberCurrent;
-    std::vector<std::pair<std::unique_ptr<RubberRender>, double>> rubberRetired;
+    std::vector<std::pair<std::unique_ptr<RubberRender>, juce::int64>> rubberRetired;   // and audioSamplesDone then
+    std::atomic<juce::int64> audioSamplesDone { 0 };    // samples the audio thread has processed (Rubber Band's grace)
     void serviceRubber();
     juce::CriticalSection rubberLock;
     juce::ThreadPool loader { juce::ThreadPoolOptions{}.withNumberOfThreads (1).withThreadName ("Reanima analysis")
