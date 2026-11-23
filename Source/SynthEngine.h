@@ -34,6 +34,9 @@ class SynthEngine
 public:
     static constexpr float minReshapedRelease = 0.06f;  // seconds; below this a sustained sound stops with a knock
 
+    // Tests and A/B renders only (audit 23-11): the granular sustain of B and D laid in tune (LoopGrains::inTune).
+    static void setGranularSustainInTune (bool on, bool varied = false) noexcept;
+
     static constexpr int maxVoices = 32;
     static constexpr int physicalVoices = maxVoices + 8;   // spares so stolen voices can fade out
 

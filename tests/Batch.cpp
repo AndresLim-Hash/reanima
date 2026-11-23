@@ -447,6 +447,9 @@ int main (int argc, char* argv[])
     juce::ScopedJuceInitialiser_GUI init;
     if (argc < 3)
         return 1;
+    // GRAIN_IN_TUNE=1: the granular sustain of B and D in tune (audit 23-11, for its A/B).
+    if (std::getenv ("GRAIN_IN_TUNE") != nullptr)
+        SynthEngine::setGranularSustainInTune (true, std::atoi (std::getenv ("GRAIN_IN_TUNE")) == 2);
 
     if (juce::String (argv[1]) == "pico" && argc > 3)
     {

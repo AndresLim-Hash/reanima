@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdio>
 #include <set>
+#include <map>
 #include <cstdlib>
 #include <functional>
 #include <new>
@@ -6696,6 +6697,221 @@ void auditTechnical()
     }
 }
 
+//==============================================================================
+// Sample rates (23-11): a file at 44.1 kHz played in projects at every rate, and the rate changed mid-session the way
+// a host does it (processing stopped, prepareToPlay again, processing resumed).
+namespace rates2311
+{
+juce::File writeWav (const Audio& a, double rate, const juce::String& name)
+{
+    auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile (name);
+    file.deleteFile();
+    std::unique_ptr<juce::OutputStream> stream (file.createOutputStream().release());
+    juce::WavAudioFormat wav;
+    if (auto writer = wav.createWriterFor (stream, juce::AudioFormatWriterOptions().withSampleRate (rate).withNumChannels (2).withBitsPerSample (24)))
+        writer->writeFromAudioSampleBuffer (a, 0, a.getNumSamples());
+    return file;
+}
+
+void setParam (ReanimaProcessor& proc, int id, float v)
+{
+    if (auto* param = proc.apvts.getParameter (P::defs()[(size_t) id].id))
+        param->setValueNotifyingHost (param->convertTo0to1 (v));
+}
+
+void settle (ReanimaProcessor& proc)
+{
+    proc.serviceMessageThread();
+    for (int k = 0; k < 600 && proc.isLoading(); ++k)
+    {
+        juce::Thread::sleep (20);
+        proc.serviceMessageThread();
+    }
+    proc.serviceMessageThread();
+}
+
+// Plays `seconds` with a note from `noteAt` to `noteOff` (seconds; -1: none), in blocks of `block`.
+Audio run (ReanimaProcessor& proc, double rate, int block, double seconds, double noteAt, double noteOff, int note = 60)
+{
+    const int n = (int) (seconds * rate);
+    Audio out (2, n), buf (2, block);
+    for (int pos = 0; pos < n; pos += block)
+    {
+        const int len = std::min (block, n - pos);
+        Audio view (buf.getArrayOfWritePointers(), 2, len);
+        view.clear();
+        juce::MidiBuffer midi;
+        const int on = noteAt >= 0.0 ? (int) (noteAt * rate) : -1, off = noteOff >= 0.0 ? (int) (noteOff * rate) : -1;
+        if (on >= pos && on < pos + len)
+            midi.addEvent (juce::MidiMessage::noteOn (1, note, 0.8f), on - pos);
+        if (off >= pos && off < pos + len)
+            midi.addEvent (juce::MidiMessage::noteOff (1, note), off - pos);
+        proc.processBlock (view, midi);
+        out.copyFrom (0, pos, view, 0, 0, len);
+        out.copyFrom (1, pos, view, 1, 0, len);
+    }
+    return out;
+}
+
+// Frequency of the strongest spectral peak between two times (Hann window, zero-padded FFT, parabolic interpolation in
+// dB): grains and overlapping copies make zero crossings unreliable.
+double frequency (const Audio& a, double rate, double from, double to)
+{
+    const int i0 = (int) (from * rate), len = std::min (a.getNumSamples() - i0, (int) ((to - from) * rate));
+    if (len < 1024)
+        return 0.0;
+    int order = 1;
+    while ((1 << order) < 4 * len)
+        ++order;
+    const int size = 1 << order;
+    juce::dsp::FFT fft (order);
+    std::vector<float> w ((size_t) size * 2, 0.0f);
+    for (int i = 0; i < len; ++i)
+        w[(size_t) i] = a.getSample (0, i0 + i) * (float) (0.5 - 0.5 * std::cos (twoPi * i / len));
+    fft.performFrequencyOnlyForwardTransform (w.data());
+    int best = 1;
+    for (int k = 2; k < size / 2 - 1; ++k)
+        if (w[(size_t) k] > w[(size_t) best])
+            best = k;
+    const double l = std::log (w[(size_t) best - 1] + 1.0e-12), c = std::log (w[(size_t) best] + 1.0e-12), r = std::log (w[(size_t) best + 1] + 1.0e-12);
+    const double delta = 0.5 * (l - r) / (l - 2.0 * c + r);
+    return (best + delta) * rate / size;
+}
+
+// (the zero-crossing count, kept for reference)
+double frequencyByCrossings (const Audio& a, double rate, double from, double to)
+{
+    const float* x = a.getReadPointer (0);
+    double first = -1.0, last = -1.0;
+    int count = 0;
+    for (int i = (int) (from * rate) + 1; i < std::min (a.getNumSamples(), (int) (to * rate)); ++i)
+        if (x[i - 1] < 0.0f && x[i] >= 0.0f)
+        {
+            const double t = i - 1 + (double) -x[i - 1] / (double) (x[i] - x[i - 1]);
+            if (first < 0.0)
+                first = t;
+            else
+                ++count;
+            last = t;
+        }
+    return count > 0 ? count * rate / (last - first) : 0.0;
+}
+
+bool finite (const Audio& a)
+{
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < a.getNumSamples(); ++i)
+            if (! std::isfinite (a.getSample (c, i)))
+                return false;
+    return true;
+}
+
+double rmsDbOf (const Audio& a, double rate, double from, double to)
+{
+    double e = 0.0;
+    const int i0 = (int) (from * rate), i1 = std::min (a.getNumSamples(), (int) (to * rate));
+    for (int i = i0; i < i1; ++i)
+        e += 0.5 * (juce::square ((double) a.getSample (0, i)) + juce::square ((double) a.getSample (1, i)));
+    return 10.0 * std::log10 (e / std::max (1, i1 - i0) + 1.0e-20);
+}
+} // namespace rates2311
+
+void auditRates()
+{
+    using namespace rates2311;
+    title ("Frecuencias · un sample de 44,1 kHz en proyectos a cada frecuencia");
+    // A held tone of 440 Hz (the root plays it as it is), recorded at 44.1 kHz. Each engine must sound the same at every
+    // project rate as at 48 kHz; A and C, which read or rebuild the file without grains, exactly at 440 Hz. (B and D's
+    // granular sustain and E's cloud scatter the pitch of a pure tone, and F's FFT bins quantise it, the same way at
+    // every rate: docs/auditoria_tecnica_2026-11-23.md. F's level with a pure tone moves with its bins: informative.)
+    const auto file = writeWav (tone (440.0, 3.0, 44100.0, 0.4f), 44100.0, "reanima_audit_tono440.wav");
+    const double projectRates[] = { 48000.0, 32000.0, 44100.0, 88200.0, 96000.0, 176400.0, 192000.0 };
+    std::map<int, double> levelAt48, centsAt48;
+    for (const double rate : projectRates)
+    {
+        ReanimaProcessor proc;
+        proc.setPlayConfigDetails (0, 2, rate, 64);
+        proc.prepareToPlay (rate, 64);
+        proc.loadSampleNow (file);
+        settle (proc);
+        juce::String bad, info;
+        for (int engine = 0; engine < 6; ++engine)
+        {
+            setParam (proc, P::Engine, (float) engine);
+            setParam (proc, P::SustainType, (float) P::SustainHold);
+            setParam (proc, P::AmpS, 1.0f);
+            settle (proc);
+            run (proc, rate, 64, 0.3, -1.0, -1.0);
+            const auto y = run (proc, rate, 64, 2.0, 0.0, 1.8);
+            const double hz = frequency (y, rate, 0.6, 1.6);
+            const double cents = hz > 0.0 ? 1200.0 * std::log2 (hz / 440.0) : 9999.0;
+            const double level = rmsDbOf (y, rate, 0.6, 1.6);
+            if (rate == 48000.0)
+            {
+                levelAt48[engine] = level;
+                centsAt48[engine] = cents;
+            }
+            if (! finite (y))
+                bad << "ABCDEF"[engine] << " NaN; ";
+            if ((engine == 0 || engine == 2) && std::abs (cents) > 1.0)
+                bad << "ABCDEF"[engine] << " " << juce::String (cents, 2) << " ct; ";
+            if (engine <= 4 && std::abs (cents - centsAt48[engine]) > 1.5)      // B and D: 1.3 at 176.4 and 192 (their granular grid)
+                bad << "ABCDEF"[engine] << " " << juce::String (cents - centsAt48[engine], 2) << " ct frente a 48 kHz; ";
+            if (engine <= 4 && std::abs (level - levelAt48[engine]) > 0.5)
+                bad << "ABCDEF"[engine] << " " << juce::String (level - levelAt48[engine], 2) << " dB frente a 48 kHz; ";
+            if (engine == 5)
+                info << "F " << juce::String (cents, 1) << " ct, " << juce::String (level - levelAt48[engine], 2) << " dB";
+        }
+        check (bad.isEmpty(), "proyecto a " + juce::String (rate / 1000.0, 1) + " kHz: cada motor suena como a 48 kHz (A y C a 440 Hz exactos)",
+               bad.isEmpty() ? "(informativo) " + info : bad);
+    }
+
+    title ("Frecuencias · cambio de frecuencia en mitad de la sesión");
+    for (const auto& [from, to] : std::initializer_list<std::pair<double, double>> { { 48000.0, 96000.0 }, { 96000.0, 44100.0 }, { 44100.0, 88200.0 } })
+        for (const int engine : { 0, 1, 2, 3, 4, 5 })
+        {
+            ReanimaProcessor proc;
+            proc.setPlayConfigDetails (0, 2, from, 128);
+            proc.prepareToPlay (from, 128);
+            proc.loadSampleNow (file);
+            settle (proc);
+            setParam (proc, P::Engine, (float) engine);
+            setParam (proc, P::SustainType, (float) P::SustainHold);
+            settle (proc);
+            run (proc, from, 128, 0.3, -1.0, -1.0);
+            const auto before = run (proc, from, 128, 1.0, 0.0, -1.0);       // a note left sounding
+            proc.releaseResources();
+            proc.setPlayConfigDetails (0, 2, to, 128);
+            proc.prepareToPlay (to, 128);
+            settle (proc);
+            const auto after = run (proc, to, 128, 2.0, 0.2, 1.8);
+            // At the resume: what was left of the old note must not come back as a jump (the first 0.2 s are before the new note).
+            float firstPeak = 0.0f;
+            int peakAt = 0, firstSound = -1;
+            for (int i = 0; i < (int) (0.19 * to); ++i)
+            {
+                const float v = std::abs (after.getSample (0, i));
+                if (v > firstPeak) { firstPeak = v; peakAt = i; }
+                if (firstSound < 0 && v > 1.0e-4f) firstSound = i;
+            }
+            if (std::getenv ("RATES_DEBUG") != nullptr)
+                std::printf ("   primera muestra con sonido %d, pico en %d (%.1f ms)%c", firstSound, peakAt, 1000.0 * peakAt / to, 10);
+            const double hz = frequency (after, to, 0.8, 1.6);
+            const double cents = hz > 0.0 ? 1200.0 * std::log2 (hz / 440.0) : 9999.0;
+            // Its pitch: the engine's own in a project that starts at 48 kHz (B, D, E and F are not at 440 Hz with a pure
+            // tone, the same at every rate: above).
+            // (E's random grains and F's random phases give a pure tone a pitch that depends on when the note starts: for
+            // them only the clean resume is checked.)
+            const bool pitchKnown = engine <= 3;
+            check (finite (after) && (! pitchKnown || std::abs (cents - centsAt48[engine]) < 1.5) && firstPeak < 0.01f,
+                   "motor " + juce::String::charToString ("ABCDEF"[engine]) + ", " + juce::String (from / 1000.0, 1) + " → " + juce::String (to / 1000.0, 1)
+                       + " kHz con una nota sonando: se reanuda limpio y afinado",
+                   "pico al reanudar " + juce::String (firstPeak, 4) + ", nota nueva " + juce::String (cents, 2) + " cents");
+            (void) before;
+        }
+    file.deleteFile();
+}
+
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI init;
@@ -7124,6 +7340,12 @@ int main (int argc, char* argv[])
     {
         auditBrowser();
         std::printf ("\n%d comprobaciones, %d fallos\n", checks, failures);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "frecuencias")
+    {
+        auditRates();
+        std::printf ("%c%d comprobaciones, %d fallos%c", 10, checks, failures, 10);
         return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "tecnica")

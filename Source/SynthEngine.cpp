@@ -768,6 +768,16 @@ struct GrainReader : GrainCloud
 // whole periods for pitched sounds so the grains stay in phase.
 struct LoopGrains : GrainCloud
 {
+    // Audit 23-11 (docs/auditoria_tecnica_2026-11-23.md), off until approved by ear: a grain started every quarter
+    // of a grain from the same place repeats every len/4 samples, and that repetition is a comb on a grid of
+    // 4 / grain seconds (50 Hz with 80 ms grains): every partial of the sustain moved to the nearest line of it (a tone
+    // of 440 Hz held at 450 Hz; partials of real samples off by 40 to 96 cents). With this on, a sound with a period
+    // has its grains started a whole number of its periods apart at the output (they meet in phase: the pitch it has),
+    // and one without, at varied intervals (no grid).
+    static inline bool inTune = false;
+    static inline bool alwaysVaried = false;      // A/B: varied intervals for every sound, the period never used
+    double carry = 0.0;
+
     void tick (const juce::AudioBuffer<float>& buf, double centre, double step, int len, double spray, double period,
                float powerCoef, juce::Random& rng, float& outL, float& outR) noexcept
     {
@@ -778,7 +788,22 @@ struct LoopGrains : GrainCloud
             if (period > 0.0)
                 jitter = std::round (jitter / period) * period;
             spawn (centre + jitter, len);
-            countdown += std::max (1, len / 4);
+            if (! inTune)
+                countdown += std::max (1, len / 4);
+            else
+            {
+                double interval;
+                if (period > 0.0 && step > 0.0 && ! alwaysVaried)
+                {
+                    const double cycle = period / step;        // one period of the note, in output samples
+                    interval = std::max (1.0, std::round (0.25 * len / cycle)) * cycle + carry;
+                }
+                else
+                    interval = 0.25 * len * (0.5 + rng.nextDouble()) + carry;
+                const int whole = std::max (1, (int) interval);
+                carry = interval - (double) whole;
+                countdown += whole;
+            }
         }
 
         const float* a = buf.getReadPointer (0);
@@ -4549,6 +4574,12 @@ void SynthEngine::reset()
     pedalNoise->reset();
     limiterGain = 1.0f;
     masterGainsReady = false;
+    // Graves mono's crossover too: its filters kept the last note, and after a change of sample rate (prepare) that
+    // state rang out at the new rate as a burst of a millisecond before any note (measured: up to 0.07 of full scale).
+    bassHigh1.reset();
+    bassHigh2.reset();
+    bassAll.reset();
+    bassMonoHz = -1.0f;
 }
 
 std::shared_ptr<const SampleData> SynthEngine::setSample (std::shared_ptr<const SampleData> newSample)
@@ -4983,6 +5014,12 @@ void SynthEngine::process (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
         for (int d = 0; d < P::NumDests; ++d)
             modShown[(size_t) d].store (shown[(size_t) d], std::memory_order_relaxed);
     }
+}
+
+void SynthEngine::setGranularSustainInTune (bool on, bool varied) noexcept
+{
+    LoopGrains::inTune = on;
+    LoopGrains::alwaysVaried = varied;
 }
 
 void SynthEngine::setSidechain (const float* left, const float* right, int length) noexcept
