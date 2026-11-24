@@ -22,6 +22,9 @@ constexpr int numIntervals = 5;             // -2 oct, -1 oct, fifth, +1 oct, +2
 constexpr float intervalRatios[numIntervals] = { 0.25f, 0.5f, 1.5f, 2.0f, 4.0f };
 constexpr int maxCopies = 1 + numIntervals + 16;
 
+// The partials of a note at their true frequency (approved for A/B 23-11): on by default; off for A/B renders.
+void setTrueFrequency (bool on) noexcept;
+
 // FFT order for a "Tamaño" choice: the same length in seconds at any sample rate, up to 2^16.
 int orderFor (int sizeChoice, double hostRate) noexcept;
 
@@ -43,6 +46,7 @@ struct Settings
     int numCopies = 1;
     std::array<float, maxCopies> copyRatio {}, copyLevel {};
     const float* curve = nullptr;           // curvePoints values in dB, or none
+    const float* colour = nullptr;          // Seguir: curvePoints values in dB that change the colour, never the level
     bool keepFormants = false;              // Warp Tonos: the copies move their partials, not the envelope
 };
 
@@ -65,7 +69,7 @@ public:
     // Per-bin weights that depend only on the note, a setting and the size, not on the frame: worked out
     // when one of those changes and kept (with harmonics on, the logarithm and exponential of every bin
     // were most of a long frame's time, and the heaviest stage of all).
-    std::vector<float> harmonicKeep, curveGain;
+    std::vector<float> harmonicKeep, curveGain, colourGain;
     float keepF0 = -1.0f, keepWidth = -1.0f, keepBinHz = -1.0f, curveBinHz = -1.0f;
     int keepBins = 0, curveBins = 0;
     std::array<float, curvePoints> curveKey {};
@@ -111,7 +115,7 @@ public:
 
 private:
     static constexpr int ringSize = 2 << maxOrder;
-    int numStages() const noexcept { return 2 * order + 9; }
+    int numStages() const noexcept { return 2 * order + 10; }
 
     void read (const SampleData& s, const Settings& d, Shared& shared) noexcept;
     void fftPass (int pass, bool inverse, const Shared& shared) noexcept;      // 0: reorder; 1..order: butterflies
@@ -123,6 +127,15 @@ private:
     void scheduleNext (const Settings& d) noexcept;
 
     std::array<std::vector<float>, 2> acc, mag;
+
+    // The tonal peaks of the frame being built (fractional bin, phase in cycles at the frame's middle, the right
+    // channel's offset), and of the one before, to carry each partial's phase on at its own frequency.
+    struct Track { float pos; double theta; float apart, sweep, rate; };
+    std::vector<Track> tracks, lastTracks;
+    std::vector<int> peakOf;                // per bin: the track whose peak it belongs to, or -1
+    int lastSize = 0;
+    bool seededForPeaks = false;
+    void findPeaks (const Settings& d, juce::Random& apartRng) noexcept;
     std::vector<Complex> frame;             // the windowed input, then the spectrum to play
     int order = 14, size = 1 << 14, hop = 1 << 12;
     int readIdx = 0, nextAt = 0, untilFrame = 0, stage = 0;

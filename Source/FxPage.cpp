@@ -236,7 +236,7 @@ private:
 };
 
 //==============================================================================
-FxPage::FxPage (ReanimaProcessor& p) : proc (p), editor ({}, chainColour (0))
+FxPage::FxPage (ReanimaProcessor& p) : proc (p), editor ({}, chainColour (0)), master (p)
 {
     editor.setComponentID ("fx-editor");
     auto& st = proc.apvts;
@@ -269,6 +269,7 @@ FxPage::FxPage (ReanimaProcessor& p) : proc (p), editor ({}, chainColour (0))
     }
 
     addAndMakeVisible (editor);
+    addAndMakeVisible (master);
 
     rebuildEditor();
     startTimerHz (10);
@@ -351,5 +352,8 @@ void FxPage::resized()
     for (int c = 0; c < 3; ++c)
         chains[(size_t) c]->setBounds (margin + c * (chainWidth + gap), gap, c == 2 ? width - 2 * (chainWidth + gap) : chainWidth, chainsHeight);
 
-    editor.setBounds (margin, gap + chainsHeight + gap, width, getHeight() - chainsHeight - 2 * gap - margin);
+    // the selected slot's editor, and MASTER (what every chain goes through last) at its right
+    const int masterWidth = 372, bottom = getHeight() - chainsHeight - 2 * gap - margin;
+    editor.setBounds (margin, gap + chainsHeight + gap, width - masterWidth - gap, bottom);
+    master.setBounds (margin + width - masterWidth, gap + chainsHeight + gap, masterWidth, bottom);
 }

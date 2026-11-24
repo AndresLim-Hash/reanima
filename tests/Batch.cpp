@@ -7,6 +7,7 @@
 #include "Params.h"
 #include "SampleAnalysis.h"
 #include "SynthEngine.h"
+#include "DroneStretch.h"
 #include "Mechanism.h"
 #include "Filters.h"
 #include "Stretch.h"
@@ -445,6 +446,18 @@ int engines (const juce::Array<juce::File>& files, const char* out, int every)
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI init;
+    if (const char* anti = std::getenv ("SUSTAIN_ANTIPHASE"))  // SUSTAIN_ANTIPHASE=0: sustain sources as before (A/B)
+        SampleAnalysis::setSustainNoAntiphase (std::atoi (anti) != 0);
+    if (const char* rel = std::getenv ("LOOP_RELEASE"))    // LOOP_RELEASE=0: a loop's Release from the fit, as before (A/B)
+        SampleAnalysis::setLoopReleaseFromHits (std::atoi (rel) != 0);
+    if (const char* start = std::getenv ("DRONE_START"))   // DRONE_START=0: engine F comes in as before (A/B)
+        SynthEngine::setDroneGrainStart (std::atoi (start) != 0);
+    if (const char* hit = std::getenv ("DRONE_HIT_ASIS"))  // DRONE_HIT_ASIS=0: engine F makes a drone of a kick too (A/B)
+        SynthEngine::setDroneHitAsIs (std::atoi (hit) != 0);
+    if (const char* lock = std::getenv ("DRONE_TRUE"))     // DRONE_TRUE=0: engine F as PaulStretch, a random phase per bin (A/B)
+        Drone::setTrueFrequency (std::atoi (lock) != 0);
+    if (const char* half = std::getenv ("HALF_RATE"))     // HALF_RATE=0: engine F at the full rate (A/B)
+        SynthEngine::setHalfRateDrone (std::atoi (half) != 0);
     if (argc < 3)
         return 1;
     // GRAIN_IN_TUNE=1: the granular sustain of B and D in tune (audit 23-11, for its A/B).

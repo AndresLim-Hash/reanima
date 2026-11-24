@@ -1304,6 +1304,84 @@ bool makeAdditiveFreeze (const SampleData& d, int start, int end, juce::AudioBuf
     return true;
 }
 
+static bool sustainNoAntiphase = true;
+
+// The sample's colour in time for engine F's Seguir: each frame's partials and noise gathered into the 16 bands of
+// the drawn filter (Drone::curveFrequency), in dB against the band's mean over the frames that sound. A band with
+// nothing in it stays at 0.
+void colourBands (SampleData& d)
+{
+    const auto& pm = d.partials;
+    d.colourBands.clear();
+    if (! pm.valid())
+        return;
+    constexpr int bands = 16;
+    const auto bandOf = [] (float hz)
+    {
+        const float x = std::log2 (std::max (hz, 1.0f) / 20.0f) / std::log2 (1000.0f) * (float) (bands - 1);
+        return juce::jlimit (0, bands - 1, juce::roundToInt (x));
+    };
+    const int frames = pm.numFrames, nb = SampleData::PartialModel::numBands;
+    std::vector<double> power ((size_t) frames * bands, 0.0);
+    for (int f = 0; f < frames; ++f)
+    {
+        for (int k = 0; k < pm.numPartials; ++k)
+        {
+            const float a = pm.amp[(size_t) f * pm.numPartials + k];
+            if (a > 0.0f)
+                power[(size_t) f * bands + bandOf (pm.freq[(size_t) f * pm.numPartials + k])] += (double) a * a;
+        }
+        for (int b = 0; b < nb; ++b)
+        {
+            const float n = pm.noise[(size_t) f * nb + b];
+            const float centre = std::sqrt (pm.bandEdges[(size_t) b] * pm.bandEdges[(size_t) b + 1]);
+            power[(size_t) f * bands + bandOf (centre)] += (double) n * n * (pm.bandEdges[(size_t) b + 1] - pm.bandEdges[(size_t) b]) / std::max (1.0f, centre * 0.05f);
+        }
+    }
+    // Colour, not level: each frame's bands against its own total (a voice that fades must not take the drone
+    // down with it; with the level left in, the drone fell 24 dB as the sample did).
+    for (int f = 0; f < frames; ++f)
+    {
+        double total = 0.0;
+        for (int b = 0; b < bands; ++b)
+            total += power[(size_t) f * bands + b];
+        for (int b = 0; b < bands; ++b)
+            power[(size_t) f * bands + b] = total > 1.0e-14 ? power[(size_t) f * bands + b] / total : 0.0;
+    }
+    const int last = std::max (1, std::min (frames, pm.lastFrame + 1));
+    d.colourBands.assign ((size_t) frames * bands, 0.0f);
+    {
+        double sum = 0.0;
+        std::array<double, bands> share {};
+        for (int f = 0; f < last; ++f)
+            for (int b = 0; b < bands; ++b)
+                share[(size_t) b] += power[(size_t) f * bands + b];
+        for (const double v : share)
+            sum += v;
+        for (int b = 0; b < bands; ++b)
+            d.colourShare[(size_t) b] = sum > 0.0 ? (float) (share[(size_t) b] / sum) : 1.0f / bands;
+    }
+    for (int b = 0; b < bands; ++b)
+    {
+        double meanDb = 0.0;
+        int counted = 0;
+        for (int f = 0; f < last; ++f)
+            if (const double p = power[(size_t) f * bands + b]; p > 1.0e-9)
+            {
+                meanDb += 10.0 * std::log10 (p);
+                ++counted;
+            }
+        if (counted == 0)
+            continue;
+        meanDb /= counted;
+        for (int f = 0; f < frames; ++f)
+        {
+            const double p = power[(size_t) f * bands + b];
+            d.colourBands[(size_t) f * bands + b] = p > 1.0e-9 ? (float) juce::jlimit (-36.0, 18.0, 10.0 * std::log10 (p) - meanDb) : 0.0f;
+        }
+    }
+}
+
 void buildSource (SampleData& d, SampleData::SustainSource& src, double start)
 {
     const double sr = d.sampleRate;
@@ -1333,6 +1411,37 @@ void buildSource (SampleData& d, SampleData::SustainSource& src, double start)
                 mean += x[i];
             mean /= std::max (1, n);
             juce::FloatVectorOperations::add (x, (float) -mean, n);
+        }
+
+    // A held part that is more side than middle (the two channels opposed: summed to mono they cancel) is narrowed
+    // until its sides are no louder than its middle, which stays as it was. The tail of a music box swings into
+    // opposition, and its sustain held that moment for the whole note: in mono 11 dB went (as engine F, 22-11).
+    // Proposed 23-11, for A/B.
+    if (sustainNoAntiphase)
+        for (auto* b : { &src.loop, &src.freeze })
+        {
+            if (b->getNumChannels() < 2)
+                continue;
+            float* l = b->getWritePointer (0);
+            float* r = b->getWritePointer (1);
+            const int n = b->getNumSamples();
+            double mid = 0.0, side = 0.0;
+            for (int i = 0; i < n; ++i)
+            {
+                const double m = 0.5 * ((double) l[i] + r[i]), sd = 0.5 * ((double) l[i] - r[i]);
+                mid += m * m;
+                side += sd * sd;
+            }
+            if (side <= mid || side < 1.0e-20)
+                continue;
+            // the sides brought down to the middle's power, and the whole brought back to the power it had
+            const float k = (float) std::sqrt (mid / side), keep = (float) std::sqrt ((mid + side) / (2.0 * mid + 1.0e-30));
+            for (int i = 0; i < n; ++i)
+            {
+                const float m = 0.5f * (l[i] + r[i]), sd = 0.5f * (l[i] - r[i]) * k;
+                l[i] = (m + sd) * keep;
+                r[i] = (m - sd) * keep;
+            }
         }
 
     double loopSq = 0.0;
@@ -2047,6 +2156,89 @@ std::vector<Onset> onsets (const std::vector<float>& fl, const std::vector<float
 // 88 % of the drum loops go to Beats, 87 % of pads, chords, keys and basses to Tonal.
 static constexpr float percussiveThreshold = 0.5f;
 
+static bool loopReleaseFromHits = true;
+void setLoopReleaseFromHits (bool on) noexcept { loopReleaseFromHits = on; }
+
+int noteClassFromName (const juce::String& name)
+{
+    auto words = juce::StringArray::fromTokens (name.upToLastOccurrenceOf (".", false, false).isNotEmpty()
+                                                    && name.containsChar ('.') ? name.upToLastOccurrenceOf (".", false, false) : name,
+                                                "_- .()[]", "");
+    words.removeEmptyStrings();
+    for (int w = words.size(); --w >= 0;)
+    {
+        const auto t = words[w];
+        if (t.isEmpty() || t.length() > 7 || t[0] < 'A' || t[0] > 'G')
+            continue;
+        int pc = juce::String ("C D EF G A B").indexOfChar (t[0]);
+        auto rest = t.substring (1);
+        if (rest.startsWith ("#") || (rest.startsWith ("s") && ! rest.startsWithIgnoreCase ("sus")))
+        {
+            ++pc;
+            rest = rest.substring (1);
+        }
+        else if (rest.startsWith ("b"))
+        {
+            --pc;
+            rest = rest.substring (1);
+        }
+        for (const char* mode : { "minor", "major", "min", "maj", "m", "M" })
+            if (rest.startsWith (mode))
+            {
+                rest = rest.substring ((int) std::strlen (mode));
+                break;
+            }
+        if (rest.startsWith ("-"))
+            rest = rest.substring (1);
+        if (! rest.containsOnly ("0123456789") || rest.length() > 1)
+            continue;
+        // a lone capital in the middle of a name ("A_Day") says little: only near its end
+        if (t.length() == 1 && w < words.size() - 3)
+            continue;
+        return (pc % 12 + 12) % 12;
+    }
+    return -1;
+}
+void setSustainNoAntiphase (bool on) noexcept { sustainNoAntiphase = on; }
+
+// A loop's Release: how long its own hits take to die away (each one's fall to 20 dB under its top, three times over
+// for 60 dB; the median of them), at most 2 s. The fit of a decay over a whole loop found almost none (a loop does not
+// die away: 3 dB/s), and 60 dB at that rate is a Release of 20 s: a note let go went on sounding for seconds (680 of
+// the library's 5,206 loops over 2 s). Only ever shorter than what the fit gave. Proposed 23-11, for A/B.
+static void releaseFromHits (SampleData& d)
+{
+    if (! loopReleaseFromHits || d.loopInfo.hits.size() < 4 || d.detected.release <= 0.5f || d.env.empty())
+        return;
+    const auto& env = d.env;
+    const int hop = std::max (1, d.envHop), frames = (int) env.size();
+    const auto& hits = d.loopInfo.hits;
+    std::vector<float> falls;
+    for (size_t h = 0; h < hits.size(); ++h)
+    {
+        const int from = juce::jlimit (0, frames - 1, hits[h].first / hop);
+        const int to = h + 1 < hits.size() ? juce::jlimit (from + 1, frames, hits[h + 1].first / hop) : frames;
+        int top = from;
+        for (int f = from; f < std::min (to, from + (int) (0.05 * d.sampleRate / hop) + 1); ++f)
+            if (env[(size_t) f] > env[(size_t) top])
+                top = f;
+        if (env[(size_t) top] < 0.01f)
+            continue;               // a hit 40 dB under the loudest says little
+        for (int f = top; f < to; ++f)
+            if (env[(size_t) f] < 0.1f * env[(size_t) top])
+            {
+                falls.push_back ((float) (3.0 * (f - top) * hop / d.sampleRate));
+                break;
+            }
+    }
+    if (falls.size() < 2)
+        return;
+    std::nth_element (falls.begin(), falls.begin() + (long) falls.size() / 2, falls.end());
+    const auto& range = P::defs()[P::AmpR];
+    const float release = juce::jlimit (range.min * 0.001f, std::min (2.0f, range.max * 0.001f), falls[falls.size() / 2]);
+    if (release < d.detected.release)
+        d.detected.release = d.earlierDetected.release = release;
+}
+
 static void detectLoop (SampleData& d, const std::vector<float>& mono)
 {
     auto& L = d.loopInfo;
@@ -2668,6 +2860,7 @@ std::shared_ptr<SampleData> analyse (const juce::AudioBuffer<float>& source, dou
         analysePartials (*d, mono);
         tunePartials (*d);
         splitPartials (*d);
+        colourBands (*d);
 
         // Sustain sources: at the sustain point (Sostenido) and the last part of the
         // audible sample (Natural, so the original plays almost to the end).
@@ -2705,6 +2898,8 @@ std::shared_ptr<SampleData> analyse (const juce::AudioBuffer<float>& source, dou
     Reconstruct::buildBeds (*d);
 
     detectLoop (*d, mono);
+    releaseFromHits (*d);
+    d->nameRoot = d->pitched ? -1 : noteClassFromName (d->name);
     return d;
 }
 

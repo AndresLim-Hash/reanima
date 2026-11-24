@@ -312,6 +312,12 @@ inline juce::String value (int index, double v)
         return juce::String (v * 100.0, 1) + " %";
     if (index == P::LoopBpm)
         return v < 0.5 ? juce::String ("Auto") : juce::String (v, 2) + " BPM";
+    if (index == P::MstAmount)
+        return juce::String (juce::roundToInt (v)) + " %";
+    if (index == P::MstCharacter)       // TRANSPARENT - WARM - BODY
+        return (v < 25.0 ? juce::String ("Transp. ") : v < 75.0 ? juce::String ("Warm ") : juce::String ("Body ")) + juce::String (juce::roundToInt (v));
+    if (index == P::MstOutput)
+        return (v > 0.05 ? "+" : "") + juce::String (v, 1) + " dB";
     if (index == P::SliceStart)
     {
         static const char* names[] = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };

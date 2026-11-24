@@ -51,6 +51,8 @@ public:
     // Message thread. The analysis takes a while, so it runs in the background: the sample
     // arrives through a change message. Offline tools can wait for it with loadSampleNow().
     void loadSample (const juce::File& file);
+    // Snap a C may use the note of the file name for this sample (CP9: samples loaded from 0.9.6 on).
+    bool usesNameRoot() const noexcept { return nameRootHint.load(); }
     bool loadSampleNow (const juce::File& file);
     bool isLoading() const noexcept { return loading.load(); }
     // Offline tools without a message loop: what the timer and the async updates would do now.
@@ -102,6 +104,8 @@ public:
     // What the output did since the last call, for the meter.
     struct MeterReading { std::array<float, 2> peak {}, meanSquare {}; };
     MeterReading takeMeterReading();
+    // The MASTER stage's meters (the valve's activity, the true peak out, the limiter's reduction): the editor reads them.
+    MasterStage::Telemetry& masterTelemetry() noexcept { return masterStage.telemetry(); }
 
     // Presets: the whole state, sample path included, in a file the user names (message thread).
     static constexpr const char* presetExtension = ".reanimapreset";
@@ -263,6 +267,9 @@ private:
     void loadDemo();
     void saturateOutput (juce::AudioBuffer<float>& buffer) noexcept;
     MasterStage masterStage;
+public:
+    static inline bool skipMasterStageForTests = false;     // tests: the signal as it enters the output stage
+private:
     static constexpr int monoScratchSize = 256;
     std::array<float, monoScratchSize> monoScratch {};
     void applySetup (const std::vector<Factory::Setting>& values, const std::vector<std::pair<int, float>>& effects,
@@ -332,6 +339,9 @@ private:
     juce::AudioBuffer<float> clipboard;
     double clipboardRate = 44100.0;
     bool edited = false;
+    // Snap a C may use the note of the file name (CP9): for samples loaded from 0.9.6 on; a project saved before
+    // has no such mark and plays as it did.
+    std::atomic<bool> nameRootHint { false };
 
     // The sample as it goes into a project, prepared in the background after each load.
     juce::CriticalSection savedLock;

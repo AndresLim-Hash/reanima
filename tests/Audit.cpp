@@ -7,6 +7,8 @@
 #include "SampleAnalysis.h"
 #include "PluginProcessor.h"
 #include "MasterStage.h"
+#include "MasterStageLegacy.h"
+#include <functional>
 #include "SynthEngine.h"
 #include "FxRack.h"
 #include "DspUtil.h"
@@ -1652,12 +1654,15 @@ void auditParameters()
         const bool mode = id == P::SustainMode, grain = id == P::GrainMs || id == P::Spray || id == P::GranSpeed;
         const bool partials = id == P::Partials || id == P::NoiseLevel;
         const bool transient = id == P::TransientMs || id == P::TransientGain;
-        const bool cloud = id == P::GrainPos || id == P::GrainDensity || id == P::GrainPitch || id == P::GrainReverse || id == P::GrainWidth || id == P::GrainCoherent;
-        const bool drone = id >= P::DroneStretch && id <= P::DroneCurveOn;
+        const bool cloud = id == P::GrainPos || id == P::GrainDensity || id == P::GrainPitch || id == P::GrainReverse || id == P::GrainWidth || id == P::GrainCoherent || id == P::GrainSync;
+        const bool drone = (id >= P::DroneStretch && id <= P::DroneCurveOn) || id == P::DroneFollow;
 
         // Armónico's knobs need that filter type and the Sidechain source a sidechain (auditColorPlay); Movimiento is
         // engines B and D's alone.
         if (id == P::FltHarmGain || id == P::FltHarmRegion || (id >= P::ScSens && id <= P::ScResponse))
+            return true;
+        // MASTER acts after the engine, in the processor's output stage (auditMaster).
+        if (id >= P::MstValveOn && id <= P::MstCeiling)
             return true;
         if (id == P::SustainMotion && engineMode != P::EngineReenvelope && engineMode != P::EngineHybrid)
             return true;
@@ -2565,7 +2570,8 @@ void auditQuality()
         steady.copyFrom (0, 0, out, 0, from, steady.getNumSamples());
         steady.copyFrom (1, 0, out, 1, from, steady.getNumSamples());
         const double sample = steady.getMagnitude (0, steady.getNumSamples()), tp = truePeak (steady);
-        check (loaded && sample > 0.9 && tp <= 1.0, "salida a +12 dB: el true peak (4x) no pasa de 0 dBFS",
+        // (since 24-11-2026 the true peak limiter holds it at -1 dBTP; before, a clipper at -1 dBFS)
+        check (loaded && sample > 0.85 && tp <= 0.8912509 * 1.006, "salida a +12 dB: el true peak (4x) no pasa del techo de -1 dBTP",
                "pico de muestra " + db (toDb (sample)) + "FS, true peak " + db (toDb (tp)) + "TP");
         file.deleteFile();
     }
@@ -5910,56 +5916,371 @@ MasterRun measureMaster (const Audio& source, double rate, double sampleRate, do
     return r;
 }
 
+// The true peak, strictly: 16 points between the samples through a long Kaiser-windowed sinc (64 taps a side).
+double truePeakStrict (const Audio& y)
+{
+    constexpr int over = 16, half = 64;
+    static std::vector<std::vector<float>> kernels;
+    if (kernels.empty())
+        for (int q = 1; q < over; ++q)
+        {
+            std::vector<float> k ((size_t) (2 * half));
+            for (int i = -half; i < half; ++i)
+            {
+                const double x = i + 1.0 - (double) q / over;
+                const double s = x == 0.0 ? 1.0 : std::sin (juce::MathConstants<double>::pi * x) / (juce::MathConstants<double>::pi * x);
+                const double r = x / (half + 1.0);
+                const double w = juce::dsp::SpecialFunctions::besselI0 (10.0 * std::sqrt (std::max (0.0, 1.0 - r * r))) / juce::dsp::SpecialFunctions::besselI0 (10.0);
+                k[(size_t) (i + half)] = (float) (s * w);
+            }
+            kernels.push_back (std::move (k));
+        }
+    double peak = 0.0;
+    for (int ch = 0; ch < y.getNumChannels(); ++ch)
+    {
+        const float* x = y.getReadPointer (ch);
+        for (int i = half; i + half < y.getNumSamples(); ++i)
+        {
+            peak = std::max (peak, (double) std::abs (x[i]));
+            for (const auto& k : kernels)
+            {
+                double v = 0.0;
+                for (int j = 0; j < 2 * half; ++j)
+                    v += k[(size_t) j] * x[i - half + 1 + j];
+                peak = std::max (peak, std::abs (v));
+            }
+        }
+    }
+    return peak;
+}
+
+// The MASTER stage alone (MasterStage.h) over a stereo signal in blocks of 64; the result lined up with its input.
+Audio runMasterStage (const Audio& in, double rate, const MasterStage::Settings& s, float gainDb = 0.0f,
+                      std::function<void (MasterStage::Settings&, int)> automate = {})
+{
+    MasterStage stage;
+    stage.prepare (rate, 64);
+    stage.setSettings (s);
+    const int latency = stage.latency(), n = in.getNumSamples();
+    Audio io (2, n + latency);
+    io.clear();
+    for (int ch = 0; ch < 2; ++ch)
+        io.copyFrom (ch, 0, in, std::min (ch, in.getNumChannels() - 1), 0, n);
+    io.applyGain (juce::Decibels::decibelsToGain (gainDb));
+    auto settings = s;
+    for (int pos = 0; pos < io.getNumSamples(); pos += 64)
+    {
+        if (automate)
+        {
+            automate (settings, pos);
+            stage.setSettings (settings);
+        }
+        const int m = std::min (64, io.getNumSamples() - pos);
+        stage.process (io.getWritePointer (0) + pos, io.getWritePointer (1) + pos, m);
+    }
+    Audio out (2, n);
+    for (int ch = 0; ch < 2; ++ch)
+        out.copyFrom (ch, 0, io, ch, latency, n);
+    return out;
+}
+
+Audio stereoTone (double hz, double seconds, double rate, double amp = 1.0)
+{
+    Audio a (2, (int) (seconds * rate));
+    for (int i = 0; i < a.getNumSamples(); ++i)
+    {
+        const float v = (float) (amp * std::sin (twoPi * hz * i / rate));
+        a.setSample (0, i, v);
+        a.setSample (1, i, v);
+    }
+    return a;
+}
+
+double thdOfTone (const Audio& y, double rate, double hz, int from)
+{
+    constexpr int order = 15;
+    const auto mag = spectrum (y.getReadPointer (0) + from, order);
+    return thdOf (mag, rate, order, hz);
+}
+
+// The relative level of harmonic h of a tone (dB under the fundamental).
+double harmonicDb (const Audio& y, double rate, double hz, int h, int from)
+{
+    return toDb (toneAmp (y.getReadPointer (0) + from, 1 << 15, hz * h, rate) / toneAmp (y.getReadPointer (0) + from, 1 << 15, hz, rate));
+}
+
+// Up to a fraction of Nyquist and nothing above (a windowed-sinc low-pass, 255 taps, in place): what a recording has.
+void bandLimit (Audio& a, double fraction)
+{
+    constexpr int half = 127;
+    std::vector<double> h (2 * half + 1);
+    for (int i = -half; i <= half; ++i)
+    {
+        const double x = fraction * i;
+        const double s = i == 0 ? fraction : std::sin (juce::MathConstants<double>::pi * x) / (juce::MathConstants<double>::pi * i);
+        const double r = (double) i / (half + 1);
+        h[(size_t) (i + half)] = s * juce::dsp::SpecialFunctions::besselI0 (9.0 * std::sqrt (1.0 - r * r)) / juce::dsp::SpecialFunctions::besselI0 (9.0);
+    }
+    for (int ch = 0; ch < a.getNumChannels(); ++ch)
+    {
+        std::vector<float> x (a.getReadPointer (ch), a.getReadPointer (ch) + a.getNumSamples());
+        for (int n = 0; n < a.getNumSamples(); ++n)
+        {
+            double v = 0.0;
+            for (int k = -half; k <= half; ++k)
+                if (n - k >= 0 && n - k < a.getNumSamples())
+                    v += h[(size_t) (k + half)] * x[(size_t) (n - k)];
+            a.setSample (ch, n, (float) v);
+        }
+    }
+}
+
 void auditMaster()
 {
-    title ("Salida master: de 0 a +6 dB en el vúmetro");
-    for (const double rate : { 48000.0, 96000.0 })
+    title ("MASTER: válvula, Output y limitador True Peak (24-11-2026)");
+    MasterStage::Settings off;                  // the defaults: valve off, Output 0 dB, limiter on at -1 dBTP
+    MasterStage::Settings warm = off;
+    warm.valveOn = true;
+    warm.amount = 0.35f;
+    warm.character = 0.5f;
+
+    // A drum loop with hard hits (as before) and a chord of saws: what pushes a limiter.
+    const auto drumsAt = [] (double sr)
     {
-        const double sr = 48000.0, hz = 2500.0;
-        Audio tone (2, (int) (3.0 * sr)), drums (2, (int) (3.0 * sr));
+        Audio drums (2, (int) (3.0 * sr));
         juce::Random rng (21);
-        for (int i = 0; i < tone.getNumSamples(); ++i)
+        for (int i = 0; i < drums.getNumSamples(); ++i)
         {
             const double t = i / sr, beat = std::fmod (t, 0.5);
-            const float v = (float) (0.5 * std::sin (twoPi * hz * t));
-            tone.setSample (0, i, v);
-            tone.setSample (1, i, v);
             const double noise = rng.nextFloat() * 2.0 - 1.0;
             const float dv = (float) (0.7 * std::exp (-beat / 0.06) * std::sin (twoPi * 55.0 * beat) + 0.6 * std::exp (-beat / 0.004) * noise
                                       + 0.2 * std::exp (-std::fmod (t + 0.25, 0.5) / 0.03) * noise);
             drums.setSample (0, i, dv);
             drums.setSample (1, i, (float) (dv * 0.8 + 0.1 * noise * std::exp (-beat / 0.01)));
         }
-        juce::String table;
-        double lastThd = -300.0, worstAlias = -300.0, worstTonePeak = -300.0, worstToneTp = -300.0, worstDrumPeak = -300.0, thd0 = 0.0, thd6 = 0.0;
-        int toneClicks = 0;
-        bool rising = true;
-        for (int step = 0; step <= 6; ++step)
-        {
-            const auto t = measureMaster (tone, rate, sr, (double) step, "tono", true, hz);
-            const auto d = measureMaster (drums, rate, sr, (double) step, "bateria", false, 0.0);
-            rising = rising && t.thdDb > lastThd;
-            lastThd = t.thdDb;
-            (step == 0 ? thd0 : thd6) = t.thdDb;
-            worstAlias = std::max (worstAlias, t.aliasDb);
-            worstTonePeak = std::max (worstTonePeak, t.peakDb);
-            worstToneTp = std::max (worstToneTp, t.truePeakDb);
-            worstDrumPeak = std::max (worstDrumPeak, d.peakDb);
-            toneClicks += t.clicks;
-            table << juce::String::formatted ("\n    +%d dB  tono: vúmetro %+5.1f, pico %+5.2f, TP %+5.2f, THD %6.1f dB, aliasing %6.1f dB, clics %d"
-                                              "  |  batería: vúmetro %+5.1f, pico %+5.2f, TP %+5.2f, clics %d",
-                                              step, t.meterDb, t.peakDb, t.truePeakDb, t.thdDb, t.aliasDb, t.clicks, d.meterDb, d.peakDb, d.truePeakDb, d.clicks);
-        }
-        std::printf ("  %.1f kHz:%s\n", rate / 1000.0, table.toRawUTF8());
+        return drums;
+    };
+
+    for (const double rate : rates)
+    {
         const juce::String at = juce::String (rate / 1000.0, 1) + " kHz: ";
-        check (thd0 < -90.0, at + "salida master limpia a 0 dB del vúmetro", "THD " + db (thd0));
-        check (rising && thd6 > -25.0 && thd6 < -12.0, at + "la saturación crece de 0 a +6 dB, paso a paso", "THD a +6 dB " + db (thd6));
-        check (worstAlias < -80.0 && toneClicks == 0, at + "la saturación no pliega armónicos (sobremuestreada) ni da clics", "aliasing " + db (worstAlias));
-        check (worstTonePeak <= -0.3 && worstToneTp <= -0.3 && worstDrumPeak <= -0.3, at + "de 0 a +6 dB ninguna muestra pasa de -0,3 dBFS (tono y golpes)",
-               "tono pico " + db (worstTonePeak) + "FS, TP " + db (worstToneTp) + "TP; golpes pico " + db (worstDrumPeak) + "FS");
+        const auto drums = drumsAt (rate);
+
+        // 1. Off and under the ceiling: bit for bit the old stage's clean path (only later).
+        {
+            MasterStageLegacy old;
+            old.prepare (rate, 64);
+            Audio a (drums), b;
+            a.applyGain (0.5f);                     // the meter well under 0 dB
+            for (int pos = 0; pos < a.getNumSamples(); pos += 64)
+                old.process (a.getWritePointer (0) + pos, a.getWritePointer (1) + pos, std::min (64, a.getNumSamples() - pos));
+            b = runMasterStage (drums, rate, off, toDb (0.5));
+            MasterStage probe;
+            probe.prepare (rate, 64);
+            // (b is lined up with its input, a is late by the old latency)
+            float worst = 0.0f;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i + old.latency() < a.getNumSamples(); ++i)
+                    worst = std::max (worst, std::abs (a.getSample (ch, i + old.latency()) - b.getSample (ch, i)));
+            // (bit for bit when the old stage ran in blocks of 512; in blocks of 64 JUCE's filters round differently)
+            check (worst < 1.0e-6f, at + "válvula apagada y bajo el techo: lo mismo que la etapa de antes (sólo más tarde; diferencia bajo -120 dB)",
+                   "diferencia " + juce::String (worst, 9) + ", latencia " + juce::String (old.latency()) + " -> " + juce::String (probe.latency())
+                   + " muestras (" + juce::String (1000.0 * probe.latency() / rate, 2) + " ms)");
+        }
+
+        // 2. The limiter: the ceiling read between the samples, from 0 to +20 dB over it, never a hard clip. The hits'
+        // noise up to 0.9 of Nyquist (20 kHz at 44.1, what a recording holds); with white noise up to Nyquist itself
+        // the reading between the samples falls short (docs/master_valvula_limitador_2026-11-24.md): informative.
+        {
+            auto recorded = drums;
+            bandLimit (recorded, 0.9);
+            double worstTp = -100.0, worstFull = -100.0, worstThd = -300.0;
+            for (const float overDb : { 0.0f, 6.0f, 12.0f, 20.0f })
+            {
+                // the meter's level that leaves overDb over -1 dBFS (the meter's 0 dB leaves at -4)
+                const float drive = overDb + 3.0f;
+                const auto y = runMasterStage (recorded, rate, off, drive - (float) toDb (recorded.getMagnitude (0, recorded.getNumSamples())));
+                worstTp = std::max (worstTp, toDb (truePeakStrict (y)));
+                const auto full = runMasterStage (drums, rate, off, drive - (float) toDb (drums.getMagnitude (0, drums.getNumSamples())));
+                worstFull = std::max (worstFull, toDb (truePeakStrict (full)));
+                // a fs/4 tone at 45 degrees: its samples 3 dB under its peak
+                Audio isp (2, (int) (rate * 1.0));
+                for (int i = 0; i < isp.getNumSamples(); ++i)
+                {
+                    isp.setSample (0, i, (float) std::sin (juce::MathConstants<double>::halfPi * i + juce::MathConstants<double>::pi / 4.0));
+                    isp.setSample (1, i, isp.getSample (0, i));
+                }
+                const auto z = runMasterStage (isp, rate, off, drive);
+                Audio mid (2, z.getNumSamples() - (int) (0.2 * rate));
+                for (int ch = 0; ch < 2; ++ch)
+                    mid.copyFrom (ch, 0, z, ch, (int) (0.1 * rate), mid.getNumSamples());
+                worstTp = std::max (worstTp, toDb (truePeakStrict (mid)));
+                const auto tone = runMasterStage (stereoTone (1000.0, 1.5, rate), rate, off, drive);
+                worstThd = std::max (worstThd, thdOfTone (tone, rate, 1000.0, (int) (0.5 * rate)));
+            }
+            check (worstTp <= -0.95, at + "limitador: ningún pico real pasa de -1 dBTP (golpes y tono fs/4 a 45°, de 0 a +20 dB sobre el techo)",
+                   "peor " + db (worstTp) + "TP");
+            check (worstFull <= -0.5, at + "limitador con ruido blanco hasta Nyquist (caso extremo): por debajo de -0,5 dBTP", "peor " + db (worstFull) + "TP");
+            // a pad (220 Hz) with a kick every half second pushed 12 dB over the ceiling: no clicks and no pumping
+            Audio padKick (2, (int) (3.0 * rate));
+            for (int i = 0; i < padKick.getNumSamples(); ++i)
+            {
+                const double t = i / rate, beat = std::fmod (t, 0.5);
+                const double kick = std::exp (-beat / 0.08) * std::sin (twoPi * 55.0 * beat * (1.0 + 2.0 * std::exp (-beat / 0.02)));
+                const float v = (float) (0.25 * std::sin (twoPi * 220.0 * t) + 4.0 * kick);
+                padKick.setSample (0, i, v);
+                padKick.setSample (1, i, v);
+            }
+            const auto pk = runMasterStage (padKick, rate, off, 3.0f);
+            // the kick's own start counts as a jump: the same signal 30 dB lower (the limiter idle) says how many
+            const int clicks = clicksIn (pk, (int) (0.05 * rate)), own = clicksIn (runMasterStage (padKick, rate, off, -27.0f), (int) (0.05 * rate));
+            check (worstThd < -100.0 && clicks <= own, at + "limitador transparente en tono estable y sin clics propios (pad con bombo 12 dB sobre el techo)",
+                   "THD " + db (worstThd) + ", saltos " + juce::String (clicks) + " (los del propio bombo sin limitar: " + juce::String (own) + ")");
+        }
+
+        // 3. The valve: grows little by little with the level (no cliff), and with AMOUNT.
+        {
+            double last = -300.0, thd0 = 0.0;
+            bool rising = true;
+            juce::String row;
+            for (const float level : { -12.0f, -6.0f, 0.0f, 6.0f, 12.0f })
+            {
+                auto s = warm;
+                s.limiterOn = false;
+                const auto y = runMasterStage (stereoTone (1000.0, 1.5, rate), rate, s, level);
+                const double thd = thdOfTone (y, rate, 1000.0, (int) (0.5 * rate));
+                rising = rising && thd > last && (last < -200.0 || thd - last < 8.0);
+                last = thd;
+                if (level == 0.0f)
+                    thd0 = thd;
+                row << juce::String::formatted (" %+.0f:%.1f", level, thd);
+            }
+            check (rising && thd0 > -45.0 && thd0 < -25.0, at + "válvula (35 %, Warm): la THD crece poco a poco con el nivel, sin saltos", "vúmetro:THD" + row);
+            double lastA = -300.0;
+            bool risingA = true;
+            juce::String rowA;
+            for (const float amount : { 0.1f, 0.25f, 0.5f, 0.75f, 1.0f })
+            {
+                auto s = warm;
+                s.amount = amount;
+                s.limiterOn = false;
+                const auto y = runMasterStage (stereoTone (1000.0, 1.5, rate), rate, s, 0.0f);
+                const double thd = thdOfTone (y, rate, 1000.0, (int) (0.5 * rate));
+                risingA = risingA && thd > lastA;
+                lastA = thd;
+                rowA << juce::String::formatted (" %.0f%%:%.1f", amount * 100.0f, thd);
+            }
+            check (risingA && lastA < -15.0 && lastA > -22.0, at + "AMOUNT: recorrido progresivo, al máximo al borde de la distorsión sin llegar", "a 0 dB del vúmetro" + rowA);
+        }
+
+        // 4. OUTPUT never changes the valve: the same harmonics after levels are matched.
+        {
+            auto s = warm;
+            s.amount = 0.75f;
+            s.limiterOn = false;
+            Audio reference;
+            double worst = 0.0;
+            for (const float output : { -18.0f, -6.0f, 0.0f, 6.0f, 12.0f })
+            {
+                s.outputDb = output;
+                auto y = runMasterStage (drums, rate, s, 3.0f);
+                y.applyGain (juce::Decibels::decibelsToGain (-output));
+                if (reference.getNumSamples() == 0)
+                    reference = y;
+                for (int ch = 0; ch < 2; ++ch)
+                    for (int i = 0; i < y.getNumSamples(); ++i)
+                        worst = std::max (worst, (double) std::abs (y.getSample (ch, i) - reference.getSample (ch, i)));
+            }
+            check (worst < 1.0e-5, at + "OUTPUT de -18 a +12 dB: la válvula hace exactamente lo mismo (diferencia tras igualar nivel)", "máx " + juce::String (worst, 8));
+        }
+
+        // 5. ON/BYPASS, AMOUNT, CHARACTER and OUTPUT moved while a tone sounds: no clicks.
+        {
+            const auto tone = stereoTone (220.0, 3.0, rate, 0.9);
+            auto s = warm;
+            s.amount = 1.0f;
+            const int quarter = (int) (rate * 0.25);
+            const auto y = runMasterStage (tone, rate, s, 0.0f, [quarter] (MasterStage::Settings& v, int pos)
+            {
+                v.valveOn = (pos / quarter) % 2 == 0;
+                v.character = (float) ((pos / (2 * quarter)) % 3) * 0.5f;
+            });
+            const auto z = runMasterStage (tone, rate, s, 0.0f, [rate] (MasterStage::Settings& v, int pos)
+            {
+                const double t = pos / rate;
+                v.amount = (float) (0.5 + 0.5 * std::sin (twoPi * 0.7 * t));
+                v.character = (float) (0.5 + 0.5 * std::sin (twoPi * 0.4 * t));
+                v.outputDb = (float) (6.0 * std::sin (twoPi * 0.9 * t));
+            });
+            const int c1 = clicksIn (y, (int) (0.05 * rate)), c2 = clicksIn (z, (int) (0.05 * rate));
+            check (c1 == 0 && c2 == 0, at + "encender/apagar la válvula cada 250 ms y automatizar AMOUNT, CHARACTER y OUTPUT: sin clics",
+                   "clics " + juce::String (c1) + " y " + juce::String (c2));
+        }
+
+        // 6. The declared delay is the real one, with the valve on as well.
+        {
+            for (const bool on : { false, true })
+            {
+                MasterStage stage;
+                stage.prepare (rate, 64);
+                auto s = warm;
+                s.valveOn = on;
+                s.amount = 0.0f;
+                stage.setSettings (s);
+                std::vector<float> l (4096, 0.0f), r (4096, 0.0f);
+                l[100] = r[100] = 0.1f;
+                for (int pos = 0; pos < 4096; pos += 64)
+                    stage.process (l.data() + pos, r.data() + pos, 64);
+                int top = 0;
+                for (int i = 0; i < 4096; ++i)
+                    if (std::abs (l[(size_t) i]) > std::abs (l[(size_t) top]))
+                        top = i;
+                check (top - 100 == stage.latency(), at + "retardo real = el declarado al DAW, válvula " + (on ? "encendida" : "apagada"),
+                       juce::String (stage.latency()) + " muestras (" + juce::String (1000.0 * stage.latency() / rate, 2) + " ms)");
+            }
+        }
     }
 
-    // Real samples of the library (when it is there): hits, a loop, a bass, a pad, at 48 kHz.
+    // 7. Through the processor: an older project (without the MASTER parameters) opens with the valve off, Output at
+    // 0 dB and the limiter on at -1 dBTP, and a project keeps all six.
+    {
+        ReanimaProcessor proc;
+        proc.setPlayConfigDetails (0, 2, 48000.0, 64);
+        proc.prepareToPlay (48000.0, 64);
+        juce::MemoryBlock state;
+        proc.getStateInformation (state);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (state.getData(), (int) state.getSize());
+        auto tree = juce::ValueTree::fromXml (*xml);
+        for (int i = tree.getNumChildren(); --i >= 0;)
+            if (tree.getChild (i).getProperty ("id").toString().startsWith ("mst"))
+                tree.removeChild (i, nullptr);
+        for (const auto* id : { "mstValveOn", "mstAmount", "mstCharacter", "mstOutput", "mstLimiterOn", "mstCeiling" })
+            if (auto* param = proc.apvts.getParameter (id))
+                param->setValueNotifyingHost (param->getValue() > 0.5f ? 0.1f : 0.9f);
+        juce::MemoryBlock older;
+        juce::AudioProcessor::copyXmlToBinary (*tree.createXml(), older);
+        proc.setStateInformation (older.getData(), (int) older.getSize());
+        bool asDefault = true;
+        for (int i = P::MstValveOn; i <= P::MstCeiling; ++i)
+            asDefault = asDefault && std::abs (proc.paramValue (i) - P::defs()[(size_t) i].def) < 1.0e-4f;
+        check (asDefault, "proyecto anterior: válvula apagada, Output 0 dB, limitador a -1 dBTP (suena como antes donde antes era limpio)");
+
+        const float want[] = { 1.0f, 62.0f, 81.0f, -4.5f, 0.0f, -2.5f };
+        for (int i = P::MstValveOn; i <= P::MstCeiling; ++i)
+            if (auto* param = proc.apvts.getParameter (P::defs()[(size_t) i].id))
+                param->setValueNotifyingHost (param->convertTo0to1 (want[i - P::MstValveOn]));
+        juce::MemoryBlock saved;
+        proc.getStateInformation (saved);
+        ReanimaProcessor other;
+        other.setStateInformation (saved.getData(), (int) saved.getSize());
+        bool kept = true;
+        for (int i = P::MstValveOn; i <= P::MstCeiling; ++i)
+            kept = kept && std::abs (other.paramValue (i) - want[i - P::MstValveOn]) < 0.01f;
+        check (kept, "proyecto guardado: conserva válvula, Amount, Character, Output, limitador y techo");
+    }
+
+    // Real samples of the library (when it is there): hits, a loop, a bass, a pad, through the processor from the
+    // meter's 0 to +12 dB, valve off and on: never over the ceiling.
     const juce::File library = juce::File::getCurrentWorkingDirectory().getChildFile ("samples_prueba/all samples");
     const char* files[] = { "006_Clap_Snare_-_TDV_Zenhiser.wav", "001_Kick_-_FLECKMELTECHNO_Zenhiser.wav", "003_b__Drum_Loop_122bpm_C_-_80SW1_Zenhiser.wav",
                             "003_Bassline_122bpm_Fm_-_MAGNETICTECHNO_Zenhiser.wav", "044_Pad_118bpm_Gmin_-_NEON80S_Zenhiser.wav" };
@@ -5977,21 +6298,19 @@ void auditMaster()
         }
         juce::String row;
         double worstTp = -300.0;
-        for (const int step : { 0, 3, 6 })
+        for (const int step : { 0, 6, 12 })
         {
             const auto r = measureMaster (audio, 48000.0, sr, (double) step, juce::String (name).upToFirstOccurrenceOf ("_-", false, false), false, 0.0);
             row << juce::String::formatted ("  +%d: vúmetro %+5.1f pico %+5.2f TP %+5.2f", step, r.meterDb, r.peakDb, r.truePeakDb);
             worstTp = std::max (worstTp, r.truePeakDb);
         }
-        check (worstTp <= 0.0, juce::String ("muestra real ") + juce::String (name).substring (0, 24) + ": de 0 a +6 dB sin pasar de 0 dBTP", row);
+        check (worstTp <= -0.95, juce::String ("muestra real ") + juce::String (name).substring (0, 24) + ": de 0 a +12 dB del vúmetro sin pasar de -1 dBTP", row);
     }
+    for (const double rate : rates)
     {
         MasterStage stage;
-        for (const double rate : { 44100.0, 48000.0, 88200.0, 96000.0 })
-        {
-            stage.prepare (rate, 512);
-            std::printf ("  latencia de la etapa a %.1f kHz: %d muestras (%.2f ms)\n", rate / 1000.0, stage.latency(), 1000.0 * stage.latency() / rate);
-        }
+        stage.prepare (rate, 512);
+        std::printf ("  latencia de la etapa a %.1f kHz: %d muestras (%.2f ms)\n", rate / 1000.0, stage.latency(), 1000.0 * stage.latency() / rate);
     }
 }
 
@@ -6620,10 +6939,11 @@ void auditTechnical()
         const double eight = jump (8), many = jump (24);
         check (eight <= 1.5, "8 notas nuevas de golpe sobre 32 voces: todas las robadas se apagan en 4 ms, sin cortes",
                "salto mayor entre muestras x" + juce::String (eight, 2) + " del acorde estable");
-        std::printf ("(info) 24 notas nuevas de golpe sobre 32 voces: salto x%.2f (las que pasan de las 8 de reserva se cortan)%c", many, 10);
+        check (many <= 1.5, "24 notas nuevas de golpe sobre 32 voces: las que pasan de la reserva se funden por adelantado, sin cortes",
+               "salto mayor entre muestras x" + juce::String (many, 2) + " del acorde estable");
     }
 
-    title ("Técnica · cambiar de motor con una nota sonando (informativo)");
+    title ("Técnica · cambiar de motor con una nota sonando: la nota sigue con el suyo");
     {
         const auto s = SampleAnalysis::analyse (pluck (220.0, 3.0, 48000.0), 48000.0, "pluck", false, true);
         for (const int to : { 1, 2, 3, 4, 5 })
@@ -6658,8 +6978,9 @@ void auditTechnical()
                 eBefore += (double) x[i] * x[i];
             for (int i = 30000; i < 35900; ++i)
                 eAfter += (double) x[i] * x[i];
-            std::printf ("(info) motor A -> %c con la nota sonando: salto mayor x%.2f del de antes; nivel despues %.1f dB%c", "ABCDEF"[to],
-                         at / std::max (1.0e-9, before), 10.0 * std::log10 ((eAfter + 1.0e-20) / (eBefore + 1.0e-20)), 10);
+            const double jumpRatio = at / std::max (1.0e-9, before), levelDb = 10.0 * std::log10 ((eAfter + 1.0e-20) / (eBefore + 1.0e-20));
+            check (jumpRatio <= 1.5 && levelDb > -3.0, juce::String ("motor A -> ") + "ABCDEF"[to] + " con la nota sonando: la nota sigue igual",
+                   "salto x" + juce::String (jumpRatio, 2) + ", nivel después " + juce::String (levelDb, 1) + " dB");
         }
     }
 

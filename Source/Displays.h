@@ -57,6 +57,31 @@ private:
     juce::String drawnState;
 };
 
+// MASTER (24-11-2026): the valve (drawn: its filament glows with what the valve really adds), AMOUNT, CHARACTER,
+// OUTPUT, the true peak limiter and its meters (what enters, the true peak that leaves with the ceiling, the
+// reduction, a clip light). The audio thread only writes the numbers; this reads them 30 times a second.
+class MasterPanel : public Section, private juce::Timer
+{
+public:
+    explicit MasterPanel (ReanimaProcessor& p);
+    ~MasterPanel() override;
+
+    class Valve;
+    class Meters;
+
+    // what is drawn now (for the tests)
+    float filamentGlow() const noexcept;
+    float reductionShown() const noexcept;
+    float outputShown() const noexcept;
+
+private:
+    void timerCallback() override;
+
+    ReanimaProcessor& proc;
+    Valve* valve = nullptr;
+    Meters* meters = nullptr;
+};
+
 // The real response of the filter: an impulse through the same code the voices use.
 class FilterCurve : public ParamView
 {

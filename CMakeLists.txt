@@ -496,6 +496,49 @@ target_link_libraries(ReanimaAudit
         juce::juce_recommended_config_flags
         juce::juce_recommended_warning_flags)
 
+# The MASTER output stage lab: the old and new stage over the same signals (24-11-2026).
+juce_add_console_app(ReanimaMasterLab PRODUCT_NAME "ReanimaMasterLab")
+
+target_sources(ReanimaMasterLab
+    PRIVATE
+        tests/MasterLab.cpp
+        Source/Params.cpp
+        Source/PluginProcessor.cpp
+        Source/FactoryPresets.cpp
+        Source/Randomizer.cpp
+        Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
+        Source/Displays.cpp
+        Source/EditPage.cpp
+        Source/Guide.cpp
+        Source/TabGuides.cpp
+        Source/FxPage.cpp
+        Source/FxRack.cpp
+        Source/HelpText.cpp
+        Source/Reconstruct.cpp
+        Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
+        Source/SynthEngine.cpp
+        Source/Mechanism.cpp
+        Source/DroneStretch.cpp
+        Source/WaveformView.cpp)
+
+target_include_directories(ReanimaMasterLab PRIVATE Source)
+target_compile_options(ReanimaMasterLab PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+target_compile_definitions(ReanimaMasterLab PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JucePlugin_Name="Reanima" JucePlugin_VersionString="${PROJECT_VERSION}" JUCE_MODAL_LOOPS_PERMITTED=1)
+
+target_link_libraries(ReanimaMasterLab
+    PRIVATE
+        ReanimaMechanism
+        signalsmith_stretch
+        juce::juce_audio_utils
+        juce::juce_audio_formats
+        juce::juce_dsp
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)
+
 # Loads the built .vst3 through the VST3 interface, as a host does.
 juce_add_console_app(ReanimaHostCheck PRODUCT_NAME "ReanimaHostCheck")
 

@@ -28,7 +28,7 @@ const char* controlHelp (int index)
         case Reverse:       return "Toca el sample al revés. Reanaliza el sonido y pone los mandos en los valores detectados.";
         case Transpose:     return "Sube o baja el tono en semitonos.";
         case Fine:          return "Afinación fina en centésimas de semitono.";
-        case SnapC:         return "Apagado: Do3 toca el sample tal cual. Encendido: el sample se transporta al Do más cercano a su nota (un La2 sube a Do3) y todo el teclado queda afinado.";
+        case SnapC:         return "Apagado: Do3 toca el sample tal cual. Encendido: el sample se transporta al Do más cercano a su nota (un La2 sube a Do3) y todo el teclado queda afinado. Si no se le encuentra nota y su nombre la lleva («Kick_F», «Piano_C4»), se usa la del nombre (samples cargados desde la versión 0.9.6).";
         case Bits:          return "Resolución del sonido. A 24 no hace nada; cuanto más baja, más sucio y digital.";
         case Downsample:    return "Reduce la frecuencia de muestreo para un sonido lo-fi. A 1 no hace nada. Suena igual a cualquier frecuencia del proyecto.";
         case Variation:     return "Hace cada nota un poco distinta en afinación, volumen y brillo, para que las repeticiones no suenen a metralleta. No toca el ataque ni la envolvente.";
@@ -128,6 +128,15 @@ const char* controlHelp (int index)
         case DroneUp2:      return "Motor F: añade una copia dos octavas por encima. El volumen total se mantiene.";
         case DroneShift:    return "Motor F: desplaza todas las frecuencias los mismos hercios. Rompe la relación entre armónicos: suena metálico e inarmónico.";
         case DroneWidth:    return "Motor F: separación estéreo. A 0 los dos canales comparten fases y suena igual en mono; a 100 % son independientes y muy anchos.";
+        case VelAttack:     return "Cuanto más suave tocas, más tarda la nota en subir: hasta cuatro veces el Ataque con la velocidad más baja, como un arco o un soplo que empiezan despacio. A 0 la velocidad no toca el Ataque.";
+        case MstValveOn:    return "Enciende la válvula del MASTER (también con clic en el dibujo). Se funde en 30 ms: sin clics. Apagada, el sonido pasa limpio, exactamente como antes.";
+        case MstAmount:     return "Cuánta válvula: armónicos (sobre todo el 2.º, cálido), cuerpo y algo de redondez en los picos. Crece poco a poco: hasta un tercio es sutil, al máximo se nota sin llegar a distorsión dura. También actúa más cuanto más alto entra el sonido (Volumen).";
+        case MstCharacter:  return "El color de la válvula, con el mismo volumen.\nTransparent: limpia, apenas armónicos.\nWarm: el 2.º armónico, cálido y redondo, con los agudos de lo que añade suavizados.\nBody: además empuja más los graves contra la válvula: más cuerpo abajo.";
+        case MstOutput:     return "Ganancia después de la válvula y antes del limitador. 0 dB = sin cambio. No cambia nada de lo que hace la válvula: sólo el volumen que sale (y lo que el limitador tiene que bajar).";
+        case MstLimiterOn:  return "El limitador del final: ningún pico, tampoco entre muestras, pasa del Techo. Mira 1,5 ms por delante y baja el volumen con suavidad (nunca recorta). Por debajo del techo no toca nada.";
+        case MstCeiling:    return "Lo más alto que sale, en dBTP (pico real entre muestras). -1 dBTP es lo recomendado para que nada recorte al convertir o comprimir (MP3, AAC, streaming).";
+        case GrainSync:     return "Motor E: los granos nacen al ritmo del tempo del DAW (negras, corcheas, tresillos...) en lugar de a la Densidad, a intervalos exactos. Libre: como siempre, a la Densidad y con algo de azar.";
+        case DroneFollow:   return "Motor F: el color del drone cambia como cambiaba el del sample al sonar (un piano que se apaga y se oscurece, una voz que abre y cierra), en 16 bandas y con un movimiento lento, para que el drone respire sin perder la calma. Se suma al filtro dibujado. A 0 suena como antes.";
         case DroneCurveOn:  return "Motor F: enciende el filtro dibujado. Dibuja la curva con el ratón en el panel DRONE MAKER.";
         case GrainDensity:  return "Motor E: granos que nacen por segundo. Pocos suena a partículas sueltas; muchos, a una nube continua.";
         case GrainPitch:    return "Motor E: cada grano se desafina al azar hasta estos semitonos, arriba o abajo. Da brillo y movimiento.";

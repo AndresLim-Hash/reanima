@@ -53,9 +53,9 @@ void ParamView::update()
 //==============================================================================
 OutputMeter::OutputMeter()
 {
-    setTooltip (P::u8 ("Nivel antes de la etapa de salida. Hasta 0 dB el sonido sale limpio; de 0 a +6 dB (zona roja) entra en una "
-                       "saturación suave que añade armónicos y densidad poco a poco, sin pasar nunca de 0 dBFS a la salida. La barra "
-                       "sólida es el nivel medio (VU), la clara el pico y la línea el último pico. Abajo, el pico más alto: clic para ponerlo a cero."));
+    setTooltip (P::u8 ("Nivel que entra en la etapa MASTER (válvula, Output y limitador, en la pestaña FX). Su 0 dB sale a -4 dBFS si "
+                       "nada actúa; por encima, el limitador baja los picos hasta el techo sin recortar. La barra sólida es el nivel medio "
+                       "(VU), la clara el pico y la línea el último pico. Abajo, el pico más alto: clic para ponerlo a cero."));
     setOpaque (false);
 }
 
@@ -678,4 +678,268 @@ void MechanismAdvice::update()
     setTooltip (text + "\n\n" + P::u8 ("Cuánto encaja cada gesto de Mecanismo con este sample y con el ataque que le das: mira el ataque, si el sonido "
                                     "se sostiene, si tiene golpe propio, tono o ruido, y su registro. Es una guía: cualquier gesto se puede elegir."));
     repaint();
+}
+
+//==============================================================================
+// MASTER: the valve, its controls, the limiter and their meters.
+namespace
+{
+const juce::Colour amber { 0xffffb347 };
+float gainDb (float g, float floor = -100.0f) { return juce::Decibels::gainToDecibels (g, floor); }
+}
+
+class MasterPanel::Valve : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit Valve (ReanimaProcessor& p) : proc (p)
+    {
+        setComponentID ("master-valve");
+        setTooltip (P::u8 ("La válvula: clic para encenderla o apagarla. Su filamento brilla con lo que la válvula añade de verdad "
+                           "al sonido (sus armónicos): apagada, o sin nada que la atraviese, queda fría."));
+        setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    }
+
+    void setGlow (float target, bool on)
+    {
+        // a filament warms in about 60 ms and cools in about 400 ms
+        const float k = target > glow ? 0.45f : 0.08f;
+        glow += (target - glow) * k;
+        const int shown = juce::roundToInt (glow * 60.0f) + (on ? 1000 : 0);
+        if (shown != drawn)
+        {
+            drawn = shown;
+            lit = on;
+            repaint();
+        }
+    }
+
+    float glowNow() const noexcept { return lit ? glow : 0.0f; }
+
+    void mouseDown (const juce::MouseEvent&) override
+    {
+        if (auto* param = proc.apvts.getParameter (P::defs()[(size_t) P::MstValveOn].id))
+        {
+            param->beginChangeGesture();
+            param->setValueNotifyingHost (param->getValue() > 0.5f ? 0.0f : 1.0f);
+            param->endChangeGesture();
+        }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto area = getLocalBounds().toFloat().reduced (2.0f);
+        const float w = std::min (area.getWidth(), area.getHeight() * 0.46f), h = area.getHeight();
+        const auto tube = juce::Rectangle<float> (w, h).withCentre (area.getCentre());
+        const float baseH = h * 0.16f;
+        const auto glass = tube.withTrimmedBottom (baseH - 2.0f);
+        const auto base = tube.withTop (tube.getBottom() - baseH).reduced (w * 0.06f, 0.0f);
+        const float heat = lit ? juce::jlimit (0.0f, 1.0f, glow) : 0.0f;
+
+        // the glow behind the glass
+        if (heat > 0.01f)
+        {
+            const auto c = glass.getCentre().translated (0.0f, glass.getHeight() * 0.08f);
+            juce::ColourGradient halo (amber.withAlpha (0.42f * heat), c.x, c.y, amber.withAlpha (0.0f), c.x + w * 1.1f, c.y, true);
+            g.setGradientFill (halo);
+            g.fillEllipse (juce::Rectangle<float> (w * 2.2f, glass.getHeight() * 1.1f).withCentre (c));
+        }
+
+        // the glass: a dome on a tall body
+        juce::Path envelope;
+        envelope.addRoundedRectangle (glass.getX(), glass.getY(), glass.getWidth(), glass.getHeight(), w * 0.48f, w * 0.48f,
+                                      true, true, false, false);
+        g.setColour (juce::Colour (0xff1a1f27).withAlpha (0.9f));
+        g.fillPath (envelope);
+        juce::ColourGradient sheen (juce::Colours::white.withAlpha (0.10f), glass.getX(), 0.0f, juce::Colours::white.withAlpha (0.0f),
+                                    glass.getX() + glass.getWidth() * 0.45f, 0.0f, false);
+        g.setGradientFill (sheen);
+        g.fillPath (envelope);
+
+        // inside: the plate, the grid, the filament
+        const auto inner = glass.reduced (w * 0.2f, 0.0f).withTrimmedTop (glass.getHeight() * 0.2f).withTrimmedBottom (glass.getHeight() * 0.08f);
+        g.setColour (juce::Colour (0xff4a525e));
+        g.fillRoundedRectangle (inner.withWidth (inner.getWidth() * 0.18f), 1.5f);
+        g.fillRoundedRectangle (inner.withLeft (inner.getRight() - inner.getWidth() * 0.18f), 1.5f);
+        g.setColour (juce::Colour (0xff6b7482).withAlpha (0.8f));
+        const auto grid = inner.reduced (inner.getWidth() * 0.26f, inner.getHeight() * 0.05f);
+        for (int i = 0; i < 9; ++i)
+        {
+            const float y = grid.getY() + grid.getHeight() * (float) i / 8.0f;
+            g.drawLine (grid.getX(), y, grid.getRight(), y, 0.8f);
+        }
+        const float fx = inner.getCentreX();
+        const auto cold = juce::Colour (0xff5a4a3c);
+        const auto hot = cold.interpolatedWith (amber, std::min (1.0f, 0.25f + heat * 0.9f)).brighter (heat * 0.4f);
+        if (heat > 0.01f)
+        {
+            g.setColour (amber.withAlpha (0.35f * heat));
+            g.drawLine (fx, inner.getY(), fx, inner.getBottom(), 3.0f + 5.0f * heat);
+        }
+        g.setColour (lit ? hot : cold);
+        g.drawLine (fx, inner.getY(), fx, inner.getBottom(), 1.6f);
+
+        // the outline of the glass and the base with its pins
+        g.setColour (lit ? Theme::silver.withAlpha (0.55f) : Theme::panelEdge.brighter (0.3f));
+        g.strokePath (envelope, juce::PathStrokeType (1.2f));
+        g.setColour (juce::Colour (0xff262b33));
+        g.fillRoundedRectangle (base, 2.5f);
+        g.setColour (Theme::panelEdge.brighter (0.2f));
+        g.drawRoundedRectangle (base, 2.5f, 1.0f);
+        g.setColour (Theme::dim.withAlpha (0.6f));
+        for (int i = 0; i < 4; ++i)
+        {
+            const float x = base.getX() + base.getWidth() * (0.2f + 0.2f * (float) i);
+            g.drawLine (x, base.getBottom(), x, base.getBottom() + 2.0f, 1.2f);
+        }
+    }
+
+private:
+    ReanimaProcessor& proc;
+    float glow = 0.0f;
+    int drawn = -1;
+    bool lit = false;
+};
+
+class MasterPanel::Meters : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    Meters()
+    {
+        setComponentID ("master-meters");
+        setTooltip (P::u8 ("Entrada: lo que llega a la etapa MASTER, como el vúmetro de SALIDA (su 0 dB sale a -4 dBFS si nada actúa).\n"
+                           "Salida: el pico real, entre muestras incluido, que sale (dBTP), con la línea del techo.\n"
+                           "Reducción: cuánto baja el limitador ahora.\n"
+                           "CLIP se enciende si la salida pasa de 0 dBTP. Clic para apagarlo."));
+    }
+
+    void update (float inPeak, float outPeak, float reduction, float ceilingDb, bool limiterOn)
+    {
+        const auto fall = [] (float& shown, float now) { shown = now >= shown ? now : std::max (now, shown - 1.2f); };
+        fall (inDb, gainDb (inPeak));
+        fall (outDb, gainDb (outPeak));
+        const float gr = -gainDb (reduction, -40.0f);
+        grDb = gr >= grDb ? gr : std::max (gr, grDb - 0.8f);
+        ceiling = ceilingDb;
+        limiting = limiterOn;
+        clip = clip || outPeak > 1.0f;
+        const auto state = juce::String (juce::roundToInt (inDb * 4)) + " " + juce::String (juce::roundToInt (outDb * 4)) + " "
+                           + juce::String (juce::roundToInt (grDb * 4)) + " " + juce::String ((int) clip) + " " + juce::String (ceiling, 1)
+                           + juce::String ((int) limiting);
+        if (state != drawn)
+        {
+            drawn = state;
+            repaint();
+        }
+    }
+
+    float reductionDb() const noexcept { return grDb; }
+    float outputDb() const noexcept { return outDb; }
+
+    void mouseDown (const juce::MouseEvent&) override
+    {
+        clip = false;
+        drawn.clear();
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const float rowH = std::min (24.0f, (float) getHeight() / 3.0f);
+        const float labelW = 70.0f, valueW = 64.0f;
+        auto rows = getLocalBounds().toFloat();
+        rows = rows.withSizeKeepingCentre (rows.getWidth(), rowH * 3.0f);
+        const auto bar = [&] (int i, const juce::String& name, float value, float lo, float hi, juce::Colour c, bool fromRight, float mark,
+                              const juce::String& text)
+        {
+            auto r = rows.withY (rows.getY() + rowH * (float) i).withHeight (rowH);
+            g.setColour (Theme::dim);
+            g.setFont (Theme::caps (9.5f));
+            g.drawText (name, r.removeFromLeft (labelW), juce::Justification::centredLeft);
+            g.setColour (Theme::text);
+            g.setFont (Theme::font (11.0f));
+            g.drawText (text, r.removeFromRight (valueW), juce::Justification::centredRight);
+            const auto well = r.reduced (4.0f, rowH * 0.28f);
+            g.setColour (Theme::well);
+            g.fillRoundedRectangle (well, 2.0f);
+            const float f = juce::jlimit (0.0f, 1.0f, (value - lo) / (hi - lo));
+            if (f > 0.0f)
+            {
+                g.setColour (c);
+                g.fillRoundedRectangle (fromRight ? well.withLeft (well.getRight() - well.getWidth() * f) : well.withWidth (well.getWidth() * f), 2.0f);
+            }
+            if (mark > lo && mark < hi)
+            {
+                const float x = well.getX() + well.getWidth() * (mark - lo) / (hi - lo);
+                g.setColour (Theme::text);
+                g.drawLine (x, well.getY() - 2.0f, x, well.getBottom() + 2.0f, 1.4f);
+            }
+        };
+        const auto dbText = [] (float v, const char* unit) { return v <= -59.5f ? juce::String ("-inf") : juce::String (v, 1) + " " + unit; };
+        bar (0, "ENTRADA", inDb, -48.0f, 12.0f, inDb > 0.0f ? Theme::warning : Theme::good, false, 0.0f, dbText (inDb, "dB"));
+        bar (1, "SALIDA", outDb, -48.0f, 0.0f, clip ? Theme::danger : Theme::silver, false, limiting ? ceiling : -100.0f, dbText (outDb, "dBTP"));
+        bar (2, P::u8 ("REDUCCIÓN"), grDb, 0.0f, 24.0f, Theme::accent2, true, -100.0f,
+             ! limiting ? P::u8 ("apagado") : grDb < 0.05f ? juce::String ("0.0 dB") : "-" + juce::String (grDb, 1) + " dB");
+        if (clip)
+        {
+            const auto led = juce::Rectangle<float> (30.0f, 13.0f).withPosition (labelW - 34.0f, rows.getY() + rowH + (rowH - 13.0f) * 0.5f);
+            g.setColour (Theme::danger);
+            g.fillRoundedRectangle (led, 3.0f);
+            g.setColour (Theme::bg);
+            g.setFont (Theme::caps (8.5f));
+            g.drawText ("CLIP", led, juce::Justification::centred);
+        }
+    }
+
+private:
+    float inDb = -100.0f, outDb = -100.0f, grDb = 0.0f, ceiling = -1.0f;
+    bool clip = false, limiting = true;
+    juce::String drawn;
+};
+
+MasterPanel::MasterPanel (ReanimaProcessor& p) : Section ("MASTER", Theme::silver), proc (p)
+{
+    setComponentID ("s:MASTER");
+    auto& st = proc.apvts;
+    row (124);
+    valve = &add (std::make_unique<Valve> (proc), 0.8f);
+    add (std::make_unique<Knob> (st, P::MstAmount));
+    add (std::make_unique<Knob> (st, P::MstCharacter));
+    add (std::make_unique<Knob> (st, P::MstOutput));
+    row (26);
+    add (std::make_unique<Toggle> (st, P::MstValveOn), 0.8f);
+    add (std::make_unique<juce::Component>(), 2.0f);
+    add (std::make_unique<Toggle> (st, P::MstLimiterOn), 1.0f);
+    row();
+    meters = &add (std::make_unique<Meters>(), 2.8f);
+    add (std::make_unique<Knob> (st, P::MstCeiling), 1.0f);
+    startTimerHz (30);
+}
+
+MasterPanel::~MasterPanel()
+{
+    stopTimer();
+}
+
+float MasterPanel::filamentGlow() const noexcept { return valve->glowNow(); }
+float MasterPanel::reductionShown() const noexcept { return meters->reductionDb(); }
+float MasterPanel::outputShown() const noexcept { return meters->outputDb(); }
+
+void MasterPanel::timerCallback()
+{
+    auto& t = proc.masterTelemetry();
+    // read and start again (the audio thread only raises them)
+    const float in = t.inPeak.exchange (0.0f), out = t.outPeak.exchange (0.0f), reduction = t.reduction.exchange (1.0f);
+    const float residual = t.residual.exchange (0.0f);
+    t.level.exchange (0.0f);
+    const int samples = t.samples.exchange (0);
+    const bool on = proc.paramValue (P::MstValveOn) > 0.5f;
+    // the filament: what the valve adds, from -66 dB (just warm) to -18 dB (glowing) under the meter's 0 dB
+    float heat = 0.0f;
+    if (on && samples > 0)
+    {
+        const float addedDb = juce::Decibels::gainToDecibels (std::sqrt (residual / (float) samples), -120.0f);
+        heat = juce::jlimit (0.0f, 1.0f, (addedDb + 66.0f) / 48.0f);
+    }
+    valve->setGlow (on ? 0.12f + 0.88f * heat : 0.0f, on);
+    meters->update (in, out, reduction, proc.paramValue (P::MstCeiling), proc.paramValue (P::MstLimiterOn) > 0.5f);
 }

@@ -220,6 +220,15 @@ std::array<Def, Count> buildDefs()
     f (ScAttack, "scAttack", "Ataque", 0.1f, 200, 5, 20, "ms");
     f (ScRelease, "scRelease", "Release", 5, 2000, 150, 200, "ms");
     c (ScResponse, "scResponse", "Respuesta", "Nivel|Graves|Medios|Agudos|Brillo");
+    f (DroneFollow, "droneFollow", "Seguir", 0, 1, 0);
+    f (VelAttack, "velAttack", "Vel → Ataque", 0, 1, 0);
+    c (GrainSync, "grainSync", "Ritmo", "Libre|1/4|1/8|1/8T|1/16|1/16T|1/32");
+    b (MstValveOn, "mstValveOn", "Válvula", false);
+    f (MstAmount, "mstAmount", "Amount", 0, 100, 35, 0, "%");
+    f (MstCharacter, "mstCharacter", "Character", 0, 100, 50, 0, "%");
+    f (MstOutput, "mstOutput", "Output", -24, 12, 0, 0, "dB");
+    b (MstLimiterOn, "mstLimiterOn", "Limitador", true);
+    f (MstCeiling, "mstCeiling", "Techo", -12, -0.1f, -1, 0, "dBTP");
 
     // Slot ids and names must outlive the defs, so they live in static storage.
     static std::vector<std::string> strings;
@@ -273,6 +282,8 @@ static juce::String hostName (int index)
         return "Env 2 " + name;
     if (index >= Lfo1Rate && index < Macro1)
         return "LFO " + juce::String (1 + (index - Lfo1Rate) / lfoStride) + " " + name;
+    if (index >= MstValveOn && index <= MstCeiling)
+        return "Master " + name;
     if (index >= M1Src && index < FxMainLevel)
         return "Mod " + juce::String (1 + (index - M1Src) / slotStride) + " " + name;
     return name;
@@ -304,6 +315,20 @@ juce::AudioProcessorValueTreeState::ParameterLayout createLayout()
                 juce::NormalisableRange<float> range (d.min, d.max, d.step);
                 if (d.centre > d.min && d.centre < d.max)
                     range.setSkewForCentre (d.centre);
+                if (i == MstCharacter)
+                {
+                    // TRANSPARENT (0) - WARM (50) - BODY (100), with the number
+                    layout.add (std::make_unique<juce::AudioParameterFloat> (
+                        pid, name, range, d.def,
+                        juce::AudioParameterFloatAttributes()
+                            .withStringFromValueFunction ([] (float v, int)
+                            {
+                                const auto n = juce::String (juce::roundToInt (v));
+                                return (v < 25.0f ? "Transp. " : v < 75.0f ? "Warm " : "Body ") + n;
+                            })
+                            .withValueFromStringFunction ([] (const juce::String& t) { return t.retainCharacters ("0123456789.").getFloatValue(); })));
+                    break;
+                }
 
                 layout.add (std::make_unique<juce::AudioParameterFloat> (
                     pid, name, range, d.def,

@@ -90,6 +90,14 @@ enum Id : int
     SustainMotion,
     // The sidechain as a source of the matrix: how much it is raised, how its level is followed, and what of it.
     ScSens, ScAttack, ScRelease, ScResponse,
+    // Engine F: its drawn filter follows how the sample's colour changes in time (0: still, as before).
+    DroneFollow,
+    // Soft notes take longer to rise (0: as before); engine E's grains born on the host's tempo (0 Libre: as before).
+    VelAttack, GrainSync,
+    // MASTER (24-11-2026): the valve (on, how much, its character), the gain after it, and the true peak limiter at
+    // the very end (on, its ceiling). Off by default, the limiter on at -1 dBTP: older projects sound as before
+    // wherever the old stage was clean.
+    MstValveOn, MstAmount, MstCharacter, MstOutput, MstLimiterOn, MstCeiling,
 
     // FX slots follow: type, on, mix and fxParamsPerSlot generic values each.
     FxSlotBase

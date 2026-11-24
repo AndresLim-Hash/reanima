@@ -9,6 +9,7 @@
 #include "PluginProcessor.h"
 #include "FactoryPresets.h"
 #include "FxRack.h"
+#include "DroneStretch.h"
 #include <cstdio>
 #include <chrono>
 #include <functional>
@@ -571,6 +572,16 @@ int main (int argc, char* argv[])
         return 1;
     }
     juce::ScopedJuceInitialiser_GUI juce;
+    if (const char* anti = std::getenv ("SUSTAIN_ANTIPHASE"))  // SUSTAIN_ANTIPHASE=0: sustain sources as before (A/B)
+        SampleAnalysis::setSustainNoAntiphase (std::atoi (anti) != 0);
+    if (const char* rel = std::getenv ("LOOP_RELEASE"))
+        SampleAnalysis::setLoopReleaseFromHits (std::atoi (rel) != 0);
+    if (const char* start = std::getenv ("DRONE_START"))   // DRONE_START=0: engine F comes in as before (A/B)
+        SynthEngine::setDroneGrainStart (std::atoi (start) != 0);
+    if (const char* lock = std::getenv ("DRONE_TRUE"))     // DRONE_TRUE=0: engine F as PaulStretch, a random phase per bin (A/B)
+        Drone::setTrueFrequency (std::atoi (lock) != 0);
+    if (const char* half = std::getenv ("HALF_RATE"))     // HALF_RATE=0: engine F at the full rate (A/B)
+        SynthEngine::setHalfRateDrone (std::atoi (half) != 0);
     if (juce::String (argv[1]) == "suite" && argc > 6)
         return suite (argc, argv);
     if (juce::String (argv[1]) == "memoria" && argc > 2)
@@ -649,7 +660,7 @@ int main (int argc, char* argv[])
     const int engine = argc > 2 ? std::atoi (argv[2]) : 0;
     const int unison = argc > 3 ? std::atoi (argv[3]) : 1;
     const int block = argc > 4 ? std::atoi (argv[4]) : 256;
-    const double rate = 44100.0;
+    const double rate = std::getenv ("CPUBENCH_RATE") != nullptr ? std::atof (std::getenv ("CPUBENCH_RATE")) : 44100.0;   // CPUBENCH_RATE: another rate
 
     ReanimaProcessor proc;
     useHostTempo (proc);
@@ -691,7 +702,7 @@ int main (int argc, char* argv[])
                  proc.paramValue (P::SustainType) > 0.5f ? "Sostenido" : "Natural", (int) proc.paramValue (P::WarpMode));
 
     if (auto smp = proc.getSample())
-        std::printf ("file %d, beds %d / %d samples, pitched %d, tonesHold %d, cycle %.1f\n", smp->length, smp->bedBright.length, smp->bedDark.length, (int) smp->pitched, (int) smp->tonesHold, smp->cycle);
+        std::printf ("file %d, beds %d / %d samples, pitched %d, tonesHold %d, cycle %.1f, partials %d x %d, colour %d\n", smp->length, smp->bedBright.length, smp->bedDark.length, (int) smp->pitched, (int) smp->tonesHold, smp->cycle, smp->partials.numFrames, smp->partials.numPartials, (int) smp->colourBands.size());
     if (const char* path = std::getenv ("CPUBENCH_DUMP"))
         b.dump = std::fopen (path, "wb");
     b.run ("1 voice, short", held ({ 60 }, 0.1, 0.4), 12);

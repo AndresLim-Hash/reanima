@@ -421,6 +421,14 @@ ReanimaEditor::ReanimaEditor (ReanimaProcessor& p)
                                           "uses el dado o vuelvas a abrir el proyecto."));
     content.addAndMakeVisible (*snapToggle);
 
+    originalButton.setClickingTogglesState (true);
+    originalButton.setColour (juce::TextButton::buttonOnColourId, Theme::good.withAlpha (0.55f));
+    originalButton.setTooltip (P::u8 ("Para comparar: mientras está encendido, las notas que toques suenan como el sample tal cual "
+                                      "(motor A con su envolvente, sin filtro, Mecanismo, modulación ni efectos), a tu Volumen. "
+                                      "Las que ya suenan no cambian. No se guarda con el proyecto."));
+    originalButton.onClick = [this] { proc.engine.listenOriginal.store (originalButton.getToggleState()); };
+    content.addAndMakeVisible (originalButton);
+
     engineChoice = make<Choice> (state, P::Engine, false);
     content.addAndMakeVisible (*engineChoice);
 
@@ -828,6 +836,7 @@ void ReanimaEditor::buildSamplePage()
     for (const int id : { P::GrainMs, P::GrainDensity, P::Spray })
         onlyFor (motor.add (make<Knob> (st, id)), { E });
     onlyFor (motor.add (make<Toggle> (st, P::GrainCoherent), 1.0f, 28), { E });
+    onlyFor (motor.add (make<Choice> (st, P::GrainSync), 0.8f), { E });
     motor.row();
     for (const int id : { P::GranSpeed, P::GrainPitch, P::GrainReverse, P::GrainWidth })
         onlyFor (motor.add (make<Knob> (st, id)), { E });
@@ -882,7 +891,7 @@ void ReanimaEditor::buildSamplePage()
     droneCurve = &spectrum.add (make<DroneCurveView> (proc));
     views.push_back (droneCurve);
     spectrum.row();
-    for (const int id : { P::DroneHarm, P::DroneHarmWidth, P::DroneTonal, P::DroneSpread, P::DroneShift })
+    for (const int id : { P::DroneHarm, P::DroneHarmWidth, P::DroneTonal, P::DroneSpread, P::DroneShift, P::DroneFollow })
     {
         auto& knob = spectrum.add (make<Knob> (st, id));
         if (id == P::DroneHarmWidth)
@@ -987,6 +996,7 @@ void ReanimaEditor::buildSamplePage()
         return oneShot() && rebuildEngine() && sample != nullptr && proc.paramValue (P::AmpA) * 0.001f < sample->detected.attack;
     });
     amp.add (make<Knob> (st, P::VelAmp));
+    amp.add (make<Knob> (st, P::VelAttack));
 
     auto& voice = addSection (samplePage, P::u8 ("VOZ · AFINACIÓN"), {}, Theme::violet);
     voicePanel = &voice;
@@ -2074,6 +2084,8 @@ void ReanimaEditor::resized()
     if (browser != nullptr)
         browser->setBounds (tabs.getBounds().withTrimmedTop (tabDepth).reduced (margin, 4));
     snapToggle->setBounds (card.removeFromRight (78));
+    card.removeFromRight (4);
+    originalButton.setBounds (card.removeFromRight (64).reduced (0, 7));
     card.reduce (10, -3);
     sampleLabel.setBounds (card.removeFromTop (card.getHeight() / 2 + 2));
     rootLabel.setBounds (card);
@@ -2319,6 +2331,15 @@ void ReanimaEditor::updateSampleInfo()
 
     if (! s->pitched)
     {
+        if (s->nameRoot >= 0 && proc.usesNameRoot())
+        {
+            static const char* names[] = { "Do", "Do#", "Re", "Re#", "Mi", "Fa", "Fa#", "Sol", "Sol#", "La", "La#", "Si" };
+            juce::String text = P::u8 ("Sin nota clara · por su nombre: ") + P::u8 (names[s->nameRoot]);
+            text << (proc.paramValue (P::SnapC) > 0.5f ? juce::String::formatted (" (%+.0f st en Do3)", (double) SynthEngine::snapShift (*s, true, true))
+                                                       : P::u8 (" · Do3 lo toca tal cual"));
+            rootLabel.setText (text, juce::dontSendNotification);
+            return;
+        }
         rootLabel.setText (P::u8 ("Sin nota clara · Do3 lo toca tal cual"), juce::dontSendNotification);
         return;
     }

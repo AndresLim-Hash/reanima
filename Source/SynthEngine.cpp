@@ -768,13 +768,13 @@ struct GrainReader : GrainCloud
 // whole periods for pitched sounds so the grains stay in phase.
 struct LoopGrains : GrainCloud
 {
-    // Audit 23-11 (docs/auditoria_tecnica_2026-11-23.md), off until approved by ear: a grain started every quarter
+    // Audit 23-11 (docs/auditoria_tecnica_2026-11-23.md), on since the user approved it (23-11): a grain started every quarter
     // of a grain from the same place repeats every len/4 samples, and that repetition is a comb on a grid of
     // 4 / grain seconds (50 Hz with 80 ms grains): every partial of the sustain moved to the nearest line of it (a tone
     // of 440 Hz held at 450 Hz; partials of real samples off by 40 to 96 cents). With this on, a sound with a period
     // has its grains started a whole number of its periods apart at the output (they meet in phase: the pitch it has),
     // and one without, at varied intervals (no grid).
-    static inline bool inTune = false;
+    static inline bool inTune = true;
     static inline bool alwaysVaried = false;      // A/B: varied intervals for every sound, the period never used
     double carry = 0.0;
 
@@ -1372,7 +1372,38 @@ struct CloudSettings
     float reverseChance = 0.0f;
     float width = 0.0f;
     double period = 0.0;            // Coherente (engine E): the note's period in samples of the sample; 0 off
+    bool regular = false;           // Ritmo (engine E): grains at exact intervals (on the tempo), no chance in them
 };
+
+// Twice the rate: a half-band interpolator (Kaiser, 95 taps on the fine grid). For engine F at 88.2/96 kHz, which
+// works at half the rate and comes up to the host's here (approved 23-11). Flat to 20 kHz at 96 kHz (+-0.0001 dB),
+// images over 28 kHz 109 dB down; at 88.2 kHz -0.12 dB at 20 kHz, and what is left of the images lies over 22 kHz.
+// Each input sample gives two: the input delayed, and the one halfway after it.
+struct HalfBandUp
+{
+    static constexpr int half = 24;                 // odd taps each side
+    static constexpr float odd[2 * half] { -5.007594733e-06f, 1.891792794e-05f, -5.008427491e-05f, 1.110135849e-04f, -2.196807195e-04f, 4.007371246e-04f, -6.867013944e-04f, 1.119096647e-03f, -1.749541273e-03f, 2.640874335e-03f, -3.868519991e-03f, 5.522494227e-03f, -7.710786464e-03f, 1.056542169e-02f, -1.425357557e-02f, 1.899825472e-02f, -2.511770491e-02f, 3.310375014e-02f, -4.378834364e-02f, 5.873485253e-02f, -8.130223845e-02f, 1.202640091e-01f, -2.079001693e-01f, 6.351723780e-01f, 6.351723780e-01f, -2.079001693e-01f, 1.202640091e-01f, -8.130223845e-02f, 5.873485253e-02f, -4.378834364e-02f, 3.310375014e-02f, -2.511770491e-02f, 1.899825472e-02f, -1.425357557e-02f, 1.056542169e-02f, -7.710786464e-03f, 5.522494227e-03f, -3.868519991e-03f, 2.640874335e-03f, -1.749541273e-03f, 1.119096647e-03f, -6.867013944e-04f, 4.007371246e-04f, -2.196807195e-04f, 1.110135849e-04f, -5.008427491e-05f, 1.891792794e-05f, -5.007594733e-06f };
+    std::array<float, 4 * half> history {};         // the newest last, twice over (no wrap when reading)
+    int at = 0;
+
+    void reset() noexcept { history.fill (0.0f); at = 0; }
+
+    void push (float x, float& first, float& second) noexcept
+    {
+        history[(size_t) at] = history[(size_t) at + 2 * half] = x;
+        at = (at + 1) % (2 * half);
+        const float* h = history.data() + at;       // h[0] oldest ... h[2 half - 1] newest
+        float sum = 0.0f;
+        for (int j = 0; j < 2 * half; ++j)
+            sum += odd[j] * h[2 * half - 1 - j];
+        first = h[half];                            // the sample the interpolated one follows
+        second = sum;
+    }
+};
+
+inline bool halfRateDroneOn = true;      // SynthEngine::setHalfRateDrone
+inline bool droneGrainStartOn = true;    // SynthEngine::setDroneGrainStart
+inline bool droneHitAsIs = true;         // SynthEngine::setDroneHitAsIs: engine F plays a low hit as A does (A/B)
 
 struct GranularCloud
 {
@@ -1450,7 +1481,7 @@ struct GranularCloud
                     pos = reading + std::round ((pos - reading) / c.period) * c.period;
                 spawn (backwards ? pos + grainStep * c.size : pos, backwards ? -grainStep : grainStep, c.size,
                        c.width * (rng.nextFloat() * 2.0f - 1.0f));
-                untilNext += coherent ? interval : interval * (0.75 + 0.5 * rng.nextDouble());
+                untilNext += coherent || c.regular ? interval : interval * (0.75 + 0.5 * rng.nextDouble());
             }
             if (coherent)
                 reading += step;
@@ -1539,6 +1570,7 @@ public:
     float pressure = 0.0f;      // polyphonic aftertouch of this voice's key
     bool onPrevious = false;    // started before the sample's analysis was extended: plays that one to its end
     int channel = 1;            // the MIDI channel it was played on (MPE: its own)
+    bool original = false;      // started under Original (CP9): plays with engine.originalParams, after the effects
 
     // MPE of this note: bend in semitones, pressure 0-1, and how much brighter its timbre makes it (octaves).
     float mpeBend() const noexcept
@@ -1553,6 +1585,17 @@ public:
 
     void start (const SampleData& s, const ParamSnapshot& p, int newNote, float vel, float fromPitch, juce::uint32 newOrder)
     {
+        // The engine this note keeps to its end, release included: a change of Motor is for the notes that come
+        // after it. Changed under a sounding note, its algorithm changed in one go and the note jumped or died
+        // (to C at -59 dB, to F cut: C and F set their state up when the note starts). Approved 23-11.
+        noteEngine = (int) p[P::Engine];
+        followStarted = false;
+        original = false;           // (noteOn marks it again when it starts under Original)
+        droneHalf = false;
+        resynthHalf = halfRateDroneOn && hostRate >= 88000.0 && noteEngine == P::EngineResynth;
+        halfUp[0].reset();
+        halfUp[1].reset();
+        halfPending = false;
         // Each note's chance (grains, noise, Drone's phases, Mecanismo) from a seed of its own: drawn from the
         // engine's sequence (a different one for every note), or in the tests from its key alone, so that a note
         // sounds the same alone or among others. Before, each voice went on with its own sequence from note to
@@ -1615,7 +1658,7 @@ public:
 
         // Per-partial constants for engine C: brightness weight and stereo position.
         const auto& pm = s.partials;
-        const bool usesPartials = (int) p[P::Engine] == P::EngineResynth && pm.valid();
+        const bool usesPartials = noteEngine == P::EngineResynth && pm.valid();
         if (usesPartials)
         {
             const int ref = juce::jlimit (0, pm.numFrames - 1, (int) std::round ((s.peak + 0.03 * s.sampleRate) / pm.hop));
@@ -1730,12 +1773,20 @@ public:
         if (playingEngine (s, p) == P::EngineDrone && (int) p[P::PlayMode] != P::PlayLoop)
         {
             drone = engine.acquireDrone();
+            droneHalf = halfRateDroneOn && hostRate >= 88000.0;
+            halfUp[0].reset();
+            halfUp[1].reset();
+            halfPending = false;
             if (drone != nullptr)
             {
                 const auto d = droneSettings (s, p);
                 const double from = s.readingPosition (p[P::GrainPos] + mod[P::DstStart]);
-                drone->start (juce::jlimit (d.regionStart, d.regionEnd - 1.0, from), d.order,
-                              std::max ((1 << d.order) / 4, 2 * engine.lastBlock), rng.nextInt64());
+                droneDelay = std::max ((1 << d.order) / 4, 2 * droneSamples (engine.lastBlock));
+                droneFrame = 1 << d.order;
+                droneClock = 0.0;
+                dronePreroll = droneGrainStartOn;
+                droneSpan = (1 << d.order) * d.rateRatio;
+                drone->start (juce::jlimit (d.regionStart, d.regionEnd - 1.0, from), d.order, droneDelay, rng.nextInt64());
             }
         }
     }
@@ -1743,20 +1794,21 @@ public:
     // Engine F: how many blocks this note's next frame can wait, and one stage of it.
     int droneSlack (const ParamSnapshot& p, int blockSize) const noexcept
     {
-        return drone != nullptr && (int) p[P::Engine] == P::EngineDrone ? drone->slack (blockSize) : std::numeric_limits<int>::max();
+        return drone != nullptr && noteEngine == P::EngineDrone ? drone->slack (droneSamples (blockSize)) : std::numeric_limits<int>::max();
     }
 
     // Engine F: when this note's frame is due, then how far along it is (for the order of the work).
     std::pair<int, int> droneOrder (const ParamSnapshot& p) const noexcept
     {
-        if (drone == nullptr || (int) p[P::Engine] != P::EngineDrone)
+        if (drone == nullptr || noteEngine != P::EngineDrone)
             return { std::numeric_limits<int>::max(), 0 };
-        return { drone->deadline(), -drone->progress() };
+        const int due = drone->deadline();
+        return { droneHalf && due != std::numeric_limits<int>::max() ? 2 * due : due, -drone->progress() };
     }
 
     double droneDemand (const ParamSnapshot& p, int blockSize) const noexcept
     {
-        return drone != nullptr && (int) p[P::Engine] == P::EngineDrone ? drone->demand (blockSize) : 0.0;
+        return drone != nullptr && noteEngine == P::EngineDrone ? drone->demand (droneSamples (blockSize)) : 0.0;
     }
 
     void droneStep (const SampleData& s, const ParamSnapshot& p)
@@ -1827,14 +1879,16 @@ public:
         pitchEnv = p[P::PitchEnvAmt] != 0.0f ? p[P::PitchEnvAmt] * std::exp (-(float) t * 5.0f / std::max (0.001f, p[P::PitchEnvTime] * 0.001f)) : 0.0f;
 
         const bool hold = (int) p[P::SustainType] == P::SustainHold;
-        const AdsrShape user { std::max (1.0e-4f, p[P::AmpA] * 0.001f), p[P::AmpCurve], std::max (1.0e-3f, p[P::AmpD] * 0.001f),
+        // Vel -> Ataque (CP9): a soft note rises more slowly, up to four times the Ataque at the lowest velocity.
+        const float velAttack = 1.0f + 3.0f * p[P::VelAttack] * (1.0f - juce::jlimit (0.0f, 1.0f, velocity));
+        const AdsrShape user { std::max (1.0e-4f, p[P::AmpA] * 0.001f * velAttack), p[P::AmpCurve], std::max (1.0e-3f, p[P::AmpD] * 0.001f),
                                p[P::AmpS], hold ? 0.0f : p[P::AmpFade], std::max (1.0e-3f, p[P::AmpR] * 0.001f) };
         // LOOP: the loop player instead of the engine; the envelope is a gate (Ataque and Release its fades).
         const bool looping = (int) p[P::PlayMode] == P::PlayLoop && s.length > 0;
         const int engineMode = playingEngine (s, p);
         const bool rebuild = ! looping && engineMode == P::EngineRebuild && s.bedBright.length > 0;
         // Sintetizador: the sample is flattened into a steady tone and the ADSR shapes it from zero.
-        const bool synth = ! looping && (int) p[P::EnvMode] == P::EnvSynth && (int) p[P::Engine] <= P::EngineHybrid;
+        const bool synth = ! looping && (int) p[P::EnvMode] == P::EnvSynth && noteEngine <= P::EngineHybrid;
         const float flatten = synth ? 1.0f : p[P::Flatten];
         const bool untouched = rebuild && ! synth && matchesSample (s, user, hold);
         const bool resynth = ! looping && engineMode == P::EngineResynth && s.partials.valid();
@@ -2022,8 +2076,13 @@ public:
         else if (engineMode == P::EngineDrone)
         {
             synthetic = 1.0f;
-            if (drone != nullptr)
+            updateFollow (s, p, num);
+            if (drone != nullptr && ! droneHalf)
                 drone->render (s, droneSettings (s, p), *engine.droneShared, uArr.data(), bufL.data(), bufR.data(), num);
+            else if (drone != nullptr)
+                renderDroneHalf (s, p, num);
+            if (drone != nullptr && dronePreroll)
+                renderDroneStart (s, num);
             alive = true;
         }
         else if (rebuild)
@@ -2031,7 +2090,8 @@ public:
         else if (resynth)
         {
             synthetic = 1.0f;
-            alive = renderResynth (s, p, num, user, hold || synth, flatten, bow, breath, relPhase);
+            alive = resynthHalf ? renderResynthHalf (s, p, num, user, hold || synth, flatten, bow, breath, relPhase)
+                                : renderResynth (s, p, num, user, hold || synth, flatten, bow, breath, relPhase);
         }
         else
         {
@@ -2115,6 +2175,217 @@ private:
     };
 
     //--------------------------------------------------------------------------
+    int noteEngine = 0;             // the Motor this note started with (see start)
+
+    // Engine F at 88.2/96 kHz works at half the rate (the same FFT length in seconds, half the work) and comes up
+    // to the host's through a half-band interpolator. Chosen when the note starts. Off: as before (for A/B).
+    bool droneHalf = false;
+    HalfBandUp halfUp[2];
+    bool halfPending = false;               // a sample made in the last block and not played yet
+    float pendingL = 0.0f, pendingR = 0.0f;
+    std::array<float, subBlock> halfGain {}, halfL {}, halfR {};
+    double droneRate() const noexcept { return droneHalf ? 0.5 * hostRate : hostRate; }
+    int droneSamples (int hostSamples) const noexcept { return droneHalf ? (hostSamples + 1) / 2 : hostSamples; }
+
+    // Engine C at 88.2/96 kHz, the same way (approved 23-11): the resynthesis runs for half as many samples with the
+    // rate halved and the lanes reading twice as far per sample (the same pitch and timing), its envelopes taken every
+    // other sample, and comes up to the host's rate through the interpolator. Above 22 kHz a 44.1/48 kHz
+    // resynthesis has nothing; the sample's own partials up there are left out.
+    bool resynthHalf = false;
+    std::array<float, subBlock> keepU {}, keepRel {}, keepTrans {};
+
+    bool renderResynthHalf (const SampleData& s, const ParamSnapshot& p, int num, const AdsrShape& user, bool hold,
+                            float flatten, float bow, float breath, float relPhase)
+    {
+        const int o = halfPending ? 1 : 0;
+        const int m = (num - o + 1) / 2;
+        if (m <= 0)
+        {
+            bufL[0] += pendingL;
+            bufR[0] += pendingR;
+            halfPending = false;
+            return true;
+        }
+        std::copy (uArr.begin(), uArr.begin() + num, keepU.begin());
+        std::copy (relArr.begin(), relArr.begin() + num, keepRel.begin());
+        std::copy (wTrans.begin(), wTrans.begin() + num, keepTrans.begin());
+        for (int j = 0; j < m; ++j)
+        {
+            const size_t at = (size_t) std::min (num - 1, o + 2 * j);
+            uArr[(size_t) j] = keepU[at];
+            relArr[(size_t) j] = keepRel[at];
+            wTrans[(size_t) j] = keepTrans[at];
+        }
+        hostRate *= 0.5;
+        for (int i = 0; i < numLanes; ++i)
+            lanes[(size_t) i].step *= 2.0;
+        const bool alive = renderResynth (s, p, m, user, hold, flatten, bow, breath, relPhase);
+        hostRate *= 2.0;
+        for (int i = 0; i < numLanes; ++i)
+            lanes[(size_t) i].step *= 0.5;
+        std::copy (bufL.begin(), bufL.begin() + m, halfL.begin());
+        std::copy (bufR.begin(), bufR.begin() + m, halfR.begin());
+        std::fill (bufL.begin(), bufL.begin() + num, 0.0f);
+        std::fill (bufR.begin(), bufR.begin() + num, 0.0f);
+        std::copy (keepU.begin(), keepU.begin() + num, uArr.begin());
+        std::copy (keepRel.begin(), keepRel.begin() + num, relArr.begin());
+        std::copy (keepTrans.begin(), keepTrans.begin() + num, wTrans.begin());
+
+        int at = 0;
+        if (halfPending)
+        {
+            bufL[0] = pendingL;
+            bufR[0] = pendingR;
+            halfPending = false;
+            at = 1;
+        }
+        for (int j = 0; j < m; ++j)
+        {
+            float l0, l1, r0, r1;
+            halfUp[0].push (halfL[(size_t) j], l0, l1);
+            halfUp[1].push (halfR[(size_t) j], r0, r1);
+            bufL[(size_t) at] += l0;
+            bufR[(size_t) at] += r0;
+            ++at;
+            if (at < num)
+            {
+                bufL[(size_t) at] += l1;
+                bufR[(size_t) at] += r1;
+                ++at;
+            }
+            else
+            {
+                pendingL = l1;
+                pendingR = r1;
+                halfPending = true;
+            }
+        }
+        return alive || halfPending;
+    }
+
+    // Engine F from the first moment (approved for A/B 23-11): a drone's frames are long (0.34 s by default), so
+    // its sound came in over the first 0.2 s, the first frame due a quarter of one in and rising under its window.
+    // Working its frames out at once would cost a whole frame's FFTs in one block for every note of a chord (16 ms
+    // for eight notes, against 1.3 ms of time in a block of 64): instead, grains from the point it reads fill what
+    // the drone does not yet have, at its level, and give way to it in equal power as its frames arrive.
+    bool dronePreroll = false;
+    int droneDelay = 0, droneFrame = 1;
+    double droneClock = 0.0;                // the drone's samples since the note started
+    double droneSpan = 0.0;                 // a frame of the drone, in samples of the sample
+
+    // Seguir (CP5): the drone's filter moves with the sample's colour as it changed when it played, read at the
+    // sample's own speed from the note's start (round again from its onset once its sounding part is over), each
+    // band smoothed over 0.3 s, in dB on top of the drawn curve (or a flat one), within -24..+12 dB.
+    std::array<float, Drone::curvePoints> followCurve {}, followNow {};
+    bool followStarted = false;
+
+    void updateFollow (const SampleData& s, const ParamSnapshot& p, int num) noexcept
+    {
+        const auto& pm = s.partials;
+        if (p[P::DroneFollow] <= 0.0f || s.colourBands.empty() || pm.hop <= 0)
+            return;
+        const int frames = (int) s.colourBands.size() / Drone::curvePoints;
+        const double first = s.onset / pm.hop, span = std::max (1.0, (double) std::min (frames, pm.lastFrame + 1) - first);
+        const double at = std::fmod (t * s.sampleRate / pm.hop, span) + first;
+        const int f = juce::jlimit (0, frames - 1, (int) at);
+        const float* bands = s.colourBands.data() + (size_t) f * Drone::curvePoints;
+        const float coef = followStarted ? 1.0f - std::exp (-(float) num / (0.3f * (float) hostRate)) : 1.0f;
+        followStarted = true;
+        const float amount = p[P::DroneFollow];
+        for (int b = 0; b < Drone::curvePoints; ++b)
+        {
+            followNow[(size_t) b] += (bands[b] - followNow[(size_t) b]) * coef;
+            followCurve[(size_t) b] = juce::jlimit (-24.0f, 12.0f, amount * followNow[(size_t) b]);
+        }
+    }
+
+    // The share of its full power the drone has reached at time t (its own samples): the frames placed so far
+    // under their windows, squared (4 at 75 % overlap add up to 1.5).
+    double droneShare (double t) const noexcept
+    {
+        const double hop = droneFrame / 4.0;
+        double sum = 0.0;
+        for (int k = 0; k < 5; ++k)
+        {
+            const double x = (t - droneDelay - k * hop) / droneFrame;
+            if (x <= 0.0 || x >= 1.0)
+                continue;
+            const double w = 0.5 - 0.5 * std::cos (Dsp::twoPi * x);
+            sum += w * w;
+        }
+        return t - droneDelay >= 0.75 * droneFrame ? 1.0 : std::min (1.0, sum / 1.5);      // from then on, four frames overlap
+    }
+
+    void renderDroneStart (const SampleData& s, int num) noexcept
+    {
+        const double perSample = droneHalf ? 0.5 : 1.0;
+        const double pos = drone->position();
+        const float level = levelFor (s, pos);
+        bool any = false;
+        for (int i = 0; i < num; ++i)
+        {
+            const double share = droneShare (droneClock + i * perSample);
+            const float g = (float) std::sqrt (std::max (0.0, 1.0 - share));
+            texGain[(size_t) i] = uArr[(size_t) i] * level * g;
+            any = any || g > 0.0f;
+        }
+        droneClock += num * perSample;
+        dronePreroll = droneClock - droneDelay < 0.75 * droneFrame;
+        if (any)
+        {
+            // Grains over the middle half of what a frame of the drone reads (where its window weighs most; up to
+            // 0.1 s long, four at a time): they take the level and the colour of the frame. Short grains around the
+            // point were up to 10 dB off; spread over all of it, they read the silence around a hit.
+            CloudSettings c = textureCloud (s);
+            c.size = std::max (16, (int) (std::min (0.1, 0.25 * droneSpan / s.sampleRate) * hostRate));
+            c.interval = c.size / 4.0;
+            c.spray = 0.25 * droneSpan;
+            lanes[0].cloud.render (s, pos, lanes[0].step, c, rng, texGain.data(), bufL.data(), bufR.data(), num);
+        }
+    }
+
+    void renderDroneHalf (const SampleData& s, const ParamSnapshot& p, int num) noexcept
+    {
+        int o = 0;
+        if (halfPending)
+        {
+            bufL[0] += pendingL;
+            bufR[0] += pendingR;
+            halfPending = false;
+            o = 1;
+        }
+        const int m = (num - o + 1) / 2;
+        if (m <= 0)
+            return;
+        for (int j = 0; j < m; ++j)
+        {
+            halfGain[(size_t) j] = uArr[(size_t) std::min (num - 1, o + 2 * j)];
+            halfL[(size_t) j] = halfR[(size_t) j] = 0.0f;
+        }
+        drone->render (s, droneSettings (s, p), *engine.droneShared, halfGain.data(), halfL.data(), halfR.data(), m);
+        for (int j = 0; j < m; ++j)
+        {
+            float l0, l1, r0, r1;
+            halfUp[0].push (halfL[(size_t) j], l0, l1);
+            halfUp[1].push (halfR[(size_t) j], r0, r1);
+            bufL[(size_t) o] += l0;
+            bufR[(size_t) o] += r0;
+            ++o;
+            if (o < num)
+            {
+                bufL[(size_t) o] += l1;
+                bufR[(size_t) o] += r1;
+                ++o;
+            }
+            else
+            {
+                pendingL = l1;
+                pendingR = r1;
+                halfPending = true;
+            }
+        }
+    }
+
     void releaseDrone() noexcept
     {
         if (drone != nullptr)
@@ -2127,9 +2398,10 @@ private:
     Drone::Settings droneSettings (const SampleData& s, const ParamSnapshot& p) const
     {
         Drone::Settings d;
-        d.order = Drone::orderFor ((int) p[P::DroneSize], hostRate);
-        d.hostRate = hostRate;
-        d.rateRatio = s.sampleRate / hostRate;
+        const double rate = droneRate();
+        d.order = Drone::orderFor ((int) p[P::DroneSize], rate);
+        d.hostRate = rate;
+        d.rateRatio = s.sampleRate / rate;
         d.advance = p[P::DroneFreeze] > 0.5f ? 0.0 : d.rateRatio / std::max (1.0f, p[P::DroneStretch]);
         d.regionStart = s.onset;
         d.regionEnd = std::max (s.onset + 2.0, s.usableEnd);
@@ -2141,9 +2413,12 @@ private:
         d.shiftHz = p[P::DroneShift];
         d.width = p[P::DroneWidth];
         d.curve = p[P::DroneCurveOn] > 0.5f ? engine.droneCurve.data() : nullptr;
+        if (p[P::DroneFollow] > 0.0f && ! s.colourBands.empty())
+            d.colour = followCurve.data();      // the sample's colour, set in render
         d.keepFormants = (int) p[P::WarpMode] == P::WarpTones && s.pitched;   // as in the other engines
 
-        const float ratio = (float) (laneStep (s, p, 0.0f) / d.rateRatio);
+        // (laneStep is at the host's rate; at half the rate the source moves twice as far per sample: the same pitch)
+        const float ratio = (float) (laneStep (s, p, 0.0f) / d.rateRatio * (droneHalf ? 2.0 : 1.0));
         int n = 0;
         d.copyRatio[(size_t) n] = ratio;
         d.copyLevel[(size_t) n++] = 1.0f;
@@ -2185,9 +2460,9 @@ private:
     }
 
     // Do3 plays the sample as it is; with Snap a C, moved to the C nearest its note.
-    static float rootPitch (const SampleData& s, const ParamSnapshot& p)
+    float rootPitch (const SampleData& s, const ParamSnapshot& p) const
     {
-        return (float) SynthEngine::rootKey - SynthEngine::snapShift (s, p[P::SnapC] > 0.5f);
+        return (float) SynthEngine::rootKey - SynthEngine::snapShift (s, p[P::SnapC] > 0.5f, engine.nameRootOn.load (std::memory_order_relaxed));
     }
 
     // The note that sounds, in MIDI: the sample's own note moved as the voice moves it, or the
@@ -2307,6 +2582,13 @@ private:
         CloudSettings c;
         c.size = std::max (16, (int) (p[P::GrainMs] * 0.001f * (float) hostRate));
         c.interval = hostRate / std::max (1.0f, p[P::GrainDensity]);
+        // Ritmo (CP9): grains born on the host's tempo, at exact intervals.
+        if (const int sync = (int) p[P::GrainSync]; sync > 0)
+        {
+            static constexpr double beats[] = { 0.0, 1.0, 0.5, 1.0 / 3.0, 0.25, 1.0 / 6.0, 0.125 };
+            c.interval = std::max (1.0, beats[juce::jlimit (1, 6, sync)] * 60.0 / std::max (20.0, engine.bpm) * hostRate);
+            c.regular = true;
+        }
         c.spray = juce::jlimit (0.0f, 1.0f, p[P::Spray] + mod[P::DstSpray]) * 0.25 * s.sampleRate;
         c.pitchSpread = p[P::GrainPitch];
         c.reverseChance = p[P::GrainReverse];
@@ -2334,12 +2616,12 @@ private:
     // hi-hat of 25 ms against grains of 80 ms) or a low hit with nothing held after it (a kick), what came out was
     // silence, or, made to sound, a stutter and a smeared rumble (judged by ear on 2026-11-22). Those play the hit
     // as engine A does.
-    static int playingEngine (const SampleData& s, const ParamSnapshot& p) noexcept
+    int playingEngine (const SampleData& s, const ParamSnapshot& p) const noexcept
     {
-        const int chosen = (int) p[P::Engine];
+        const int chosen = noteEngine;
         if (chosen != P::EngineGranular && chosen != P::EngineDrone)
             return chosen;
-        const bool lowHit = s.excitation.sustain < 0.3f && s.excitation.lowShare > 0.5f;
+        const bool lowHit = s.excitation.sustain < 0.3f && s.excitation.lowShare > 0.5f && (chosen == P::EngineGranular || droneHitAsIs);
         const bool shorterThanGrain = chosen == P::EngineGranular && (s.usableEnd - s.onset) / s.sampleRate < p[P::GrainMs] * 0.001f;
         return lowHit || shorterThanGrain ? (int) P::EngineRebuild : chosen;
     }
@@ -4424,6 +4706,16 @@ void SynthEngine::prepare (double sr)
     for (auto& v : voices)
         v->prepare (sr);
     fx->prepare (sr);
+    {
+        // 4 ms of fade and a sub-block, at any rate
+        const int size = juce::nextPowerOfTwo ((int) std::ceil (0.004 * sr) + 2 * subBlock);
+        for (auto& t : stolenTail)
+            t.assign ((size_t) size, 0.0f);
+        stolenMask = size - 1;
+        voicesRendered = stolenUntil = 0;
+    }
+    for (auto& b : originalBuf)
+        b.assign (65536, 0.0f);
     reset();
 }
 
@@ -4566,6 +4858,8 @@ void SynthEngine::reset()
 {
     for (auto& v : voices)
         v->stopImmediately();
+    for (auto& t : stolenTail)
+        std::fill (t.begin(), t.end(), 0.0f);
     fx->reset();
     heldNotes.clear();
     pedalDown = false;
@@ -4791,9 +5085,16 @@ bool SynthEngine::tonesFallBack (const SampleData& s, int engine) noexcept
         && (engine == P::EngineRebuild || engine == P::EngineReenvelope || engine == P::EngineHybrid);
 }
 
-float SynthEngine::snapShift (const SampleData& s, bool snap) noexcept
+float SynthEngine::snapShift (const SampleData& s, bool snap, bool nameRoot) noexcept
 {
-    return s.pitched && snap ? (float) s.nearestC() - s.rootMidi : 0.0f;
+    if (! snap)
+        return 0.0f;
+    if (s.pitched)
+        return (float) s.nearestC() - s.rootMidi;
+    // the note of its name moved to the nearest C (an F down 5, a G up 5)
+    if (nameRoot && s.nameRoot >= 0)
+        return (float) (s.nameRoot <= 6 ? -s.nameRoot : 12 - s.nameRoot);
+    return 0.0f;
 }
 
 // Play con el host: while the host plays, one voice plays the loop where the host is; it stops when the host
@@ -4811,7 +5112,7 @@ void SynthEngine::manageTransport (const ParamSnapshot& p)
         transportVoice = nullptr;
     }
     if (want && transportVoice == nullptr)
-        if (auto* v = allocateVoice())
+        if (auto* v = allocateVoice (p))
         {
             v->channel = 1;
             transportPpqNow = hostPpq;
@@ -4832,6 +5133,32 @@ void SynthEngine::process (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
     takeBeatCuts();
     manageTransport (p);
     grainBudget = 6;
+
+    // Original (CP9): the settings of an instance just opened with this sample (engine A, its detected envelope),
+    // at the Volumen set, for the notes that start while it is on and until they end.
+    bool anyOriginal = listenOriginal.load (std::memory_order_relaxed);
+    for (auto& v : voices)
+        anyOriginal = anyOriginal || (v->isActive() && v->original);
+    if (anyOriginal && sample != nullptr)
+    {
+        const auto& defs = P::defs();
+        for (int i = 0; i < P::Count; ++i)
+            originalParams[(size_t) i] = defs[(size_t) i].def;
+        const auto set = [this, &defs] (int index, float v) { originalParams[(size_t) index] = juce::jlimit (defs[(size_t) index].min, defs[(size_t) index].max, v); };
+        const auto& det = sample->detected;
+        set (P::AmpA, det.attack * 1000.0f);
+        set (P::AmpCurve, det.curve);
+        set (P::AmpD, det.decay * 1000.0f);
+        set (P::AmpS, det.sustain);
+        set (P::AmpFade, det.fadeDbPerSec);
+        set (P::AmpR, det.release * 1000.0f);
+        set (P::TransientMs, sample->transientMs);
+        originalParams[P::Engine] = (float) P::EngineRebuild;
+        originalParams[P::StartPos] = sample->length > 0 ? (float) (sample->onset / sample->length) : 0.0f;
+        originalParams[P::Volume] = p[P::Volume];
+        originalParams[P::MonoBass] = p[P::MonoBass];
+        originalParams[P::PolyMode] = p[P::PolyMode];
+    }
 
     const int n = buffer.getNumSamples();
     int pos = 0;
@@ -4897,6 +5224,17 @@ void SynthEngine::process (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
     if (pos < n)
         renderVoices (buffer, pos, n - pos, p);
     fx->process (buffer, p, bpm);
+    if (originalVoices)
+    {
+        // Original's notes, after the effects (they have none)
+        const int m = std::min (n, (int) originalBuf[0].size());
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            juce::FloatVectorOperations::add (buffer.getWritePointer (ch), originalBuf[(size_t) ch].data(), m);
+            juce::FloatVectorOperations::clear (originalBuf[(size_t) ch].data(), m);
+        }
+        originalVoices = false;
+    }
     setSidechain (nullptr, nullptr, 0);     // given again for each block: never read after the host's buffer is gone
 
     const float monoTarget = p[P::MonoOut] > 0.5f ? 1.0f : 0.0f;
@@ -5016,6 +5354,21 @@ void SynthEngine::process (juce::AudioBuffer<float>& buffer, const juce::MidiBuf
     }
 }
 
+void SynthEngine::setDroneHitAsIs (bool on) noexcept
+{
+    droneHitAsIs = on;
+}
+
+void SynthEngine::setDroneGrainStart (bool on) noexcept
+{
+    droneGrainStartOn = on;
+}
+
+void SynthEngine::setHalfRateDrone (bool on) noexcept
+{
+    halfRateDroneOn = on;
+}
+
 void SynthEngine::setGranularSustainInTune (bool on, bool varied) noexcept
 {
     LoopGrains::inTune = on;
@@ -5098,11 +5451,34 @@ void SynthEngine::renderVoices (juce::AudioBuffer<float>& buffer, int start, int
         if (sample != nullptr)
         {
             transportPpqNow = hostPpq + (start + done) / sampleRate * bpm / 60.0;
+            const bool apart = start + done + chunk <= (int) originalBuf[0].size();
             for (auto& v : voices)
                 if (v->isActive())
-                    v->render (L + start + done, R + start + done, chunk, sampleFor (*v), p);
+                {
+                    if (v->original)
+                    {
+                        originalVoices = true;
+                        if (apart)
+                            v->render (originalBuf[0].data() + start + done, originalBuf[1].data() + start + done, chunk, sampleFor (*v), originalParams);
+                        else
+                            v->render (L + start + done, R + start + done, chunk, sampleFor (*v), originalParams);
+                    }
+                    else
+                        v->render (L + start + done, R + start + done, chunk, sampleFor (*v), p);
+                }
             pedalNoise->process (L + start + done, R + start + done, chunk, *sample);
         }
+        if (stolenMask > 0 && voicesRendered < stolenUntil)     // only then: adding zeros is not always exact (-0)
+        {
+            for (int i = 0; i < chunk; ++i)
+            {
+                const size_t at = (size_t) ((voicesRendered + i) & stolenMask);
+                L[start + done + i] += stolenTail[0][at];
+                R[start + done + i] += stolenTail[1][at];
+                stolenTail[0][at] = stolenTail[1][at] = 0.0f;
+            }
+        }
+        voicesRendered += chunk;
 
         // The older analysis is let go once its last note has ended. The processor still holds it, so
         // it is freed later on the message thread, never here.
@@ -5225,7 +5601,7 @@ void SynthEngine::handleMidi (const juce::MidiMessage& m, const ParamSnapshot& p
     }
 }
 
-Voice* SynthEngine::allocateVoice()
+Voice* SynthEngine::allocateVoice (const ParamSnapshot& p)
 {
     for (auto& v : voices)
         if (! v->isActive())
@@ -5245,8 +5621,33 @@ Voice* SynthEngine::allocateVoice()
             if (v->getOrder() < chosen->getOrder())
                 chosen = v.get();
     }
+    fadeStolen (*chosen, p);
     chosen->stopImmediately();
     return chosen;
+}
+
+void SynthEngine::fadeStolen (Voice& v, const ParamSnapshot& p) noexcept
+{
+    if (sample == nullptr || stolenMask == 0 || ! v.isActive())
+        return;
+    if (! v.isFading())
+        v.fadeOut();
+    const int room = stolenMask + 1 - subBlock;
+    for (int done = 0; done < room && v.isActive();)
+    {
+        const int chunk = std::min (subBlock, room - done);
+        std::fill (stolenScratchL.begin(), stolenScratchL.begin() + chunk, 0.0f);
+        std::fill (stolenScratchR.begin(), stolenScratchR.begin() + chunk, 0.0f);
+        v.render (stolenScratchL.data(), stolenScratchR.data(), chunk, sampleFor (v), p);
+        for (int i = 0; i < chunk; ++i)
+        {
+            const size_t at = (size_t) ((voicesRendered + done + i) & stolenMask);
+            stolenTail[0][at] += stolenScratchL[(size_t) i];
+            stolenTail[1][at] += stolenScratchR[(size_t) i];
+        }
+        done += chunk;
+        stolenUntil = std::max (stolenUntil, voicesRendered + done);
+    }
 }
 
 void SynthEngine::noteOn (int note, float velocity, const ParamSnapshot& p, int channel)
@@ -5321,10 +5722,12 @@ void SynthEngine::noteOn (int note, float velocity, const ParamSnapshot& p, int 
             if (v->isActive() && ! v->isFading() && v->getNote() == note)
                 v->fadeOut();
 
-    if (auto* v = allocateVoice())
+    if (auto* v = allocateVoice (p))
     {
         v->channel = channel;
-        v->start (*sample, p, note, velocity, startPitch, ++noteCounter);
+        const bool asIs = listenOriginal.load (std::memory_order_relaxed);
+        v->start (*sample, asIs ? originalParams : p, note, velocity, startPitch, ++noteCounter);
+        v->original = asIs;
     }
 }
 

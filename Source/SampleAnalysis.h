@@ -142,6 +142,11 @@ struct SampleData
 
     PartialModel partials;
 
+    // Engine F's Seguir: the sample's colour in the 16 bands of the drawn filter, frame by frame of the partial
+    // model (dB against each band's mean over the part that sounds; [frame * 16 + band]). Empty without partials.
+    std::vector<float> colourBands;
+    std::array<float, 16> colourShare {};      // each band's mean share of the power (they add up to 1)
+
     // What keeps a note alive in engines B and D: a spectrally equalised seamless loop
     // (Loop and Granular) and a breathing additive/spectral freeze, both built from a
     // region of the sample. "early" sits at the sustain point (Sostenido), "late" near
@@ -241,6 +246,10 @@ struct SampleData
     int nearestC() const noexcept;
     int rootKey() const noexcept { return pitched ? juce::roundToInt (rootMidi) : 60; }
 
+    // A sample with no note found: the note its file name gives ("Kick_F", "Piano_C4": its pitch class, 0 = C), or -1.
+    // Only a hint, used by Snap a C for samples loaded from 0.9.6 on (CP9, approved 23-11).
+    int nameRoot = -1;
+
     // Posición of engines E and F: a fraction of the part that sounds, from the onset to the
     // usable end, so that the silence a file is padded with is never where they read.
     double soundingPosition (double fraction) const noexcept
@@ -270,6 +279,15 @@ struct SampleData
 
 namespace SampleAnalysis
 {
+// The pitch class a file name gives as a note (the last word that is one: C, F#, Bb, Gs, with an octave or m/maj
+// after it or not), or -1.
+int noteClassFromName (const juce::String& name);
+
+// A loop's Release from how its own hits die away (on by default since 23-11); off for A/B renders.
+void setLoopReleaseFromHits (bool on) noexcept;
+// The sustain sources of B and D narrowed where they are more side than middle (on since 23-11); off for A/B.
+void setSustainNoAntiphase (bool on) noexcept;
+
 // Reads an audio file (max 2 channels, max 2 minutes). Returns false on failure.
 bool loadFile (const juce::File& file, juce::AudioBuffer<float>& out, double& sampleRate);
 

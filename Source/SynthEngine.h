@@ -34,8 +34,15 @@ class SynthEngine
 public:
     static constexpr float minReshapedRelease = 0.06f;  // seconds; below this a sustained sound stops with a knock
 
-    // Tests and A/B renders only (audit 23-11): the granular sustain of B and D laid in tune (LoopGrains::inTune).
+    // The granular sustain of B and D laid in tune (LoopGrains::inTune, on by default since 23-11); off for A/B renders.
     static void setGranularSustainInTune (bool on, bool varied = false) noexcept;
+    // Engine F at half the rate at 88.2/96 kHz (on by default since 23-11); off for A/B renders.
+    static void setHalfRateDrone (bool on) noexcept;
+    // Engine F sounding from the first moment, grains filling in while its frames arrive (on since 23-11); off for A/B.
+    static void setDroneGrainStart (bool on) noexcept;
+    // Engine F with a low hit (a kick): played as engine A does (on), or made a drone of (off; with the partials at
+    // their true frequency its low body holds as a clean tone). A/B 23-11.
+    static void setDroneHitAsIs (bool on) noexcept;
 
     static constexpr int maxVoices = 32;
     static constexpr int physicalVoices = maxVoices + 8;   // spares so stolen voices can fade out
@@ -90,7 +97,16 @@ public:
     static constexpr int rootKey = 60;
 
     // Semitones the sample moves at the root key: 0, or up to C with Snap a C.
-    static float snapShift (const SampleData& s, bool snap) noexcept;
+    static float snapShift (const SampleData& s, bool snap, bool nameRoot = false) noexcept;
+    // Snap a C may use the note of the file name for a sample with none found (set by the processor: samples loaded
+    // from 0.9.6 on; projects saved before keep playing as they did).
+    std::atomic<bool> nameRootOn { false };
+    // Original (CP9): while on, the notes that start play the sample as it is (engine A, its detected envelope, the
+    // default settings, your Volumen), with no filter, Mecanismo, modulation or effects, to compare with your sound.
+    std::atomic<bool> listenOriginal { false };
+    ParamSnapshot originalParams {};
+    std::array<std::vector<float>, 2> originalBuf;      // mixed in after the effects; made in prepare()
+    bool originalVoices = false;
 
     // Analysis thread, while the sample is built: tries Warp's Tonos on it and sets tonesHold and
     // tonesGrid. Where Tonos would miss the note, engines A, B and D play it as Textura.
@@ -148,7 +164,16 @@ private:
     void renderVoices (juce::AudioBuffer<float>& buffer, int start, int num, const ParamSnapshot& p);
     // The matrix's Sidechain source over samples [start, start + num) of the block.
     void followSidechain (int start, int num, const ParamSnapshot& p) noexcept;
-    Voice* allocateVoice();
+    Voice* allocateVoice (const ParamSnapshot& p);
+    // A voice taken while it still sounds (none free: more notes at once than the spares): the rest of its 4 ms
+    // fade is worked out at that moment and played from this ring, instead of cut (approved 23-11). Made in
+    // prepare(); the ring is read and cleared as the voices are rendered.
+    void fadeStolen (Voice& v, const ParamSnapshot& p) noexcept;
+    std::array<std::vector<float>, 2> stolenTail;
+    std::array<float, 32> stolenScratchL {}, stolenScratchR {};
+    juce::int64 voicesRendered = 0;     // samples the voices have rendered (where the ring is read)
+    int stolenMask = 0;
+    juce::int64 stolenUntil = 0;       // the ring holds a fade up to here
     Drone::Stream* acquireDrone() noexcept;
     LoopStretcher* acquireStretcher() noexcept;
 

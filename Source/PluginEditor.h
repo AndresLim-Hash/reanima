@@ -319,6 +319,7 @@ private:
     std::unique_ptr<class SampleBrowser> browser;
     void showBrowser (bool show);
     std::unique_ptr<Toggle> snapToggle;
+    juce::TextButton originalButton { "Original" };      // CP9: the notes that start sound as the sample is
     std::unique_ptr<Choice> engineChoice;
     OutputMeter* meter = nullptr;
     juce::TextButton* sizeButton = nullptr;

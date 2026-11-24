@@ -6,6 +6,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "EditPage.h"
+#include "FxPage.h"
 #include "MasterStage.h"
 #include "FxRack.h"
 #include "FactoryPresets.h"
@@ -645,7 +646,8 @@ void checkEngineSwitch (const juce::File& sampleFile)
             midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
             p.processBlock (b, midi);
         }
-        for (int k = 0; k < (int) (4.5 * 48000 / 256); ++k)
+        // (7 s: the note keeps engine A, whose release of 3 s takes some 5 s to reach -100 dB)
+        for (int k = 0; k < (int) (7.0 * 48000 / 256); ++k)
         {
             juce::MidiBuffer none;
             p.processBlock (b, none);
@@ -1812,6 +1814,7 @@ int main (int argc, char* argv[])
             wait (120);
             shot (juce::String ("5_fx_ranura_") + juce::String (slot + 1));
         }
+
     }
 
     tabs->setCurrentTabIndex (0);
@@ -1909,6 +1912,9 @@ int main (int argc, char* argv[])
         proc.compareSelect (0);
         const bool backToA = std::abs (volume->getValue() - volumeA) < 1.0e-4f;
         proc.matchLevels = false;
+        // "= nivel" follows each setting's loudness over 3 s: A's is let settle first (the checks before this one
+        // played other things in it, and 1.7 s of notes left the match a fraction of a dB off, depending on them)
+        loudnessOfNotes();
         const double a = loudnessOfNotes();
         proc.compareSelect (1);
         const bool backToB = std::abs (volume->getValue() - volumeB) < 1.0e-4f;
@@ -2170,6 +2176,57 @@ int main (int argc, char* argv[])
         check (exports == 0 && hearts == 0, "sin botón EXPORTAR ni corazón suelto en la barra de presets",
                juce::String (exports) + " exportar, " + juce::String (hearts) + " corazones");
     }
+
+    // MASTER: the filament follows what the valve adds (cold when off or silent), the meters what the limiter does.
+    // (last, with the editor still open: its loud chord would weigh on "= nivel"'s 3 s of loudness above)
+    tabs->setCurrentTabIndex (4);
+    wait (100);
+    if (auto* fxPage = findChild<FxPage> (*editor))
+        if (auto* master = findChild<MasterPanel> (*fxPage))
+        {
+            const auto set = [&] (const char* id, float v)
+            {
+                if (auto* param = proc.apvts.getParameter (id))
+                    param->setValueNotifyingHost (param->convertTo0to1 (v));
+            };
+            const auto play = [&] (int blocks, bool chord)
+            {
+                juce::AudioBuffer<float> b (2, 512);
+                for (int k = 0; k < blocks; ++k)
+                {
+                    juce::MidiBuffer midi;
+                    if (k == 0 && chord)
+                        for (const int note : { 48, 55, 60, 64, 67, 71 })
+                            midi.addEvent (juce::MidiMessage::noteOn (1, note, 1.0f), 0);
+                    if (k == blocks - 1 && chord)
+                        for (const int note : { 48, 55, 60, 64, 67, 71 })
+                            midi.addEvent (juce::MidiMessage::noteOff (1, note), 0);
+                    b.clear();
+                    proc.processBlock (b, midi);
+                    if (k % 4 == 0)
+                        wait (10);
+                }
+            };
+            set ("mstValveOn", 0.0f);
+            play (40, false);
+            wait (300);
+            const float coldOff = master->filamentGlow();
+            set ("mstValveOn", 1.0f);
+            set ("mstAmount", 70.0f);
+            set ("volume", 12.0f);
+            play (60, true);
+            const float hot = master->filamentGlow(), reduction = master->reductionShown(), outShown = master->outputShown();
+            shot ("5_fx_master_activo");
+            set ("volume", -6.0f);
+            set ("mstAmount", 35.0f);
+            set ("mstValveOn", 0.0f);
+            play (40, false);
+            wait (600);
+            check (coldOff == 0.0f && hot > 0.3f, "MASTER: el filamento está frío con la válvula apagada y brilla con lo que añade al tocar",
+                   juce::String (coldOff, 2) + " / " + juce::String (hot, 2));
+            check (reduction > 0.5f && outShown <= -0.9f, "MASTER: los medidores muestran la reducción del limitador y la salida bajo el techo",
+                   "reducción " + juce::String (reduction, 1) + " dB, salida " + juce::String (outShown, 1) + " dBTP");
+        }
 
     editor.reset();
 

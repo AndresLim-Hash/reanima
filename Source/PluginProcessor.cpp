@@ -542,6 +542,7 @@ bool ReanimaProcessor::renderExport (const juce::File& out, int format, double r
     }
     MasterStage stage;
     stage.prepare (rate, block);
+    stage.setSettings (MasterStage::settingsFrom (p.data()));
     const int latency = stage.latency();
     const int total = (int) std::ceil (seconds * rate);
     juce::AudioBuffer<float> result (2, total), buf (2, block);
@@ -865,6 +866,7 @@ void ReanimaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     }
     if (! sideGiven)
         engine.setSidechain (nullptr, nullptr, 0);
+    engine.nameRootOn.store (nameRootHint.load (std::memory_order_relaxed), std::memory_order_relaxed);
     engine.process (buffer, *engineMidi, audioParams, bpm);
     if (isNonRealtime() && engine.rubberWanted.load())
     {
@@ -877,8 +879,10 @@ void ReanimaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     }
     matchLoudness (buffer);
     mixPreview (buffer);
-    measureOutput (buffer);     // the meter shows the level before the output stage: 0 dB is where saturation starts
-    saturateOutput (buffer);
+    measureOutput (buffer);     // the meter shows the level that enters the output stage (its 0 dB leaves at -4 dBFS)
+    masterStage.setSettings (MasterStage::settingsFrom (audioParams.data()));
+    if (! skipMasterStageForTests)
+        saturateOutput (buffer);
     audioSamplesDone.fetch_add (buffer.getNumSamples(), std::memory_order_release);
 }
 
@@ -1235,8 +1239,19 @@ void ReanimaProcessor::mixPreview (juce::AudioBuffer<float>& buffer) noexcept
     previewOn.store (previewGain > 0.0f, std::memory_order_release);
 }
 
-// The output stage (MasterStage): clean up to the meter's 0 dB, saturation from 0 to +6 dB, never past -1 dBFS,
-// four times oversampled.
+MasterStage::Settings MasterStage::settingsFrom (const float* p) noexcept
+{
+    Settings s;
+    s.valveOn = p[P::MstValveOn] > 0.5f;
+    s.amount = p[P::MstAmount] * 0.01f;
+    s.character = p[P::MstCharacter] * 0.01f;
+    s.outputDb = p[P::MstOutput];
+    s.limiterOn = p[P::MstLimiterOn] > 0.5f;
+    s.ceilingDb = p[P::MstCeiling];
+    return s;
+}
+
+// The output stage (MasterStage): 4 dB of room, the valve, OUTPUT and the true peak limiter.
 void ReanimaProcessor::saturateOutput (juce::AudioBuffer<float>& buffer) noexcept
 {
     if (buffer.getNumChannels() >= 2)
@@ -1374,6 +1389,7 @@ void ReanimaProcessor::loadSample (const juce::File& file)
     rememberCurrentSample (load);
     load.fresh = true;
     edited = false;
+    nameRootHint = true;
     load.file = file;
     load.name = file.getFileNameWithoutExtension();
     // A new sample plays forward: Reverse belongs to the sample it was set for (or to a preset).
@@ -1388,6 +1404,7 @@ bool ReanimaProcessor::loadSampleNow (const juce::File& file)
     history.clear();
     historyPos = 0;
     edited = false;
+    nameRootHint = true;
 
     Load load;
     load.id = ++latestLoad;
@@ -1425,6 +1442,7 @@ void ReanimaProcessor::loadDemo()
     load.audio = std::move (audio);
     load.rate = reader->sampleRate;
     load.name = juce::String::fromUTF8 (demoName);
+    nameRootHint = true;
     startLoad (std::move (load));
 }
 
@@ -2208,6 +2226,7 @@ void ReanimaProcessor::getStateInformation (juce::MemoryBlock& destData)
         state.setProperty ("sampleAudio", savedAudio(), nullptr);
         state.setProperty ("sampleName", uiSample != nullptr ? uiSample->name : sampleFile.getFileNameWithoutExtension(), nullptr);
         state.setProperty ("sampleEdited", edited, nullptr);
+        state.setProperty ("nameRootHint", nameRootHint.load(), nullptr);
     }
 
     // Every digit a float needs (with 2 decimals, a project opened again had its drawn curve moved by up to 0.005 dB).
@@ -2466,7 +2485,10 @@ void ReanimaProcessor::setStateInformation (const void* data, int sizeInBytes)
     const auto embedded = state.getProperty ("sampleAudio").toString();
     const auto name = state.getProperty ("sampleName").toString();
     const bool wasEdited = state.getProperty ("sampleEdited", false);
-    for (const auto* id : { "sampleAudio", "sampleName", "sampleEdited" })
+    // (a preset keeps the sample that is loaded, and its mark)
+    if (! presetLoading)
+        nameRootHint = (bool) state.getProperty ("nameRootHint", false);
+    for (const auto* id : { "sampleAudio", "sampleName", "sampleEdited", "nameRootHint" })
         state.removeProperty (id, nullptr);
 
     // Up to version 2 the engines were, in order: Reenvolvente, Híbrido, Resíntesis, Reconstrucción, Granular.

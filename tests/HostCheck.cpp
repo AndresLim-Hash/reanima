@@ -732,9 +732,10 @@ int main (int argc, char* argv[])
 
     {
         auto p = open (format, desc, 48000.0, 512);
-        // The output stage's linear-phase oversampling: 38 samples at 48 kHz, reported once the rate is known.
+        // The MASTER stage (since 24-11-2026): its linear-phase oversampling (38 samples at 48 kHz) and the true peak
+        // limiter's reading between the samples and lookahead (32 + 72): 142 samples, reported once the rate is known.
         p->prepareToPlay (48000.0, 512);
-        check (p->getLatencySamples() == 38, "latencia declarada (la etapa de salida, 0,8 ms a 48 kHz)", juce::String (p->getLatencySamples()) + " muestras");
+        check (p->getLatencySamples() == 142, "latencia declarada (la etapa MASTER, 2,96 ms a 48 kHz)", juce::String (p->getLatencySamples()) + " muestras");
         p->releaseResources();
         // one input: the sidechain (the key of another track), auxiliary for the host
         const auto* in = p->getBus (true, 0);

@@ -102,10 +102,12 @@ ParamSnapshot defaultsFor (const SampleData& s)
 }
 
 // Plays one note held for `held` seconds and returns the left channel.
-std::vector<float> play (std::shared_ptr<const SampleData> s, const ParamSnapshot& p, int note, double held, double total)
+std::vector<float> play (std::shared_ptr<const SampleData> s, const ParamSnapshot& p, int note, double held, double total,
+                         bool original = false)
 {
     SynthEngine e;
     e.prepare (sr);
+    e.listenOriginal.store (original);
     e.prepareFx (p);
     e.setSample (s);
 
@@ -994,6 +996,41 @@ int main()
             for (int ch = 0; ch < 2; ++ch)
                 for (int i = 0; i < chordAudio.getNumSamples(); ++i)
                     chordAudio.setSample (ch, i, 0.5f * (a.getSample (ch, i) + c.getSample (ch, i) + e.getSample (ch, i)));
+        }
+        {
+            // CP9: the note of a file name (pitch class), and none where there is none.
+            const std::pair<const char*, int> names[] = { { "Kick_F", 5 }, { "Piano_C4", 0 }, { "bass_F#2", 6 }, { "808_Bb", 10 },
+                                                          { "Sub_Hit_G_-_SCIF", 7 }, { "pad_Am", 9 }, { "vox_Ebmin", 3 }, { "Gs_stab", 8 },
+                                                          { "A_Day_In_The_Life_loop", -1 }, { "Clap_Snare_TDV", -1 }, { "kick_dull", -1 },
+                                                          { "Drum_Beat_122bpm", -1 }, { "Csus_chord", -1 } };
+            juce::String wrong;
+            for (const auto& n : names)
+                if (const int got = SampleAnalysis::noteClassFromName (n.first); got != n.second)
+                    wrong << n.first << " -> " << got << " (" << n.second << ")  ";
+            check (wrong.isEmpty(), "CP9: the note of a file name, and none where there is none", wrong);
+        }
+        {
+            // CP9 Original: a note started under it sounds as the sample with an instance's defaults (engine A, its
+            // detected envelope), whatever the engine, filter and effects set.
+            auto s = SampleAnalysis::analyse (chordAudio, sr, "orig", false, true);
+            auto heavy = defaultsFor (*s);
+            heavy[P::Engine] = (float) P::EngineGranular;
+            heavy[P::FltOn] = 1.0f;
+            heavy[P::FltCircuit] = 2.0f;
+            heavy[P::FltDrive] = 12.0f;
+            heavy[(size_t) P::fxType (0)] = 8.0f;          // Reverb
+            const auto asIs = play (s, heavy, 60, 1.0, 1.5, true), reference = play (s, defaultsFor (*s), 60, 1.0, 1.5);
+            const auto changed = play (s, heavy, 60, 1.0, 1.5);
+            double diff = 0.0, peak = 0.0, apart = 0.0;
+            for (size_t i = 0; i < reference.size(); ++i)
+            {
+                diff = std::max (diff, (double) std::abs (asIs[i] - reference[i]));
+                apart = std::max (apart, (double) std::abs (changed[i] - reference[i]));
+                peak = std::max (peak, (double) std::abs (reference[i]));
+            }
+            check (diff <= 1.0e-4 * peak && apart > 0.1 * peak, "CP9: Original plays the sample as it is, whatever is set",
+                   juce::String ("difference with A as is ") + juce::String (juce::Decibels::gainToDecibels (diff / peak + 1.0e-12), 1)
+                       + " dB; the settings themselves " + juce::String (juce::Decibels::gainToDecibels (apart / peak + 1.0e-12), 1) + " dB away");
         }
         std::shared_ptr<const SampleData> chord = SampleAnalysis::analyse (chordAudio, sr, "chord", false);
         check (chord->pitched && ! chord->tonesHold, "Tonos: a chord fails its test on loading",
