@@ -879,6 +879,116 @@ int main (int argc, char* argv[])
         audio.join();
     }
 
+    // Resizing the way a host does it (Ableton Live: the window's edge or corner dragged; the host asks the plugin's
+    // checkSizeConstraint and then calls onSize), with notes playing on another thread.
+    {
+        // The size this computer remembers is the user's: put back as it was at the end.
+        juce::PropertiesFile::Options o;
+        o.applicationName = "Reanima";
+        o.folderName = "Blackpanda/Reanima";
+        o.filenameSuffix = ".settings";
+        o.osxLibrarySubFolder = "Application Support";
+        const auto settingsFile = o.getDefaultFile();
+        const bool hadSettings = settingsFile.existsAsFile();
+        const auto settingsBefore = settingsFile.loadFileAsString();
+
+        auto p = open (format, desc, 48000.0, 512);
+        p->prepareToPlay (48000.0, 512);
+        std::atomic<bool> running { true };
+        std::atomic<int> blocks { 0 };
+        std::thread audio ([&]
+        {
+            juce::AudioBuffer<float> buffer (2, 512);
+            int b = 0;
+            while (running)
+            {
+                juce::MidiBuffer midi;
+                if (b % 16 == 0)
+                    for (int k = 0; k < 12; ++k)
+                        midi.addEvent (juce::MidiMessage::noteOn (1, 40 + k * 3, (juce::uint8) 90), k);
+                if (b % 16 == 8)
+                    for (int k = 0; k < 12; ++k)
+                        midi.addEvent (juce::MidiMessage::noteOff (1, 40 + k * 3), k);
+                buffer.clear();
+                p->processBlock (buffer, midi);
+                ++blocks;
+                ++b;
+                juce::Thread::sleep (5);
+            }
+        });
+
+        std::unique_ptr<juce::AudioProcessorEditor> editor (p->createEditorAndMakeActive());
+        editor->setTopLeftPosition (30, 30);
+        editor->addToDesktop (juce::ComponentPeer::windowIsResizable);
+        editor->setVisible (true);
+        wait (2500);      // the demonstration sample's analysis sets its envelope in the background: done by now
+
+        std::vector<float> before;
+        for (auto* prm : p->getParameters())
+            before.push_back (prm->getValue());
+        const int w0 = editor->getWidth(), h0 = editor->getHeight();
+        const double ratio = (double) w0 / h0;
+        const auto steps = [&] (const char* what, std::function<juce::Point<int> (int)> size, int n)
+        {
+            double worst = 0.0;
+            for (int i = 1; i <= n; ++i)
+            {
+                const auto s = size (i);
+                const double t0 = juce::Time::getMillisecondCounterHiRes();
+                editor->setSize (s.x, s.y);
+                if (auto* peer = editor->getPeer())
+                    peer->performAnyPendingRepaintsNow();
+                juce::MessageManager::getInstance()->runDispatchLoopUntil (1);
+                worst = std::max (worst, juce::Time::getMillisecondCounterHiRes() - t0);
+            }
+            std::printf ("  %s: %d pasos, peor %.1f ms, queda %dx%d\n", what, n, worst, editor->getWidth(), editor->getHeight());
+            return worst;
+        };
+
+        std::printf ("\n== redimensionar desde el host (VST3) ==\n");
+        double worst = 0.0;
+        // the right edge, wider: the window must follow (before, Live's edge could only make it smaller)
+        worst = std::max (worst, steps ("borde derecho, más ancho", [&] (int i) { return juce::Point<int> (w0 + i * 4, editor->getHeight()); }, 60));
+        check (editor->getWidth() > w0 + 100 && std::abs ((double) editor->getWidth() / editor->getHeight() - ratio) < 0.02,
+               "el borde derecho agranda la ventana, con su proporción", juce::String (editor->getWidth()) + "x" + juce::String (editor->getHeight()));
+        const int w1 = editor->getWidth();
+        worst = std::max (worst, steps ("borde inferior, más alto", [&] (int i) { return juce::Point<int> (editor->getWidth(), editor->getHeight() + 3); }, 40));
+        check (editor->getWidth() > w1 + 50, "el borde inferior agranda la ventana", juce::String (editor->getWidth()) + "x" + juce::String (editor->getHeight()));
+        worst = std::max (worst, steps ("borde derecho, más estrecho", [&] (int i) { return juce::Point<int> (editor->getWidth() - 6, editor->getHeight()); }, 60));
+        worst = std::max (worst, steps ("esquina, saltos de mínimo a máximo", [&] (int i) { return i % 2 == 0 ? juce::Point<int> (700, 450) : juce::Point<int> (2400, 1550); }, 20));
+        worst = std::max (worst, steps ("tamaños sin proporción", [&] (int i) { return juce::Point<int> (900 + (i * 137) % 900, 500 + (i * 91) % 700); }, 40));
+        check (worst < 1000.0, "ningún paso deja la ventana colgada", juce::String (worst, 0) + " ms el peor");
+        editor->setSize (juce::roundToInt (w0 * 1.2), juce::roundToInt (h0 * 1.2));      // left at 120 %
+        wait (900);       // the plugin writes the size down once it stays still
+
+        const int played = blocks.load();
+        wait (300);
+        check (blocks.load() > played, "el audio sigue mientras tanto");
+        std::vector<float> after;
+        for (auto* prm : p->getParameters())
+            after.push_back (prm->getValue());
+        juce::String moved;
+        for (size_t i = 0; i < before.size(); ++i)
+            if (after[i] != before[i])
+                moved << p->getParameters()[(int) i]->getName (40) << " " << juce::String (before[i], 4) << "->" << juce::String (after[i], 4) << "; ";
+        check (moved.isEmpty(), "redimensionar no cambia ningún parámetro", juce::String ((int) before.size()) + " comparados " + moved);
+
+        // closed and opened again: the size it was left at
+        const int wl = editor->getWidth();
+        editor.reset();
+        wait (200);
+        editor.reset (p->createEditorAndMakeActive());
+        check (std::abs (editor->getWidth() - wl) <= 2, "al reabrir conserva el tamaño", juce::String (editor->getWidth()) + " (era " + juce::String (wl) + ")");
+        editor.reset();
+
+        running = false;
+        audio.join();
+        if (hadSettings)
+            settingsFile.replaceWithText (settingsBefore);
+        else
+            settingsFile.deleteFile();
+    }
+
     // Several instances at the same time.
     {
         std::vector<std::unique_ptr<juce::AudioPluginInstance>> many;

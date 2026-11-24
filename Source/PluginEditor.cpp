@@ -525,7 +525,7 @@ ReanimaEditor::ReanimaEditor (ReanimaProcessor& p)
     if (auto* c = getConstrainer())
         c->setFixedAspectRatio ((double) designW / designH);
     savedScale = (float) settings().getDoubleValue ("uiScale", 0.0);
-    setScale (savedScale > 0.0f ? savedScale : screenFitScale(), false);
+    setScale (savedScale > 0.0f ? std::min (savedScale, screenMaxScale()) : screenFitScale(), false);
 
     waveform.sampleChanged();
     editView->sampleChanged();
@@ -2004,6 +2004,18 @@ float ReanimaEditor::screenFitScale()
     return juce::jlimit (minScale, 1.0f, fit);
 }
 
+// The largest size the screen holds whole: a size remembered on a bigger screen (or chosen at 200 %) opens no larger,
+// so the corner and the size button are never left outside the screen. What is remembered stays as it was.
+float ReanimaEditor::screenMaxScale()
+{
+    const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay();
+    if (display == nullptr)
+        return maxScale;
+    const auto room = display->userBounds;
+    const float fit = std::min ((float) (room.getHeight() - 60) / designH, (float) (room.getWidth() - 20) / designW);
+    return juce::jlimit (minScale, maxScale, fit);
+}
+
 // Every label's font again at the window's scale (Theme::onScreen keeps text at least 8 px on the screen): its
 // design size is kept in the label the first time.
 void ReanimaEditor::refreshFonts (juce::Component& c)
@@ -2023,22 +2035,34 @@ void ReanimaEditor::refreshFonts (juce::Component& c)
     }
 }
 
+// A size the editor asks for itself (opening, the size menu). The host may grant another (its own limits, its
+// rounding to the screen's pixels): resized() draws whatever it grants.
 void ReanimaEditor::setScale (float scale, bool remember)
 {
     scale = juce::jlimit (minScale, maxScale, scale);
+    requestedScale = scale;
+    scaleSettleTicks = -1;
     setSize (juce::roundToInt (designW * scale), juce::roundToInt (designH * scale));
     if (remember)
-    {
-        savedScale = scale;
-        settings().setValue ("uiScale", (double) scale);
-        settings().saveIfNeeded();
-    }
+        rememberScale (scale);
+}
+
+// Written to this computer's settings once per choice (the menu, or the end of a drag), never on each step.
+void ReanimaEditor::rememberScale (float scale)
+{
+    scale = juce::jlimit (minScale, maxScale, scale);
+    requestedScale = scale;
+    if (std::abs (scale - savedScale) < 0.001f)
+        return;
+    savedScale = scale;
+    settings().setValue ("uiScale", (double) scale);
+    settings().saveIfNeeded();
 }
 
 void ReanimaEditor::showSizeMenu()
 {
     juce::PopupMenu menu;
-    const float current = (float) getWidth() / designW;
+    const float current = shownScale;
     menu.addItem (1, P::u8 ("Ajustar a la pantalla"));
     menu.addSeparator();
     const int sizes[] = { 60, 75, 90, 100, 125, 150, 200 };
@@ -2055,23 +2079,35 @@ void ReanimaEditor::showSizeMenu()
 
 void ReanimaEditor::paint (juce::Graphics& g)
 {
+    // Theme::uiScale is shared by every Reanima window of the process; the controls painted after this (all of them
+    // are inside this editor) read the scale of this one.
+    if (shownScale > 0.0f)
+        Theme::uiScale() = shownScale;
     g.fillAll (Theme::bg);
 }
 
 void ReanimaEditor::resized()
 {
-    const float scale = (float) getWidth() / (float) designW;
-    if (std::abs (Theme::uiScale() - scale) > 1.0e-4f)
+    // The whole design fits the size given, whatever its shape: a host that does not keep the proportion (or rounds
+    // it to its pixels) gets the design centred, never cut off at the bottom or the right.
+    const float scale = std::min ((float) getWidth() / (float) designW, (float) getHeight() / (float) designH);
+    if (scale <= 0.0f)
+        return;
+    shownScale = scale;
+    Theme::uiScale() = scale;
+    if (std::abs (fontScale - scale) > 1.0e-4f)
     {
-        Theme::uiScale() = scale;
+        fontScale = scale;
         refreshFonts (content);
     }
-    content.setTransform (juce::AffineTransform::scale (scale));
+    const float x = 0.5f * ((float) getWidth() - designW * scale), y = 0.5f * ((float) getHeight() - designH * scale);
+    content.setTransform (juce::AffineTransform::scale (scale).translated (std::floor (x), std::floor (y)));
     content.setBounds (0, 0, designW, designH);
     if (sizeButton != nullptr)
         sizeButton->setButtonText (juce::String (juce::roundToInt (scale * 100.0f)) + " %");
-    if (savedScale > 0.0f && std::abs (scale - savedScale) > 0.005f)
-        scaleSettleTicks = 15;      // a drag of the corner: remembered once it stops
+
+    // A size the editor did not ask for (its corner dragged, the host's window edge): remembered once it stays still.
+    scaleSettleTicks = std::abs (scale - requestedScale) > 0.005f ? 15 : -1;
 
     header.setBounds (0, 0, railX, headerHeight);
 
@@ -2275,7 +2311,7 @@ void ReanimaEditor::timerCallback()
     }
 
     if (scaleSettleTicks > 0 && --scaleSettleTicks == 0)
-        setScale ((float) getWidth() / designW, true);
+        rememberScale (shownScale);     // only written down: the window is already this size
 
     std::array<float, std::size (watched)> values;
     for (size_t i = 0; i < values.size(); ++i)

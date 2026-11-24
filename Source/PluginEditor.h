@@ -329,8 +329,16 @@ private:
     std::unique_ptr<GuideOverlay> guide;
     std::vector<GuideOverlay::Step> quickSteps;
     TabGuides::Targets guideTargets;
-    float savedScale = 0.0f;
+    // The window's size. Resizing only changes how the one design (designW x designH) is drawn: a transform on
+    // `content`, the label fonts kept at 8 px on the screen (refreshFonts), nothing rebuilt, nothing sent to the
+    // processor. The size chosen is written once the window has stayed still (scaleSettleTicks), never per step.
+    float savedScale = 0.0f;            // what this computer remembers (0: never chosen)
+    float shownScale = 0.0f;            // what the window draws at now
+    float fontScale = 0.0f;             // what the label fonts were last fitted to
+    float requestedScale = 0.0f;        // the last size this editor asked for itself (menu, opening)
     int scaleSettleTicks = -1;          // counts down after a drag-resize, then the size is remembered
+    void rememberScale (float scale);
+    static float screenMaxScale();
 
     juce::TabbedComponent tabs { juce::TabbedButtonBar::TabsAtTop };
     juce::Component samplePage, editPage, filterPage, matrixPage, arpPage;

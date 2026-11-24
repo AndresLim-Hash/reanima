@@ -2141,13 +2141,17 @@ private:
                         {
                             bool adjustWidth = (width / height > aspectRatio);
 
-                            if (detail::PluginUtilities::getHostType().type == PluginHostType::SteinbergCubase9)
+                            // Reanima: for every host (it was Cubase 9 only), a drag of one edge of the window
+                            // keeps that edge's new length and fits the other to it. Without this, Ableton Live's
+                            // right or bottom edge could only make the window smaller, never larger.
                             {
                                 auto currentEditorBounds = editor->getBounds().toFloat();
+                                // within a pixel: the host's frame goes through its own pixels and back
+                                const auto same = [] (float a, float b) { return std::abs (a - b) < 1.0f; };
 
-                                if (approximatelyEqual (currentEditorBounds.getWidth(), width) && ! approximatelyEqual (currentEditorBounds.getHeight(), height))
+                                if (same (currentEditorBounds.getWidth(), width) && ! same (currentEditorBounds.getHeight(), height))
                                     adjustWidth = true;
-                                else if (approximatelyEqual (currentEditorBounds.getHeight(), height) && ! approximatelyEqual (currentEditorBounds.getWidth(), width))
+                                else if (same (currentEditorBounds.getHeight(), height) && ! same (currentEditorBounds.getWidth(), width))
                                     adjustWidth = false;
                             }
 

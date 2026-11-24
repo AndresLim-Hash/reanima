@@ -564,3 +564,45 @@ if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/external/eval/rubberband/single/RubberBan
     target_link_libraries(ReanimaStretchLab PRIVATE signalsmith_stretch juce::juce_audio_formats juce::juce_dsp
         PUBLIC juce::juce_recommended_config_flags)
 endif()
+
+# Resizing the window as a user and a host do it, with audio playing: smooth, controls alive, nothing sounding changed.
+if(WIN32)
+juce_add_console_app(ReanimaResizeCheck PRODUCT_NAME "ReanimaResizeCheck")
+target_sources(ReanimaResizeCheck
+    PRIVATE
+        tests/ResizeCheck.cpp
+        Source/Params.cpp
+        Source/PluginProcessor.cpp
+        Source/FactoryPresets.cpp
+        Source/Randomizer.cpp
+        Source/PluginEditor.cpp
+        Source/SampleBrowser.cpp
+        Source/Displays.cpp
+        Source/EditPage.cpp
+        Source/Guide.cpp
+        Source/TabGuides.cpp
+        Source/FxPage.cpp
+        Source/FxRack.cpp
+        Source/HelpText.cpp
+        Source/Reconstruct.cpp
+        Source/SampleAnalysis.cpp
+        Source/KeyDetect.cpp
+        Source/StepSeq.cpp
+        Source/SynthEngine.cpp
+        Source/Mechanism.cpp
+        Source/DroneStretch.cpp
+        Source/WaveformView.cpp)
+target_include_directories(ReanimaResizeCheck PRIVATE Source)
+target_compile_options(ReanimaResizeCheck PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
+target_compile_definitions(ReanimaResizeCheck PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JucePlugin_Name="Reanima" JucePlugin_VersionString="${PROJECT_VERSION}" JUCE_MODAL_LOOPS_PERMITTED=1)
+target_link_libraries(ReanimaResizeCheck
+    PRIVATE
+        ReanimaMechanism
+        signalsmith_stretch
+        juce::juce_audio_utils
+        juce::juce_dsp
+        psapi
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_warning_flags)
+endif()
